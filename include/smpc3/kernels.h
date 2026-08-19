@@ -31,6 +31,35 @@ void smp_k_zero (const SmpBuf *dst);
 void smp_k_add(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b);
 void smp_k_mul(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b);
 
+/* --- Слияние поэлементных стадий -------------------------------------------
+ *
+ * Цепочка вида @add -> @relu -> @scale делала проход по памяти на каждую
+ * стадию. Пока данные помещаются в L3, это почти бесплатно, но дальше каждая
+ * стадия честно платит DRAM: на тензорах по 16 МиБ три стадии стоили 6250 мкс
+ * против 2500 у одной.
+ *
+ * Слитое ядро читает элемент один раз, прогоняет через всю цепочку в
+ * регистрах и один раз пишет. Промежуточные буферы не трогаются вовсе. */
+#define SMP_FUSE_MAX 8u
+
+typedef enum SmpFuseOp {
+    SMP_FOP_RELU = 0,
+    SMP_FOP_ABS,
+    SMP_FOP_SCALE,   /* k    */
+    SMP_FOP_ADD,     /* b    */
+    SMP_FOP_MUL      /* b    */
+} SmpFuseOp;
+
+typedef struct SmpFuseStep {
+    uint8_t op;      /* SmpFuseOp                                    */
+    double  k;       /* SMP_FOP_SCALE                                */
+    SmpBuf  b;       /* SMP_FOP_ADD, SMP_FOP_MUL                     */
+} SmpFuseStep;
+
+/* dst = chain(src) за один проход. Формы обязаны совпадать. */
+void smp_k_fuse(const SmpBuf *dst, const SmpBuf *src,
+                const SmpFuseStep *steps, uint32_t nsteps);
+
 /* Приведение типа с копированием. */
 void smp_k_cast(const SmpBuf *dst, const SmpBuf *src);
 

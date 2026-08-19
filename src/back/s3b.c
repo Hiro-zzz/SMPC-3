@@ -373,7 +373,8 @@ void smp_disasm(FILE *out, const SmpModule *m, bool color)
         if (in->flags & SMP_IF_FTZ)     fn += (size_t)snprintf(fl + fn, sizeof(fl) - fn, ",ftz");
         if (in->flags & SMP_IF_STRICT)  fn += (size_t)snprintf(fl + fn, sizeof(fl) - fn, ",str");
         if (in->flags & SMP_IF_NOALIAS) fn += (size_t)snprintf(fl + fn, sizeof(fl) - fn, ",na");
-        if (in->flags & SMP_IF_RAW)     snprintf(fl + fn, sizeof(fl) - fn, ",raw");
+        if (in->flags & SMP_IF_RAW)     fn += (size_t)snprintf(fl + fn, sizeof(fl) - fn, ",raw");
+        if (in->flags & SMP_IF_FUSE)    snprintf(fl + fn, sizeof(fl) - fn, ",fuse");
         fprintf(out, "%s[%-14s]%s ", dc(color, D_DIM), fl, dc(color, D_RESET));
 
         fprintf(out, "%s%-8s%s ", dc(color, D_OP), def->mnemonic, dc(color, D_RESET));

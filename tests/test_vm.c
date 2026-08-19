@@ -539,6 +539,132 @@ static void test_roundtrip(void)
 }
 
 /* ========================================================================== */
+/*  Слияние поэлементных стадий                                               */
+/* ========================================================================== */
+
+/* Сколько инструкций помечено под слияние. */
+static uint32_t count_fuse(void)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < g_mod.n_code; i++)
+        if (g_mod.code[i].flags & SMP_IF_FUSE) n++;
+    return n;
+}
+
+/* Прогоняет уже собранный модуль ещё раз, сняв все пометки слияния. Это и есть
+ * эталон: без флага VM обязана считать то же самое, инструкция за инструкцией.
+ * Флаг — утверждение компилятора об уже мёртвом буфере, а не про арифметику,
+ * поэтому расхождение означало бы, что слияние меняет результат. */
+static bool rerun_unfused(void)
+{
+    SmpInstr *code = (SmpInstr *)g_mod.code;
+    for (uint32_t i = 0; i < g_mod.n_code; i++)
+        code[i].flags &= (uint8_t)~SMP_IF_FUSE;
+
+    smp_vm_release(&g_vm);
+    if (smp_vm_init(&g_vm, &g_mod, &g_diag) != SMP_OK) return false;
+    return smp_vm_run(&g_vm) == SMP_OK;
+}
+
+/* Сверяет тензор с его же значениями до пересчёта. */
+static void check_same(const char *name, const double *want, uint32_t n)
+{
+    const SmpTensor *t = NULL;
+    const void      *p = tensor_data(name, &t);
+    if (!p || !t) { CHECK(0, "тензор %s не найден", name); return; }
+
+    bool ok = true;
+    for (uint32_t i = 0; i < n && i < t->nelem; i++) {
+        const double got = (t->dtype == SMP_DT_F64)
+                               ? ((const double *)p)[i]
+                               : (double)((const float *)p)[i];
+        if (!near(got, want[i])) ok = false;
+    }
+    CHECK(ok, "слияние изменило %s", name);
+}
+
+static void snapshot(const char *name, double *out, uint32_t n)
+{
+    const SmpTensor *t = NULL;
+    const void      *p = tensor_data(name, &t);
+    if (!p || !t) return;
+    for (uint32_t i = 0; i < n && i < t->nelem; i++)
+        out[i] = (t->dtype == SMP_DT_F64) ? ((const double *)p)[i]
+                                          : (double)((const float *)p)[i];
+}
+
+static void test_fusion(void)
+{
+    SECTION("слияние поэлементных стадий");
+
+    static double want[64];
+
+    /* Три стадии подряд. Вход намеренно со знаком, чтобы relu действительно
+     * срезал, а не проходил насквозь. */
+    static const char *three =
+        "[#arena:0] *&A<f32:64> -> @fill(-3.0) => *&A;\n"
+        "[#arena:0] *&B<f32:64> -> @fill(5.0) => *&B;\n"
+        "[#simd:v256] *&A -> @add(*&B) -> @relu -> @scale(2.0)"
+        " => *&D<f32:64> [!no-alias];\n";
+    if (run_str(three)) {
+        CHECK(count_fuse() == 2, "ждали 2 пометки слияния, нашли %u", count_fuse());
+        snapshot("D", want, 64);
+        CHECK(near(want[0], 4.0), "(-3+5)*2 дало %g, ждали 4", want[0]);
+        CHECK(rerun_unfused(), "прогон без слияния не дошёл до halt");
+        check_same("D", want, 64);
+    }
+
+    /* Цепочка, где relu обязан обнулить: (-3 + 1) < 0. */
+    static const char *clipped =
+        "[#arena:0] *&A<f32:64> -> @fill(-3.0) => *&A;\n"
+        "[#arena:0] *&B<f32:64> -> @fill(1.0) => *&B;\n"
+        "[#simd:v256] *&A -> @add(*&B) -> @relu -> @scale(7.0)"
+        " => *&D<f32:64> [!no-alias];\n";
+    if (run_str(clipped)) {
+        snapshot("D", want, 64);
+        CHECK(near(want[0], 0.0), "relu не срезал: %g", want[0]);
+        CHECK(rerun_unfused(), "прогон без слияния не дошёл до halt");
+        check_same("D", want, 64);
+    }
+
+    /* f64 мимо векторной ветки — считает скалярное слитое ядро. */
+    static const char *wide =
+        "[#arena:0] *&A<f64:32> -> @fill(-2.0) => *&A;\n"
+        "[#arena:0] *&B<f64:32> -> @fill(6.0) => *&B;\n"
+        "*&A -> @add(*&B) -> @abs -> @scale(3.0) => *&D<f64:32> [!no-alias];\n";
+    if (run_str(wide)) {
+        snapshot("D", want, 32);
+        CHECK(near(want[0], 12.0), "|(-2+6)|*3 дало %g, ждали 12", want[0]);
+        CHECK(rerun_unfused(), "прогон без слияния не дошёл до halt");
+        check_same("D", want, 32);
+    }
+
+    /* Цепочка длиннее SMP_FUSE_MAX обязана остаться правильной: лишние стадии
+     * просто исполнятся отдельно. */
+    static const char *toolong =
+        "[#arena:0] *&A<f32:16> -> @fill(1.0) => *&A;\n"
+        "*&A -> @scale(2.0) -> @scale(2.0) -> @scale(2.0) -> @scale(2.0)"
+        " -> @scale(2.0) -> @scale(2.0) -> @scale(2.0) -> @scale(2.0)"
+        " -> @scale(2.0) -> @scale(2.0) => *&D<f32:16> [!no-alias];\n";
+    if (run_str(toolong)) {
+        snapshot("D", want, 16);
+        CHECK(near(want[0], 1024.0), "2^10 дало %g", want[0]);
+        CHECK(rerun_unfused(), "прогон без слияния не дошёл до halt");
+        check_same("D", want, 16);
+    }
+
+    /* Счётчик исполненного не должен врать: слияние экономит проходы по
+     * памяти, а не инструкции программы. */
+    if (run_str(three)) {
+        const uint64_t fused = g_vm.n_executed;
+        CHECK(rerun_unfused(), "прогон без слияния не дошёл до halt");
+        CHECK(g_vm.n_executed == fused,
+              "исполнено %llu против %llu без слияния",
+              (unsigned long long)g_vm.n_executed, (unsigned long long)fused);
+    }
+}
+
+/* ========================================================================== */
 
 int main(void)
 {
@@ -564,6 +690,7 @@ int main(void)
     test_fp_modes();
     test_regdump();
     test_roundtrip();
+    test_fusion();
 
     smp_vm_release(&g_vm);
     fclose(g_sink);

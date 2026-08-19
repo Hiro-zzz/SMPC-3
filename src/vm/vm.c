@@ -232,6 +232,94 @@ static bool strict_check(SmpVM *vm, uint8_t flags, double v, const char *what)
 }
 
 /* ========================================================================== */
+/*  Слияние поэлементных стадий                                               */
+/* ========================================================================== */
+
+/* Какой стадии слитой цепочки соответствует опкод; -1 — не сливается. */
+static int fuse_op_of(uint8_t bc)
+{
+    switch (bc) {
+        case SMP_BC_RELU:  return (int)SMP_FOP_RELU;
+        case SMP_BC_ABS:   return (int)SMP_FOP_ABS;
+        case SMP_BC_SCALE: return (int)SMP_FOP_SCALE;
+        case SMP_BC_ADD:   return (int)SMP_FOP_ADD;
+        case SMP_BC_MUL:   return (int)SMP_FOP_MUL;
+        default:           return -1;
+    }
+}
+
+/* Собирает цепочку, размеченную SMP_IF_FUSE, и считает её за один проход.
+ *
+ * false означает «слить не вышло» — вызывающий тогда исполняет инструкцию
+ * обычным путём, как будто флага не было. Поэтому все проверки идут ДО первого
+ * обращения к памяти: отказ на полпути оставил бы половину работы сделанной.
+ *
+ * Флаг — утверждение компилятора, а не догадка рантайма. Но границы цепочки VM
+ * всё равно перепроверяет: опкод обязан быть поэлементным, операнды —
+ * тензорами. Не сошлось — считаем по-старому, а не молча иначе. */
+static bool vm_fuse(SmpVM *vm, const SmpInstr **ipp, const SmpInstr *first)
+{
+    const SmpModule *mod = vm->mod;
+    SmpReg          *R   = vm->regs;
+
+    const SmpInstr *chain[SMP_FUSE_MAX];
+    const SmpInstr *ip  = *ipp;
+    const SmpInstr *cur = first;
+    uint32_t        n   = 0;
+
+    for (;;) {
+        if (n >= SMP_FUSE_MAX)             return false;
+        if (fuse_op_of(cur->op) < 0)       return false;
+        chain[n++] = cur;
+        if (!(cur->flags & SMP_IF_FUSE))   break;
+        if (ip >= mod->code + mod->n_code) return false;
+        cur = ip++;
+    }
+    if (n < 2u) return false;
+
+    /* Источник цепочки — вход первой стадии, приёмник — выход последней.
+     * Всё, что между ними, в память не попадает вообще. */
+    if (!R[first->a].is_tensor)           return false;
+    if (!R[chain[n - 1u]->d].is_tensor)   return false;
+    for (uint32_t i = 0; i < n; i++) {
+        const int f = fuse_op_of(chain[i]->op);
+        if ((f == (int)SMP_FOP_ADD || f == (int)SMP_FOP_MUL) &&
+            !R[chain[i]->b].is_tensor) return false;
+    }
+
+    SmpBuf      src, dst;
+    SmpFuseStep steps[SMP_FUSE_MAX];
+
+    /* Дальше отказы уже фатальные: диагностика выдана, и повторять работу
+     * обычным путём не нужно — отсюда true, а не false. */
+    if (!make_buf(vm, &src, &R[first->a].t))          return true;
+    if (!make_buf(vm, &dst, &R[chain[n - 1u]->d].t))  return true;
+
+    for (uint32_t i = 0; i < n; i++) {
+        const SmpInstr *c = chain[i];
+        const int       f = fuse_op_of(c->op);
+
+        memset(&steps[i], 0, sizeof steps[i]);
+        steps[i].op = (uint8_t)f;
+
+        if (f == (int)SMP_FOP_SCALE) {
+            steps[i].k = smp_const_as_double(mod->consts[c->k], c->aux);
+        } else if (f == (int)SMP_FOP_ADD || f == (int)SMP_FOP_MUL) {
+            if (!make_buf(vm, &steps[i].b, &R[c->b].t)) return true;
+        }
+    }
+
+    apply_fp(vm, first->flags);
+    smp_k_fuse(&dst, &src, steps, n);
+
+    /* Диспетчеризация была одна, а инструкций израсходовано n: счётчик должен
+     * показывать исполненное, а не продиспетчеризованное. */
+    vm->n_executed += n - 1u;
+    *ipp = ip;
+    return true;
+}
+
+/* ========================================================================== */
 /*  Главный цикл                                                              */
 /* ========================================================================== */
 
@@ -406,6 +494,8 @@ dispatch_switch:
         VM_NEXT();
 
     VM_CASE(RELU)
+        if (SMP_UNLIKELY(in->flags & SMP_IF_FUSE) && vm_fuse(vm, &ip, in))
+            VM_NEXT();
         apply_fp(vm, in->flags);
         if (!make_buf(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t)) return SMP_ERR_INTERNAL;
@@ -413,6 +503,8 @@ dispatch_switch:
         VM_NEXT();
 
     VM_CASE(ABS)
+        if (SMP_UNLIKELY(in->flags & SMP_IF_FUSE) && vm_fuse(vm, &ip, in))
+            VM_NEXT();
         apply_fp(vm, in->flags);
         if (!make_buf(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t)) return SMP_ERR_INTERNAL;
@@ -420,6 +512,8 @@ dispatch_switch:
         VM_NEXT();
 
     VM_CASE(SCALE)
+        if (SMP_UNLIKELY(in->flags & SMP_IF_FUSE) && vm_fuse(vm, &ip, in))
+            VM_NEXT();
         apply_fp(vm, in->flags);
         if (!make_buf(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t)) return SMP_ERR_INTERNAL;
@@ -427,6 +521,8 @@ dispatch_switch:
         VM_NEXT();
 
     VM_CASE(ADD)
+        if (SMP_UNLIKELY(in->flags & SMP_IF_FUSE) && vm_fuse(vm, &ip, in))
+            VM_NEXT();
         apply_fp(vm, in->flags);
         if (!make_buf(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t) ||
@@ -435,6 +531,8 @@ dispatch_switch:
         VM_NEXT();
 
     VM_CASE(MUL)
+        if (SMP_UNLIKELY(in->flags & SMP_IF_FUSE) && vm_fuse(vm, &ip, in))
+            VM_NEXT();
         apply_fp(vm, in->flags);
         if (!make_buf(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t) ||

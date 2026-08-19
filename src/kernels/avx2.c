@@ -62,6 +62,62 @@ void smp_ka_scale(float *dst, const float *src, size_t n, float k)
 #undef SCALE_V
 }
 
+/* ========================================================================== */
+/*  Слитая цепочка                                                            */
+/* ========================================================================== */
+
+/* Разбор стадии сидит внутри цикла, но он приходится на восемь элементов
+ * разом и на фоне обращения к памяти не виден. Широковещания констант вынесены
+ * наружу: пересобирать их на каждом векторе незачем. */
+void smp_ka_fuse(float *dst, const float *src, size_t n,
+                 const SmpFuseStep *st, uint32_t ns)
+{
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 absm = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+
+    __m256 kv[SMP_FUSE_MAX];
+    for (uint32_t s = 0; s < ns; s++)
+        kv[s] = _mm256_set1_ps((float)st[s].k);
+
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 x = _mm256_loadu_ps(src + i);
+        for (uint32_t s = 0; s < ns; s++) {
+            switch (st[s].op) {
+                case SMP_FOP_RELU:  x = _mm256_max_ps(x, zero); break;
+                case SMP_FOP_ABS:   x = _mm256_and_ps(x, absm); break;
+                case SMP_FOP_SCALE: x = _mm256_mul_ps(x, kv[s]); break;
+                case SMP_FOP_ADD:
+                    x = _mm256_add_ps(x, _mm256_loadu_ps((const float *)st[s].b.p + i));
+                    break;
+                case SMP_FOP_MUL:
+                    x = _mm256_mul_ps(x, _mm256_loadu_ps((const float *)st[s].b.p + i));
+                    break;
+                default: break;
+            }
+        }
+        _mm256_storeu_ps(dst + i, x);
+    }
+
+    /* Хвост (n % 8) — скалярно, теми же формулами. */
+    for (; i < n; i++) {
+        float x = src[i];
+        for (uint32_t s = 0; s < ns; s++) {
+            const float y = (st[s].op == SMP_FOP_ADD || st[s].op == SMP_FOP_MUL)
+                                ? ((const float *)st[s].b.p)[i] : 0.0f;
+            switch (st[s].op) {
+                case SMP_FOP_RELU:  x = x > 0.0f ? x : 0.0f; break;
+                case SMP_FOP_ABS:   x = x < 0.0f ? -x : x;   break;
+                case SMP_FOP_SCALE: x = x * (float)st[s].k;  break;
+                case SMP_FOP_ADD:   x = x + y;               break;
+                case SMP_FOP_MUL:   x = x * y;               break;
+                default: break;
+            }
+        }
+        dst[i] = x;
+    }
+}
+
 #define SMP_BINARY_BODY(OPV, OPS)                                             \
     size_t i = 0;                                                             \
     for (; i + 16 <= n; i += 16) {                                            \

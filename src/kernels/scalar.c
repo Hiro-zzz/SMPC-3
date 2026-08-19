@@ -323,6 +323,62 @@ void smp_ks_mul(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b)
 }
 
 /* ========================================================================== */
+/*  Слитая цепочка                                                            */
+/* ========================================================================== */
+
+/* Эталон слияния: элемент читается один раз, прогоняется через все стадии и
+ * один раз пишется. Промежуточных буферов нет вовсе.
+ *
+ * Разбор стадии на каждом элементе тут остаётся — цепочка известна только в
+ * рантайме, и специализировать её нечем. Зато вместо N проходов по памяти
+ * получается один, а на длинах, ради которых всё затевалось, платит именно
+ * память. */
+void smp_ks_fuse(const SmpBuf *dst, const SmpBuf *src,
+                 const SmpFuseStep *st, uint32_t ns)
+{
+    const SmpTensor *td = dst->t, *ts = src->t;
+    const SmpDType   dd = (SmpDType)td->dtype, ds = (SmpDType)ts->dtype;
+
+    if (td->nelem == 0) return;
+
+    /* Плотный случай идёт линейно; иначе честно считаем индексы по шагам. */
+    const bool lin = dense(td) && dense(ts) && td->nelem == ts->nelem;
+
+    uint32_t idx[SMP_MAX_RANK] = { 0, 0, 0, 0 };
+    uint32_t i = 0;
+
+    for (;;) {
+        const size_t oi = lin ? (size_t)i : elem_index(ts, idx);
+        const size_t oo = lin ? (size_t)i : elem_index(td, idx);
+
+        double x = load_at(src->p, ds, oi);
+
+        for (uint32_t s = 0; s < ns; s++) {
+            switch (st[s].op) {
+                case SMP_FOP_RELU:  x = x > 0.0 ? x : 0.0; break;
+                case SMP_FOP_ABS:   x = x < 0.0 ? -x : x;  break;
+                case SMP_FOP_SCALE: x = x * st[s].k;       break;
+
+                case SMP_FOP_ADD:
+                case SMP_FOP_MUL: {
+                    const SmpTensor *tb = st[s].b.t;
+                    const size_t ob = lin ? (size_t)i : elem_index(tb, idx);
+                    const double y = load_at(st[s].b.p, (SmpDType)tb->dtype, ob);
+                    x = (st[s].op == SMP_FOP_ADD) ? x + y : x * y;
+                    break;
+                }
+                default: break;
+            }
+        }
+
+        store_at(dst->p, dd, oo, x);
+
+        if (lin) { if (++i >= td->nelem) break; }
+        else     { if (!idx_next(td, idx)) break; }
+    }
+}
+
+/* ========================================================================== */
 /*  Свёртки                                                                   */
 /* ========================================================================== */
 

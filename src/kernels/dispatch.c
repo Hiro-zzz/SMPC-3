@@ -134,6 +134,30 @@ void smp_k_mul(const SmpBuf *d, const SmpBuf *a, const SmpBuf *b)
         smp_ks_mul(d, a, b);
 }
 
+void smp_k_fuse(const SmpBuf *dst, const SmpBuf *src,
+                const SmpFuseStep *steps, uint32_t nsteps)
+{
+    resolve();
+
+    /* Векторная ветка требует того же, что и обычные поэлементные: f32,
+     * плотно, совпадающее число элементов — и это должно держаться для КАЖДОГО
+     * операнда цепочки, иначе считает эталон. */
+    if (g_use_avx2 && dense_f32(dst->t) && dense_f32(src->t) &&
+        dst->t->nelem == src->t->nelem) {
+        bool ok = true;
+        for (uint32_t i = 0; i < nsteps && ok; i++)
+            if (steps[i].op == SMP_FOP_ADD || steps[i].op == SMP_FOP_MUL)
+                ok = dense_f32(steps[i].b.t) &&
+                     steps[i].b.t->nelem == dst->t->nelem;
+        if (ok) {
+            smp_ka_fuse((float *)dst->p, (const float *)src->p,
+                        dst->t->nelem, steps, nsteps);
+            return;
+        }
+    }
+    smp_ks_fuse(dst, src, steps, nsteps);
+}
+
 double smp_k_reduce_add(const SmpBuf *s)
 {
     resolve();

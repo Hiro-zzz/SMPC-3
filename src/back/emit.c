@@ -359,6 +359,97 @@ static bool needs_buffer(SmpOpKind k)
     }
 }
 
+/* Стадии, которые умеет сливать рантайм: строго поэлементные, форма не
+ * меняется, промежуточный результат нужен только следующей стадии. */
+static bool fusable_op(SmpOpKind k)
+{
+    switch (k) {
+        case SMP_OP_RELU: case SMP_OP_ABS: case SMP_OP_SCALE:
+        case SMP_OP_ADD:  case SMP_OP_MUL:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Какие поля инструкции реально заняты — по формату из реестра опкодов, а не
+ * по догадке: у унарных операций b просто ноль, и принимать этот ноль за
+ * номер регистра значило бы отказываться от слияния почти всегда. */
+static bool fmt_uses_d(SmpOpFmt f) { return f != SMP_FMT_NONE && f != SMP_FMT_T_A; }
+static bool fmt_uses_b(SmpOpFmt f) { return f == SMP_FMT_D_A_B || f == SMP_FMT_D_A_B_K; }
+static bool fmt_uses_a(SmpOpFmt f)
+{
+    return f == SMP_FMT_D_A   || f == SMP_FMT_D_A_B  || f == SMP_FMT_D_A_K ||
+           f == SMP_FMT_D_A_B_K || f == SMP_FMT_T_A  || f == SMP_FMT_D_A_X;
+}
+
+/* Поднимает загрузки дескрипторов [from, n_code) выше всей цепочки — к
+ * позиции at. Цепочку VM собирает по СОСЕДНИМ инструкциям, а эмиттер ставит
+ * loadt приёмника прямо перед стадией, которая его использует:
+ *
+ *      loadt r2, %t2          loadt r2, %t2
+ *      add   r2, r0, r1       loadt r3, D
+ *      relu  r2, r2      ->   add   r2, r0, r1
+ *      loadt r3, D            relu  r2, r2
+ *      scale r3, r2, K        scale r3, r2, K
+ *
+ * Опускать вместо этого предыдущую стадию нельзя: загрузка тогда встаёт между
+ * ней и стадией до неё и рвёт уже собранную пару.
+ *
+ * loadt не читает регистров, так что перестановка безопасна, пока загрузка не
+ * пишет в регистр, занятый инструкцией, через которую она перепрыгивает.
+ * Возвращает новое начало цепочки или 0xFFFFFFFF, если поднять нельзя. */
+static uint32_t hoist_loads(Em *m, uint32_t at, uint32_t from)
+{
+    if (at > from || from > m->n_code) return 0xFFFFFFFFu;
+
+    const uint32_t nload = m->n_code - from;
+    if (nload == 0u) return at;              /* поднимать нечего */
+
+    for (uint32_t i = from; i < m->n_code; i++)
+        if (m->code[i].op != SMP_BC_LOADT) return 0xFFFFFFFFu;
+
+    for (uint32_t i = from; i < m->n_code; i++) {
+        const uint8_t rd = m->code[i].d;
+        for (uint32_t j = at; j < from; j++) {
+            const SmpInstr *o = &m->code[j];
+            const SmpOpFmt  f = smp_opcode_def((SmpOpcode)o->op)->fmt;
+            if (fmt_uses_d(f) && o->d == rd) return 0xFFFFFFFFu;
+            if (fmt_uses_a(f) && o->a == rd) return 0xFFFFFFFFu;
+            if (fmt_uses_b(f) && o->b == rd) return 0xFFFFFFFFu;
+        }
+    }
+
+    /* Поворот [at, n_code): хвост из загрузок уезжает в начало. */
+    SmpInstr   ld[SMP_MAX_REGS];
+    SmpDbgLine dl[SMP_MAX_REGS];
+    if (nload > SMP_ARRLEN(ld)) return 0xFFFFFFFFu;
+
+    const bool dbg_ok = (m->n_dbg == m->n_code);
+    for (uint32_t i = 0; i < nload; i++) {
+        ld[i] = m->code[from + i];
+        if (dbg_ok) dl[i] = m->dbg[from + i];
+    }
+
+    const uint32_t nmove = from - at;
+    memmove(&m->code[at + nload], &m->code[at], nmove * sizeof(SmpInstr));
+    for (uint32_t i = 0; i < nload; i++) m->code[at + i] = ld[i];
+
+    /* Отладочная таблица позиционна: instr — это индекс, а строка и колонка
+     * обязаны переехать вместе с кодом. */
+    if (dbg_ok) {
+        for (uint32_t i = nmove; i-- > 0; ) {
+            m->dbg[at + nload + i].line = m->dbg[at + i].line;
+            m->dbg[at + nload + i].col  = m->dbg[at + i].col;
+        }
+        for (uint32_t i = 0; i < nload; i++) {
+            m->dbg[at + i].line = dl[i].line;
+            m->dbg[at + i].col  = dl[i].col;
+        }
+    }
+    return at + nload;
+}
+
 /* ========================================================================== */
 /*  Инструкция целиком                                                        */
 /* ========================================================================== */
@@ -390,6 +481,10 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
     uint32_t r = load_value(m, &s->source, &in->src_val, flags, in->arena_id);
 
     /* --- стадии --- */
+    uint32_t  prev_instr  = 0xFFFFFFFFu;  /* инструкция предыдущей стадии    */
+    SmpOpKind prev_kind   = SMP_OP__COUNT;
+    uint32_t  chain_start = 0xFFFFFFFFu;  /* первая инструкция цепочки       */
+
     for (uint32_t i = 0; i < s->nstages; i++) {
         const SmpAstStage *st = &s->stages[i];
         const SmpOpKind    k  = in->ops[i];
@@ -459,7 +554,26 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
             m->reg_scratch[d] = m->reg_scratch[a];
         }
 
+        /* Две поэлементные стадии подряд считаются за один проход по памяти:
+         * промежуточный буфер читает только следующая стадия, и писать его
+         * незачем. Утверждать это может лишь компилятор — VM сама не знает,
+         * что буфер больше никем не читается. */
+        bool chain = (prev_instr != 0xFFFFFFFFu) &&
+                     fusable_op(prev_kind) && fusable_op(k);
+        if (chain) {
+            const uint32_t ns = hoist_loads(m, chain_start, prev_instr + 1u);
+            if (ns == 0xFFFFFFFFu) chain = false;
+            else                   chain_start = ns;
+        }
+
         emit_aux(m, bc, flags, d, a, b, kk, kaux);
+
+        if (chain && m->n_code >= 2u)
+            m->code[m->n_code - 2u].flags |= SMP_IF_FUSE;
+
+        prev_instr = m->n_code ? m->n_code - 1u : 0xFFFFFFFFu;
+        prev_kind  = k;
+        if (!chain) chain_start = prev_instr;
         r = d;
     }
 
