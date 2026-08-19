@@ -11,9 +11,13 @@
  */
 #include "impl.h"
 
+#include "smpc3/cpu.h"
+
 #include <immintrin.h>
 #include <string.h>
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 /* ========================================================================== */
 /*  Поэлементные                                                              */
@@ -312,9 +316,78 @@ double smp_ka_fuse_reduce(const float *src, size_t n,
  * плюс упаковка A убирают этот обрыв. */
 #define MR 6u
 #define NR 16u
-#define KC 256u
-#define NC 256u
-#define MC 96u        /* кратно MR */
+
+/* Значения по умолчанию выбраны развёрткой на Raptor Lake и подтверждены
+ * замером: соседние точки либо в пределах шума, либо хуже. «Больше» здесь не
+ * значит «лучше» — MC=384 роняет N=1024 со 117 до 85 ГФЛОПС, KC=512 роняет
+ * N=512 со 119 до 88. Разброс между прогонами одной сборки при этом доходит
+ * до 13%, так что подбирать эти числа тоньше попросту нечем. */
+#define MC_DEF 96u    /* кратно MR */
+#define KC_DEF 256u
+#define NC_DEF 256u   /* кратно NR */
+
+/* Ниже этого ужимать бессмысленно: панель перестаёт окупать упаковку. */
+#define MC_MIN 24u
+#define KC_MIN 64u
+#define NC_MIN 64u
+
+static uint32_t g_mc = MC_DEF, g_kc = KC_DEF, g_nc = NC_DEF;
+static bool     g_blk_ready = false;
+
+static size_t panels_bytes(uint32_t mc, uint32_t kc, uint32_t nc)
+{
+    return ((size_t)mc * kc + (size_t)kc * nc) * sizeof(float);
+}
+
+void smp_k_gemm_block_for(uint32_t l2_bytes,
+                          uint32_t *mc, uint32_t *kc, uint32_t *nc)
+{
+    uint32_t m = MC_DEF, k = KC_DEF, n = NC_DEF;
+
+    /* Четверть L2 оставлена под строку C, стек и всё, что ядру тоже нужно. */
+    if (l2_bytes) {
+        const size_t budget = (size_t)l2_bytes * 3u / 4u;
+
+        /* KC входит в обе панели, поэтому ужимается первым — он сокращает их
+         * разом. Затем NC: панель B крупнее. MC трогается последним. */
+        while (panels_bytes(m, k, n) > budget && k > KC_MIN) k -= 8u;
+        while (panels_bytes(m, k, n) > budget && n > NC_MIN) n -= NR;
+        while (panels_bytes(m, k, n) > budget && m > MC_MIN) m -= MR;
+    }
+
+    if (mc) *mc = m;
+    if (kc) *kc = k;
+    if (nc) *nc = n;
+}
+
+/* Разрешается один раз. Точка входа гарантированно одна: GEMM не запускается
+ * без рабочей памяти, а её размер спрашивают через smp_k_scratch_bytes — и в
+ * пуле это происходит на подъёме, до появления потоков. */
+static void blk_resolve(void)
+{
+    if (g_blk_ready) return;
+
+    /* Подмена руками — чтобы воспроизвести чужой замер, не имея того же
+     * процессора. Ровно та же роль, что у SMPC3_VEC_BITS. */
+    const char *env = getenv("SMPC3_GEMM_BLOCK");
+    unsigned    em = 0, ek = 0, en = 0;
+    if (env && sscanf(env, "%u,%u,%u", &em, &ek, &en) == 3 && em && ek && en) {
+        g_mc = (uint32_t)(em - em % MR); if (g_mc < MR) g_mc = MR;
+        g_kc = (uint32_t)ek;
+        g_nc = (uint32_t)(en - en % NR); if (g_nc < NR) g_nc = NR;
+    } else {
+        smp_k_gemm_block_for(smp_cpu()->l2_bytes, &g_mc, &g_kc, &g_nc);
+    }
+    g_blk_ready = true;
+}
+
+void smp_k_gemm_block(uint32_t *mc, uint32_t *kc, uint32_t *nc)
+{
+    blk_resolve();
+    if (mc) *mc = g_mc;
+    if (kc) *kc = g_kc;
+    if (nc) *nc = g_nc;
+}
 
 /* Размеры панелей известны на этапе компиляции, а сама память приходит
  * снаружи — по одному комплекту на инстанс VM.
@@ -323,7 +396,8 @@ double smp_ka_fuse_reduce(const float *src, size_t n,
  * Вместе укладываются в L2 современного ядра. */
 size_t smp_k_scratch_bytes(void)
 {
-    return (size_t)(MC * KC + KC * NC) * sizeof(float) + SMP_CACHELINE;
+    blk_resolve();
+    return panels_bytes(g_mc, g_kc, g_nc) + SMP_CACHELINE;
 }
 
 void smp_k_scratch_bind(SmpKScratch *s, void *mem, size_t bytes)
@@ -337,7 +411,7 @@ void smp_k_scratch_bind(SmpKScratch *s, void *mem, size_t bytes)
     uint8_t *p = (uint8_t *)mem;
     p = (uint8_t *)SMP_ALIGN_UP((uintptr_t)p, SMP_CACHELINE);
     s->apack = (float *)p;
-    s->bpack = (float *)(p + (size_t)MC * KC * sizeof(float));
+    s->bpack = (float *)(p + (size_t)g_mc * g_kc * sizeof(float));
     s->bytes = bytes;
 }
 
@@ -433,16 +507,18 @@ void smp_ka_gemm(float *C, size_t ldc, const float *A, size_t lda,
 
     float SMP_ALIGNED(64) ctile[MR * NR];
 
-    for (size_t j0 = 0; j0 < N; j0 += NC) {
-        const size_t nc = (N - j0 < NC) ? (N - j0) : NC;
+    const size_t BMC = g_mc, BKC = g_kc, BNC = g_nc;
 
-        for (size_t k0 = 0; k0 < K; k0 += KC) {
-            const size_t kc = (K - k0 < KC) ? (K - k0) : KC;
+    for (size_t j0 = 0; j0 < N; j0 += BNC) {
+        const size_t nc = (N - j0 < BNC) ? (N - j0) : BNC;
+
+        for (size_t k0 = 0; k0 < K; k0 += BKC) {
+            const size_t kc = (K - k0 < BKC) ? (K - k0) : BKC;
 
             pack_b(bpack, B + k0 * ldb + j0, ldb, kc, nc);
 
-            for (size_t i0 = 0; i0 < M; i0 += MC) {
-                const size_t mc = (M - i0 < MC) ? (M - i0) : MC;
+            for (size_t i0 = 0; i0 < M; i0 += BMC) {
+                const size_t mc = (M - i0 < BMC) ? (M - i0) : BMC;
 
                 pack_a(apack, A + i0 * lda + k0, lda, mc, kc);
 

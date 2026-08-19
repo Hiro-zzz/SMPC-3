@@ -53,6 +53,45 @@ static uint32_t smp__n_logical(void)
 #endif
 }
 
+/* Детерминированные параметры кэшей: лист 4 у Intel, 0x8000001D у AMD —
+ * формат подлистов одинаковый.
+ *
+ *   eax[4:0]   тип   (0 — подлистов больше нет, 1 — данные, 2 — код, 3 — общий)
+ *   eax[7:5]   уровень
+ *   ebx[11:0]  длина линии - 1
+ *   ebx[21:12] разделов - 1
+ *   ebx[31:22] путей - 1
+ *   ecx        наборов - 1
+ *
+ * Размер = пути * разделы * линия * наборы. */
+static void smp__detect_caches(SmpCpu *c, int leaf)
+{
+    for (int sub = 0; sub < 16; sub++) {
+        int r[4];
+        smp__cpuidex(r, leaf, sub);
+
+        const uint32_t type = (uint32_t)r[0] & 0x1Fu;
+        if (type == 0u) break;                     /* подлисты кончились */
+        if (type == 2u) continue;                  /* кэш кода не интересует */
+
+        const uint32_t level = ((uint32_t)r[0] >> 5) & 0x7u;
+        const uint64_t line  = (((uint32_t)r[1]) & 0xFFFu) + 1u;
+        const uint64_t parts = ((((uint32_t)r[1]) >> 12) & 0x3FFu) + 1u;
+        const uint64_t ways  = ((((uint32_t)r[1]) >> 22) & 0x3FFu) + 1u;
+        const uint64_t sets  = (uint64_t)(uint32_t)r[2] + 1u;
+
+        const uint64_t bytes = ways * parts * line * sets;
+        if (bytes == 0u || bytes > 0xFFFFFFFFull) continue;
+
+        switch (level) {
+            case 1: if (type == 1u || type == 3u) c->l1d_bytes = (uint32_t)bytes; break;
+            case 2: c->l2_bytes = (uint32_t)bytes; break;
+            case 3: c->l3_bytes = (uint32_t)bytes; break;
+            default: break;
+        }
+    }
+}
+
 static void smp__detect(void)
 {
     int r[4];
@@ -73,6 +112,13 @@ static void smp__detect(void)
         g_cpu.brand[48] = '\0';
     } else {
         snprintf(g_cpu.brand, sizeof g_cpu.brand, "unknown x86-64");
+    }
+
+    /* Кэши: сперва лист 4, при неудаче — расширенный лист AMD. */
+    if (max_leaf >= 4) smp__detect_caches(&g_cpu, 4);
+    if (!g_cpu.l2_bytes) {
+        smp__cpuidex(r, 0x80000000, 0);
+        if ((unsigned)r[0] >= 0x8000001Du) smp__detect_caches(&g_cpu, 0x8000001D);
     }
 
     if (max_leaf >= 1) {

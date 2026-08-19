@@ -376,6 +376,76 @@ static void test_identity(void)
     }
 }
 
+
+/* ========================================================================== */
+/*  Блокировка GEMM под размер L2                                             */
+/* ========================================================================== */
+
+static size_t blk_panels(uint32_t mc, uint32_t kc, uint32_t nc)
+{
+    return ((size_t)mc * kc + (size_t)kc * nc) * sizeof(float);
+}
+
+static void test_gemm_block(void)
+{
+    SECTION("блокировка под L2");
+
+    uint32_t mc = 0, kc = 0, nc = 0;
+
+    /* Размер неизвестен — берутся значения по умолчанию, а не что попало. */
+    smp_k_gemm_block_for(0, &mc, &kc, &nc);
+    CHECK(mc == 96u && kc == 256u && nc == 256u,
+          "без данных о L2 вышло MC=%u KC=%u NC=%u", mc, kc, nc);
+
+    /* Там, где умолчания и так помещаются, их трогать незачем: на этой машине
+     * поведение обязано остаться прежним до такта. */
+    const uint32_t roomy[] = { 512u * 1024u, 1280u * 1024u, 2048u * 1024u };
+    for (unsigned i = 0; i < 3; i++) {
+        smp_k_gemm_block_for(roomy[i], &mc, &kc, &nc);
+        CHECK(mc == 96u && kc == 256u && nc == 256u,
+              "L2=%u КиБ изменил блокировку на MC=%u KC=%u NC=%u",
+              roomy[i] / 1024u, mc, kc, nc);
+    }
+
+    /* А вот на 256 КиБ умолчания не влезают — 352 КиБ панелей против бюджета
+     * в 192. Ради этого случая всё и делалось: иначе панели вытесняют друг
+     * друга, и упаковка теряет смысл. */
+    smp_k_gemm_block_for(256u * 1024u, &mc, &kc, &nc);
+    CHECK(blk_panels(mc, kc, nc) <= (size_t)(256u * 1024u) * 3u / 4u,
+          "на L2=256 КиБ панели остались %zu Б", blk_panels(mc, kc, nc));
+    CHECK(kc < 256u, "KC не ужался: %u", kc);
+
+    /* Инварианты микроядра: MC кратно MR=6, NC кратно NR=16, и ничего не
+     * схлопнулось в ноль. */
+    const uint32_t sizes[] = { 0u, 128u * 1024u, 256u * 1024u, 384u * 1024u,
+                               512u * 1024u, 1024u * 1024u, 8192u * 1024u };
+    size_t prev = 0;
+    for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+        smp_k_gemm_block_for(sizes[i], &mc, &kc, &nc);
+        CHECK(mc > 0 && kc > 0 && nc > 0,
+              "L2=%u дал нулевой блок", sizes[i]);
+        CHECK(mc % 6u == 0u, "MC=%u не кратно MR", mc);
+        CHECK(nc % 16u == 0u, "NC=%u не кратно NR", nc);
+
+        /* Больше кэш — не меньше панели. Ноль стоит первым и в счёт не идёт. */
+        if (i > 1) {
+            const size_t cur = blk_panels(mc, kc, nc);
+            CHECK(cur >= prev, "L2=%u КиБ дал панели меньше предыдущего шага",
+                  sizes[i] / 1024u);
+            prev = cur;
+        } else if (i == 1) {
+            prev = blk_panels(mc, kc, nc);
+        }
+    }
+
+    /* Рабочая память обязана соответствовать выбранной блокировке: иначе
+     * упаковка вылезет за буфер. */
+    smp_k_gemm_block(&mc, &kc, &nc);
+    CHECK(smp_k_scratch_bytes() >= blk_panels(mc, kc, nc),
+          "рабочей памяти меньше панелей: %zu против %zu",
+          smp_k_scratch_bytes(), blk_panels(mc, kc, nc));
+}
+
 /* ========================================================================== */
 
 int main(void)
@@ -393,6 +463,7 @@ int main(void)
     test_gemm();
     test_fallback();
     test_identity();
+    test_gemm_block();
 
     smp_kernels_select(SMP_KB_AUTO);
     free(g_scmem);
