@@ -1,0 +1,523 @@
+/* SMPC3 :: diag.c -- рендер диагностики. */
+#include "smpc3/diag.h"
+
+#include <string.h>
+#include <stdlib.h>
+
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#  include <io.h>
+#  include <fcntl.h>
+#  define smp__isatty(f) _isatty(_fileno(f))
+#else
+#  include <unistd.h>
+#  define smp__isatty(f) isatty(fileno(f))
+#endif
+
+/* ========================================================================== */
+/*  Реестр                                                                    */
+/* ========================================================================== */
+
+#define SMP_DIAG_ROW(id, text, sev, cat, title, fix) \
+    { text, SMP_SEV_##sev, SMP_CAT_##cat, title, fix },
+
+static const SmpDiagInfo g_info[SMP_DIAG__COUNT] = {
+    SMP_DIAG_CODES(SMP_DIAG_ROW)
+};
+#undef SMP_DIAG_ROW
+
+static const SmpDiagInfo g_info_bogus =
+    { "E????", SMP_SEV_FATAL, SMP_CAT_INTERNAL,
+      "Запрошен несуществующий диагностический код.",
+      "Это баг самого компилятора." };
+
+const SmpDiagInfo *smp_diag_info(SmpDiagCode c)
+{
+    if ((unsigned)c >= (unsigned)SMP_DIAG__COUNT) return &g_info_bogus;
+    return &g_info[c];
+}
+
+SmpDiagCode smp_diag_lookup(const char *text)
+{
+    for (unsigned i = 0; i < SMP_DIAG__COUNT; i++)
+        if (strcmp(g_info[i].text, text) == 0) return (SmpDiagCode)i;
+    return SMP_DIAG__COUNT;
+}
+
+/* ========================================================================== */
+/*  Пулы ДИАГНОЗОВ                                                            */
+/* ========================================================================== */
+
+static const char *const g_pool_lex[] = {
+    "Ты не осилил алфавит. Алфавит — это первое, что осваивают.",
+    "Твой редактор пишет быстрее, чем твой мозг проверяет.",
+    "Символы кончились, а самоуверенность нет."
+};
+static const char *const g_pool_parse[] = {
+    "Грамматика описана на одной странице. Ты не дочитал до конца.",
+    "Форма [ПРЕФИКС] ТЕЛО [СУФФИКС] держится на трёх правилах. Ты нарушил одно.",
+    "Парсер не телепат. Он читает ровно то, что ты написал."
+};
+static const char *const g_pool_type[] = {
+    "Ты складываешь сущности, у которых нет общей природы.",
+    "Система типов существует именно для таких, как ты.",
+    "Неявных приведений нет. Придётся думать."
+};
+static const char *const g_pool_mem[] = {
+    "Твои руки не приспособлены для линейной алгебры.",
+    "Ты умножил корову на радиоприемник.",
+    "Раскладка памяти — не то, что можно угадать интуицией.",
+    "Указатель — это адрес, а не пожелание.",
+    "Границы буфера ты воспринимаешь как рекомендацию. Кремний — нет."
+};
+static const char *const g_pool_simd[] = {
+    "Ты требуешь от процессора инструкций, которых в нём нет.",
+    "Векторные регистры не растягиваются под твои амбиции.",
+    "Выравнивание — это не суеверие, это условие корректности."
+};
+static const char *const g_pool_runtime[] = {
+    "Программа дошла до выполнения. Дальше повезло меньше.",
+    "Ты проверил всё, кроме того, что сломалось.",
+    "Арифметика не прощает оптимизма."
+};
+static const char *const g_pool_internal[] = {
+    "Инвариант нарушен внутри компилятора. Здесь ты ни при чём.",
+    "Сломался инструмент, а не пользователь. Редкий случай."
+};
+
+typedef struct { const char *const *items; unsigned n; } SmpPool;
+
+static const SmpPool g_pools[SMP_CAT__COUNT] = {
+    { g_pool_lex,      (unsigned)SMP_ARRLEN(g_pool_lex)      },
+    { g_pool_parse,    (unsigned)SMP_ARRLEN(g_pool_parse)    },
+    { g_pool_type,     (unsigned)SMP_ARRLEN(g_pool_type)     },
+    { g_pool_mem,      (unsigned)SMP_ARRLEN(g_pool_mem)      },
+    { g_pool_simd,     (unsigned)SMP_ARRLEN(g_pool_simd)     },
+    { g_pool_runtime,  (unsigned)SMP_ARRLEN(g_pool_runtime)  },
+    { g_pool_internal, (unsigned)SMP_ARRLEN(g_pool_internal) }
+};
+
+/* Детерминированный выбор: одно и то же место в коде всегда получает один и
+ * тот же диагноз. Это делает вывод воспроизводимым для golden-тестов. */
+static uint64_t smp__mix(uint64_t x)
+{
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+static const char *smp__diagnosis(SmpDiagCtx *d, SmpDiagCode code, SmpSpan sp)
+{
+    const SmpDiagInfo *inf = smp_diag_info(code);
+    const SmpPool *p = &g_pools[(unsigned)inf->cat < SMP_CAT__COUNT ? inf->cat : SMP_CAT_INTERNAL];
+    if (p->n == 0) return "Диагноз не сформулирован.";
+
+    uint64_t seed = d->deterministic
+        ? smp__mix(((uint64_t)code << 40) ^ ((uint64_t)sp.line << 16) ^ sp.col)
+        : smp__mix(d->rng += 0x2545F4914F6CDD1Dull);
+    return p->items[seed % p->n];
+}
+
+/* ========================================================================== */
+/*  UTF-8 и работа со строками                                                */
+/* ========================================================================== */
+
+/* Число кодовых точек в первых nbytes байтах. Продолжения (10xxxxxx) не в счёт. */
+static size_t smp__u8len(const char *s, size_t nbytes)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < nbytes; i++)
+        if (((unsigned char)s[i] & 0xC0u) != 0x80u) n++;
+    return n;
+}
+
+/* ========================================================================== */
+/*  Цвета                                                                     */
+/* ========================================================================== */
+
+#define C_RESET "\x1b[0m"
+#define C_BOLD  "\x1b[1m"
+#define C_DIM   "\x1b[2m"
+#define C_RED   "\x1b[91m"
+#define C_YEL   "\x1b[93m"
+#define C_CYN   "\x1b[96m"
+#define C_BLU   "\x1b[94m"
+#define C_GRN   "\x1b[92m"
+#define C_MAG   "\x1b[95m"
+
+static const char *smp__c(const SmpDiagCtx *d, const char *seq)
+{
+    return d->color ? seq : "";
+}
+
+static const char *smp__sev_color(const SmpDiagCtx *d, SmpSeverity s)
+{
+    if (!d->color) return "";
+    switch (s) {
+        case SMP_SEV_FATAL: return C_RED;
+        case SMP_SEV_WARN:  return C_YEL;
+        default:            return C_CYN;
+    }
+}
+
+static const char *smp__sev_banner(SmpSeverity s)
+{
+    switch (s) {
+        case SMP_SEV_FATAL: return "FATAL SKILL ISSUE";
+        case SMP_SEV_WARN:  return "SKILL ISSUE";
+        default:            return "NOTE";
+    }
+}
+
+/* ========================================================================== */
+/*  Контекст                                                                  */
+/* ========================================================================== */
+
+void smp_diag_init(SmpDiagCtx *d, const SmpSource *src, FILE *out)
+{
+    memset(d, 0, sizeof(*d));
+    d->src           = src;
+    d->out           = out ? out : stderr;
+    d->color         = smp__isatty(d->out) ? true : false;
+    d->deterministic = true;
+    d->rng           = 0x123456789ABCDEFull;
+}
+
+void smp_console_setup(void)
+{
+#if defined(_WIN32)
+    /* Текстовый режим Windows подменяет каждый \n на \r\n. Для @emit.text это
+     * недопустимо: язык обещает вывести ровно те кодовые точки, которые
+     * посчитаны, а не «примерно те же плюс возврат каретки». Переводим stdout
+     * в двоичный режим — терминалы одиночный \n понимают прекрасно. */
+    _setmode(_fileno(stdout), _O_BINARY);
+
+    SetConsoleOutputCP(CP_UTF8);
+    DWORD mode;
+    HANDLE h[2] = { GetStdHandle(STD_OUTPUT_HANDLE), GetStdHandle(STD_ERROR_HANDLE) };
+    for (int i = 0; i < 2; i++) {
+        if (h[i] && h[i] != INVALID_HANDLE_VALUE && GetConsoleMode(h[i], &mode))
+            SetConsoleMode(h[i], mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }
+#endif
+    /* Диагностика должна доходить до пользователя целиком даже если процесс
+     * умирает следующей инструкцией. */
+    setvbuf(stderr, NULL, _IONBF, 0);
+}
+
+const char *smp_fmt(SmpDiagCtx *d, const char *fmt, ...)
+{
+    char *slot = d->fmtbuf[d->fmtslot];
+    d->fmtslot = (d->fmtslot + 1u) % SMP_FMT_SLOTS;
+
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(slot, SMP_FMT_SLOTLEN, fmt, ap);
+    va_end(ap);
+    return slot;
+}
+
+/* ========================================================================== */
+/*  Извлечение строки исходника                                               */
+/* ========================================================================== */
+
+typedef struct { const char *p; size_t len; } SmpLineRef;
+
+static bool smp__line_at(const SmpSource *src, uint32_t line, SmpLineRef *out)
+{
+    if (!src || !src->text || line == 0) return false;
+
+    const char *s = src->text, *end = src->text + src->len;
+    uint32_t cur = 1;
+    const char *ls = s;
+
+    while (ls < end && cur < line) {
+        const char *nl = (const char *)memchr(ls, '\n', (size_t)(end - ls));
+        if (!nl) return false;
+        ls = nl + 1;
+        cur++;
+    }
+    if (cur != line || ls > end) return false;
+
+    const char *nl = (const char *)memchr(ls, '\n', (size_t)(end - ls));
+    const char *le = nl ? nl : end;
+    if (le > ls && le[-1] == '\r') le--;
+
+    out->p   = ls;
+    out->len = (size_t)(le - ls);
+    return true;
+}
+
+SmpSpan smp_span_from_offset(const SmpSource *src, size_t off, uint32_t len)
+{
+    SmpSpan sp = { 1, 1, len };
+    if (!src || !src->text) return sp;
+    if (off > src->len) off = src->len;
+
+    uint32_t line = 1;
+    size_t   ls   = 0;
+    for (size_t i = 0; i < off; i++) {
+        if (src->text[i] == '\n') { line++; ls = i + 1; }
+    }
+    sp.line = line;
+    sp.col  = (uint32_t)(off - ls) + 1u;
+    return sp;
+}
+
+/* ========================================================================== */
+/*  Рендер сниппета                                                           */
+/* ========================================================================== */
+
+#define SMP_TABW      4u
+#define SMP_LINE_CAP  2048u   /* байт исходной строки, дальше — обрезка       */
+#define SMP_VIEW_COLS 132u    /* ширина окна вывода в кодовых точках          */
+
+/* Разворачивает табуляции и считает позицию каретки в кодовых точках. */
+typedef struct {
+    char     buf[SMP_LINE_CAP * 2u];
+    size_t   nbytes;
+    uint32_t ncols;         /* всего кодовых точек                            */
+    uint32_t cp_off[SMP_LINE_CAP + 1u]; /* байтовое смещение каждой к.точки   */
+    uint32_t caret_col;     /* 0-based, в кодовых точках                      */
+    uint32_t caret_len;     /* в кодовых точках, >=1                          */
+} SmpRendered;
+
+static void smp__render_line(const SmpLineRef *ln, const SmpSpan *sp, SmpRendered *r)
+{
+    r->nbytes    = 0;
+    r->ncols     = 0;
+    r->caret_col = 0;
+    r->caret_len = sp->len ? sp->len : 1u;
+
+    const size_t n = ln->len > SMP_LINE_CAP ? SMP_LINE_CAP : ln->len;
+    const size_t caret_byte = sp->col ? (size_t)sp->col - 1u : 0u;
+    const size_t caret_end  = caret_byte + (sp->len ? sp->len : 1u);
+
+    uint32_t caret_col_set = 0, caret_end_col = 0;
+
+    for (size_t i = 0; i <= n; i++) {
+        if (i == caret_byte) { r->caret_col = r->ncols; caret_col_set = 1; }
+        if (i == caret_end)  { caret_end_col = r->ncols; }
+        if (i == n) break;
+
+        const unsigned char c = (unsigned char)ln->p[i];
+
+        if (c == '\t') {
+            uint32_t pad = SMP_TABW - (r->ncols % SMP_TABW);
+            for (uint32_t k = 0; k < pad && r->ncols < SMP_LINE_CAP; k++) {
+                r->cp_off[r->ncols++] = (uint32_t)r->nbytes;
+                r->buf[r->nbytes++]   = ' ';
+            }
+            continue;
+        }
+        if ((c & 0xC0u) != 0x80u) {                 /* начало кодовой точки  */
+            if (r->ncols < SMP_LINE_CAP) r->cp_off[r->ncols++] = (uint32_t)r->nbytes;
+        }
+        /* Управляющие символы заменяем точкой, чтобы не рвать разметку. */
+        r->buf[r->nbytes++] = (c < 0x20u) ? '.' : (char)c;
+    }
+
+    if (!caret_col_set) r->caret_col = r->ncols;
+    if (caret_end_col > r->caret_col) r->caret_len = caret_end_col - r->caret_col;
+    if (r->caret_len == 0) r->caret_len = 1;
+
+    r->cp_off[r->ncols] = (uint32_t)r->nbytes;
+    r->buf[r->nbytes]   = '\0';
+}
+
+/* ========================================================================== */
+/*  Печать блоков                                                             */
+/* ========================================================================== */
+
+/* Поле вида
+ *     |-- ЛЕЙБЛ: первая строка
+ *     |          продолжение
+ * Продолжения выравниваются под первую букву текста. corner — '|' или '+'. */
+static void smp__field(SmpDiagCtx *d, uint32_t gutter, char corner,
+                       const char *label, const char *body)
+{
+    FILE       *o    = d->out;
+    const char *dim  = smp__c(d, C_DIM);
+    const char *rst  = smp__c(d, C_RESET);
+    const char *bold = smp__c(d, C_BOLD);
+
+    /* ширина "-- ЛЕЙБЛ: " в кодовых точках */
+    const int lead = (int)smp__u8len(label, strlen(label)) + 5;
+
+    const char *p     = body ? body : "";
+    bool        first = true;
+
+    for (;;) {
+        const char *nl  = strchr(p, '\n');
+        const int   seg = nl ? (int)(nl - p) : (int)strlen(p);
+
+        if (first) {
+            fprintf(o, "%s%*s%c--%s %s%s:%s %.*s\n",
+                    dim, (int)gutter, "", corner, rst, bold, label, rst, seg, p);
+        } else {
+            fprintf(o, "%s%*s|%s%*s%.*s\n",
+                    dim, (int)gutter, "", rst, lead, "", seg, p);
+        }
+
+        if (!nl) break;
+        p     = nl + 1;
+        first = false;
+    }
+}
+
+static uint32_t smp__ndigits(uint32_t v)
+{
+    uint32_t n = 1;
+    while (v >= 10u) { v /= 10u; n++; }
+    return n;
+}
+
+static void smp__snippet(SmpDiagCtx *d, SmpSpan sp, SmpSeverity sev, uint32_t gutter)
+{
+    SmpLineRef ln;
+    if (!smp__line_at(d->src, sp.line, &ln)) return;
+
+    static SmpRendered r;   /* ~10 KiB: держим в .bss, а не на стеке */
+    smp__render_line(&ln, &sp, &r);
+
+    FILE       *o    = d->out;
+    const char *dim  = smp__c(d, C_DIM);
+    const char *rst  = smp__c(d, C_RESET);
+    const char *sevc = smp__sev_color(d, sev);
+
+    /* Окно вывода: длинные строки подрезаем вокруг каретки. */
+    uint32_t vstart = 0;
+    if (r.ncols > SMP_VIEW_COLS) {
+        const uint32_t half = SMP_VIEW_COLS / 2u;
+        if (r.caret_col > half) vstart = r.caret_col - half;
+        if (vstart + SMP_VIEW_COLS > r.ncols) vstart = r.ncols - SMP_VIEW_COLS;
+    }
+    uint32_t vend = vstart + SMP_VIEW_COLS;
+    if (vend > r.ncols) vend = r.ncols;
+
+    const char  *seg    = r.buf + r.cp_off[vstart];
+    const int    seglen = (int)(r.cp_off[vend] - r.cp_off[vstart]);
+    const char  *lead   = (vstart > 0)      ? "\xE2\x80\xA6" : "";  /* … */
+    const char  *trail  = (vend < r.ncols)  ? "\xE2\x80\xA6" : "";
+
+    fprintf(o, "%s%*u |%s %s%.*s%s\n",
+            dim, (int)gutter - 1, sp.line, rst, lead, seglen, seg, trail);
+
+    /* Каретка. */
+    uint32_t cc = (r.caret_col >= vstart) ? r.caret_col - vstart : 0u;
+    if (vstart > 0) cc += 1u;                       /* поправка на многоточие */
+    uint32_t cl = r.caret_len;
+    if (cc + cl > SMP_VIEW_COLS + 1u) cl = SMP_VIEW_COLS + 1u - cc;
+    if (cl == 0) cl = 1;
+
+    fprintf(o, "%s%*s|%s %*s%s%s", dim, (int)gutter, "", rst, (int)cc, "",
+            smp__c(d, C_BOLD), sevc);
+    fputc('^', o);
+    for (uint32_t i = 1; i < cl; i++) fputc('~', o);
+    fprintf(o, "%s\n", rst);
+}
+
+static void smp__emit(SmpDiagCtx *d, const SmpDiagMsg *m)
+{
+    const SmpDiagInfo *inf = smp_diag_info(m->code);
+    FILE              *o   = d->out;
+
+    switch (inf->sev) {
+        case SMP_SEV_FATAL: d->n_fatal++; break;
+        case SMP_SEV_WARN:  d->n_warn++;  break;
+        default:            d->n_note++;  break;
+    }
+
+    const char *dim  = smp__c(d, C_DIM);
+    const char *rst  = smp__c(d, C_RESET);
+    const char *bold = smp__c(d, C_BOLD);
+    const char *sevc = smp__sev_color(d, inf->sev);
+
+    const bool     has_span = smp_span_valid(m->span) && d->src && d->src->text;
+    const uint32_t gutter   = has_span ? (2u + smp__ndigits(m->span.line) + 1u) : 5u;
+
+    /* --- шапка --- */
+    fputc('\n', o);
+    fprintf(o, "%s%s[%s :: %s]%s",
+            bold, sevc, smp__sev_banner(inf->sev), inf->text, rst);
+
+    if (has_span) {
+        fprintf(o, " %sin%s %s:%u:%u\n", dim, rst,
+                d->src->path ? d->src->path : "<memory>", m->span.line, m->span.col);
+        smp__snippet(d, m->span, inf->sev, gutter);
+    } else if (d->src && d->src->path) {
+        fprintf(o, " %sin%s %s\n", dim, rst, d->src->path);
+    } else {
+        fputc('\n', o);
+    }
+
+    /* --- тело --- */
+    smp__field(d, gutter, '|', "ОШИБКА", inf->title);
+
+    if (m->details && m->details[0])
+        smp__field(d, gutter, '|', "ДЕТАЛИ", m->details);
+
+    smp__field(d, gutter, '|', "ДИАГНОЗ",
+               m->diagnosis ? m->diagnosis : smp__diagnosis(d, m->code, m->span));
+
+    smp__field(d, gutter, '+', "ИСПРАВЛЕНИЕ", m->fix ? m->fix : inf->fix);
+
+    if (m->dump_regs && d->regdump) {
+        fputc('\n', o);
+        d->regdump(o, d->regdump_user, d->color);
+    }
+
+    fflush(o);
+}
+
+void smp_diag_emit(SmpDiagCtx *d, const SmpDiagMsg *m)
+{
+    smp__emit(d, m);
+}
+
+void smp_diag_die(SmpDiagCtx *d, const SmpDiagMsg *m)
+{
+    smp__emit(d, m);
+    exit(70);   /* EX_SOFTWARE */
+}
+
+/* ========================================================================== */
+/*  Итог                                                                      */
+/* ========================================================================== */
+
+static const char *smp__plural_ru(uint32_t n, const char *one,
+                                  const char *few, const char *many)
+{
+    const uint32_t n100 = n % 100u, n10 = n % 10u;
+    if (n100 >= 11u && n100 <= 14u) return many;
+    if (n10 == 1u)                  return one;
+    if (n10 >= 2u && n10 <= 4u)     return few;
+    return many;
+}
+
+char *smp_diag_summary(const SmpDiagCtx *d, char *buf, size_t cap)
+{
+    if (d->n_fatal == 0 && d->n_warn == 0) {
+        snprintf(buf, cap, "замечаний нет");
+        return buf;
+    }
+
+    size_t n = 0;
+    int    w;
+
+    if (d->n_fatal) {
+        w = snprintf(buf, cap, "%u %s", d->n_fatal,
+                     smp__plural_ru(d->n_fatal, "фатальная ошибка",
+                                    "фатальные ошибки", "фатальных ошибок"));
+        if (w > 0) n = (size_t)w;
+    }
+    if (d->n_warn && n < cap) {
+        w = snprintf(buf + n, cap - n, "%s%u %s", n ? ", " : "", d->n_warn,
+                     smp__plural_ru(d->n_warn, "предупреждение",
+                                    "предупреждения", "предупреждений"));
+        if (w > 0) n += (size_t)w;
+    }
+    return buf;
+}

@@ -1,0 +1,400 @@
+/* SMPC3 :: test_kernels.c -- проверки Ф6: векторные ядра против эталона.
+ *
+ * Смысл всего файла: быстрая ветка обязана давать ТОТ ЖЕ результат, что и
+ * скалярная. Бит в бит совпадения не требуется — FMA не округляет
+ * промежуточное произведение, а свёртка идёт по нескольким накопителям, —
+ * поэтому сверка идёт по относительной погрешности.
+ */
+#include "smpc3/kernels.h"
+#include "smpc3/cpu.h"
+#include "smpc3/diag.h"
+
+#include "harness.h"
+
+#include <string.h>
+#include <stdlib.h>
+#include <math.h>
+
+/* ========================================================================== */
+/*  Данные                                                                    */
+/* ========================================================================== */
+
+#define MAXN (600u * 600u)
+
+static float SMP_ALIGNED(64) g_a[MAXN];
+static float SMP_ALIGNED(64) g_b[MAXN];
+static float SMP_ALIGNED(64) g_ref[MAXN];
+static float SMP_ALIGNED(64) g_got[MAXN];
+
+/* Детерминированный генератор: тест обязан падать одинаково при каждом
+ * запуске, иначе отлаживать его невозможно. */
+static uint64_t g_rng = 0x243F6A8885A308D3ull;
+
+/* Рабочая память ядер: с тех пор как она перестала быть глобальной, её обязан
+ * предоставить вызывающий — иначе GEMM честно уходит в скалярный эталон. */
+static SmpKScratch g_sc;
+static void *g_scmem;
+
+static float frand(void)
+{
+    g_rng ^= g_rng << 13;
+    g_rng ^= g_rng >> 7;
+    g_rng ^= g_rng << 17;
+    /* Диапазон [-2, 2): нужны и отрицательные, иначе relu не проверяется. */
+    return (float)((double)(g_rng >> 40) / 2097152.0 - 2.0);
+}
+
+static void fill_rand(float *p, size_t n)
+{
+    for (size_t i = 0; i < n; i++) p[i] = frand();
+}
+
+static SmpTensor mk(uint32_t r0, uint32_t r1)
+{
+    SmpTensor t;
+    memset(&t, 0, sizeof t);
+    t.dtype = SMP_DT_F32;
+    if (r1) {
+        t.rank = 2; t.shape[0] = (uint16_t)r0; t.shape[1] = (uint16_t)r1;
+        t.stride[0] = (uint16_t)r1; t.stride[1] = 1;
+        t.nelem = r0 * r1;
+    } else {
+        t.rank = 1; t.shape[0] = (uint16_t)r0; t.stride[0] = 1;
+        t.nelem = r0;
+    }
+    t.flags = SMP_TF_CONTIG;
+    return t;
+}
+
+/* Относительная погрешность между эталоном и быстрой веткой. */
+static double max_rel_err(const float *ref, const float *got, size_t n)
+{
+    double worst = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        const double r = ref[i], g = got[i];
+        if (isnan(r) != isnan(g)) return INFINITY;
+        const double scale = fabs(r) > 1.0 ? fabs(r) : 1.0;
+        const double e = fabs(r - g) / scale;
+        if (e > worst) worst = e;
+    }
+    return worst;
+}
+
+/* ========================================================================== */
+
+static void test_available(void)
+{
+    SECTION("доступность ветки");
+
+    const SmpCpu *c = smp_cpu();
+    const bool hw = (c->isa & SMP_ISA_AVX2) && (c->isa & SMP_ISA_FMA);
+
+    CHECK(smp_kernels_select(SMP_KB_SCALAR), "скалярная ветка обязана быть всегда");
+    CHECK(strcmp(smp_kernels_name(), "scalar") == 0, "имя: %s", smp_kernels_name());
+
+    CHECK(smp_kernels_select(SMP_KB_AVX2) == hw,
+          "выбор avx2 вернул %d, а CPUID говорит %d",
+          (int)smp_kernels_select(SMP_KB_AVX2), (int)hw);
+
+    if (!hw) {
+        fprintf(stderr, "  (на этом процессоре нет AVX2+FMA — сверять не с чем)\n");
+        return;
+    }
+    CHECK(strcmp(smp_kernels_name(), "avx2+fma") == 0, "имя: %s", smp_kernels_name());
+
+    smp_kernels_select(SMP_KB_AUTO);
+    CHECK(strcmp(smp_kernels_name(), "avx2+fma") == 0,
+          "автовыбор не поднял векторную ветку");
+}
+
+/* ========================================================================== */
+
+typedef void (*UnaryOp)(const SmpBuf *, const SmpBuf *);
+
+static void cmp_unary(UnaryOp op, const char *name, size_t n)
+{
+    SmpTensor t = mk((uint32_t)n, 0);
+    SmpBuf src = { g_a, &t }, ref = { g_ref, &t }, got = { g_got, &t };
+
+    smp_kernels_select(SMP_KB_SCALAR);
+    op(&ref, &src);
+    smp_kernels_select(SMP_KB_AVX2);
+    op(&got, &src);
+
+    const double e = max_rel_err(g_ref, g_got, n);
+    CHECK(e == 0.0, "%s(n=%zu): расхождение %g (поэлементные обязаны совпадать точно)",
+          name, n, e);
+}
+
+static void test_elementwise(void)
+{
+    SECTION("поэлементные");
+
+    if (!smp_kernels_select(SMP_KB_AVX2)) return;
+
+    fill_rand(g_a, MAXN > 4096 ? 4096 : MAXN);
+    fill_rand(g_b, 4096);
+
+    /* Длины подобраны так, чтобы задеть все хвосты: кратные 32, 8 и никаким. */
+    static const size_t lens[] = { 0, 1, 7, 8, 9, 31, 32, 33, 255, 256, 1000, 4096 };
+
+    for (size_t i = 0; i < SMP_ARRLEN(lens); i++) {
+        const size_t n = lens[i];
+        if (n == 0) continue;
+        cmp_unary(smp_k_relu, "relu", n);
+        cmp_unary(smp_k_abs,  "abs",  n);
+
+        /* scale и бинарные — отдельно, у них своя сигнатура. */
+        SmpTensor t = mk((uint32_t)n, 0);
+        SmpBuf sa = { g_a, &t }, sb = { g_b, &t };
+        SmpBuf ref = { g_ref, &t }, got = { g_got, &t };
+
+        smp_kernels_select(SMP_KB_SCALAR); smp_k_scale(&ref, &sa, 0.375);
+        smp_kernels_select(SMP_KB_AVX2);   smp_k_scale(&got, &sa, 0.375);
+        CHECK(max_rel_err(g_ref, g_got, n) == 0.0, "scale(n=%zu)", n);
+
+        smp_kernels_select(SMP_KB_SCALAR); smp_k_add(&ref, &sa, &sb);
+        smp_kernels_select(SMP_KB_AVX2);   smp_k_add(&got, &sa, &sb);
+        CHECK(max_rel_err(g_ref, g_got, n) == 0.0, "add(n=%zu)", n);
+
+        smp_kernels_select(SMP_KB_SCALAR); smp_k_mul(&ref, &sa, &sb);
+        smp_kernels_select(SMP_KB_AVX2);   smp_k_mul(&got, &sa, &sb);
+        CHECK(max_rel_err(g_ref, g_got, n) == 0.0, "mul(n=%zu)", n);
+    }
+}
+
+/* ========================================================================== */
+
+static void test_reduce(void)
+{
+    SECTION("свёртки");
+
+    if (!smp_kernels_select(SMP_KB_AVX2)) return;
+
+    static const size_t lens[] = { 1, 7, 8, 33, 255, 256, 1000, 100000 };
+
+    for (size_t i = 0; i < SMP_ARRLEN(lens); i++) {
+        const size_t n = lens[i];
+        fill_rand(g_a, n);
+
+        SmpTensor t = mk((uint32_t)n, 0);
+        SmpBuf s = { g_a, &t };
+
+        smp_kernels_select(SMP_KB_SCALAR);
+        const double r_add = smp_k_reduce_add(&s);
+        const double r_max = smp_k_reduce_max(&s);
+
+        smp_kernels_select(SMP_KB_AVX2);
+        const double v_add = smp_k_reduce_add(&s);
+        const double v_max = smp_k_reduce_max(&s);
+
+        /* Максимум обязан совпасть точно: порядок сравнений на результат не
+         * влияет. */
+        CHECK(r_max == v_max, "reduce.max(n=%zu): %g против %g", n, r_max, v_max);
+
+        /* Сумма — с допуском: порядок сложения разный. */
+        const double scale = fabs(r_add) > 1.0 ? fabs(r_add) : 1.0;
+        const double err   = fabs(r_add - v_add) / scale;
+        CHECK(err < 1e-6, "reduce.add(n=%zu): %.9g против %.9g, отн. ошибка %g",
+              n, r_add, v_add, err);
+    }
+}
+
+/* ========================================================================== */
+
+static void gemm_case(uint32_t M, uint32_t N, uint32_t K)
+{
+    if ((size_t)M * K > MAXN || (size_t)K * N > MAXN || (size_t)M * N > MAXN) return;
+
+    fill_rand(g_a, (size_t)M * K);
+    fill_rand(g_b, (size_t)K * N);
+
+    SmpTensor ta = mk(M, K), tb = mk(K, N), tc = mk(M, N);
+    SmpBuf a = { g_a, &ta }, b = { g_b, &tb };
+    SmpBuf ref = { g_ref, &tc }, got = { g_got, &tc };
+
+    memset(g_ref, 0xCD, (size_t)M * N * sizeof(float));
+    memset(g_got, 0xCD, (size_t)M * N * sizeof(float));
+
+    smp_kernels_select(SMP_KB_SCALAR); smp_k_gemm(&ref, &a, &b, &g_sc);
+    smp_kernels_select(SMP_KB_AVX2);   smp_k_gemm(&got, &a, &b, &g_sc);
+
+    const double e = max_rel_err(g_ref, g_got, (size_t)M * N);
+    CHECK(e < 1e-4, "gemm %ux%ux%u: отн. ошибка %g", M, N, K, e);
+}
+
+static void test_gemm(void)
+{
+    SECTION("GEMM");
+
+    if (!smp_kernels_select(SMP_KB_AVX2)) return;
+
+    /* Ровно по микроядру. */
+    gemm_case(6, 16, 8);
+    gemm_case(12, 32, 16);
+
+    /* Хвосты по строкам: M не кратно MR=6. */
+    gemm_case(1, 16, 8);
+    gemm_case(5, 16, 8);
+    gemm_case(7, 16, 8);
+    gemm_case(13, 16, 8);
+
+    /* Хвосты по столбцам: N не кратно NR=16. */
+    gemm_case(6, 1, 8);
+    gemm_case(6, 15, 8);
+    gemm_case(6, 17, 8);
+    gemm_case(6, 100, 8);
+
+    /* Хвосты по K. */
+    gemm_case(6, 16, 1);
+    gemm_case(6, 16, 7);
+    gemm_case(6, 16, 257);
+
+    /* Оба измерения кривые сразу. */
+    gemm_case(7, 17, 13);
+    gemm_case(23, 41, 37);
+    gemm_case(1, 1, 1);
+
+    /* Больше блоков KC=256 и NC=256 — работает ли сама блокировка. */
+    gemm_case(64, 300, 300);
+    gemm_case(70, 260, 520);
+
+    /* Прямоугольные и «плоские». */
+    gemm_case(200, 3, 200);
+    gemm_case(3, 200, 200);
+    gemm_case(128, 128, 128);
+}
+
+/* ========================================================================== */
+
+static void test_fallback(void)
+{
+    SECTION("отказ от векторной ветки");
+
+    if (!smp_kernels_select(SMP_KB_AVX2)) return;
+
+    /* Разреженный вид: векторная ветка обязана уступить эталону, а результат
+     * остаться правильным. */
+    enum { R = 8, C = 8 };
+    fill_rand(g_a, R * C);
+
+    SmpTensor col;
+    memset(&col, 0, sizeof col);
+    col.dtype = SMP_DT_F32; col.rank = 1;
+    col.shape[0] = R; col.stride[0] = C;   /* столбец: шаг C элементов */
+    col.nelem = R;
+
+    SmpBuf s = { g_a, &col };
+
+    smp_kernels_select(SMP_KB_SCALAR);
+    const double r = smp_k_reduce_add(&s);
+    smp_kernels_select(SMP_KB_AVX2);
+    const double v = smp_k_reduce_add(&s);
+
+    CHECK(r == v, "разреженная свёртка: %.9g против %.9g", r, v);
+
+    /* Проверим вручную: сумма нулевого столбца. */
+    double manual = 0.0;
+    for (int i = 0; i < R; i++) manual += g_a[i * C];
+    CHECK(fabs(manual - v) < 1e-6, "ручная сумма %.9g против %.9g", manual, v);
+
+    /* f64 через векторную ветку не идёт, но обязан считаться верно. */
+    {
+        static double d[64];
+        for (int i = 0; i < 64; i++) d[i] = (double)i;
+        SmpTensor t;
+        memset(&t, 0, sizeof t);
+        t.dtype = SMP_DT_F64; t.rank = 1; t.shape[0] = 64; t.stride[0] = 1; t.nelem = 64;
+        SmpBuf b = { d, &t };
+        smp_kernels_select(SMP_KB_AVX2);
+        CHECK(fabs(smp_k_reduce_add(&b) - 2016.0) < 1e-9,
+              "f64-свёртка: %g", smp_k_reduce_add(&b));
+    }
+
+    /* GEMM с транспонированным (не row-major) операндом — тоже эталон. */
+    {
+        enum { S = 8 };
+        fill_rand(g_a, S * S);
+        fill_rand(g_b, S * S);
+
+        SmpTensor ta = mk(S, S), tc = mk(S, S);
+        SmpTensor tbT;                    /* B как транспонированный вид */
+        memset(&tbT, 0, sizeof tbT);
+        tbT.dtype = SMP_DT_F32; tbT.rank = 2;
+        tbT.shape[0] = S; tbT.shape[1] = S;
+        tbT.stride[0] = 1; tbT.stride[1] = S;   /* шаг по последней оси != 1 */
+        tbT.nelem = S * S;
+
+        SmpBuf a = { g_a, &ta }, b = { g_b, &tbT };
+        SmpBuf ref = { g_ref, &tc }, got = { g_got, &tc };
+
+        smp_kernels_select(SMP_KB_SCALAR); smp_k_gemm(&ref, &a, &b, &g_sc);
+        smp_kernels_select(SMP_KB_AVX2);   smp_k_gemm(&got, &a, &b, &g_sc);
+        CHECK(max_rel_err(g_ref, g_got, S * S) == 0.0,
+              "gemm с транспонированным B ушёл в векторную ветку");
+    }
+}
+
+/* ========================================================================== */
+
+static void test_identity(void)
+{
+    SECTION("проверяемая вручную арифметика");
+
+    if (!smp_kernels_select(SMP_KB_AVX2)) return;
+
+    /* A x I = A для размеров, задевающих и микроядро, и хвосты. */
+    static const uint32_t sizes[] = { 6, 7, 16, 17, 64, 100 };
+
+    for (size_t s = 0; s < SMP_ARRLEN(sizes); s++) {
+        const uint32_t n = sizes[s];
+        fill_rand(g_a, (size_t)n * n);
+
+        memset(g_b, 0, (size_t)n * n * sizeof(float));
+        for (uint32_t i = 0; i < n; i++) g_b[i * n + i] = 1.0f;
+
+        SmpTensor t = mk(n, n);
+        SmpBuf a = { g_a, &t }, b = { g_b, &t }, c = { g_got, &t };
+        smp_k_gemm(&c, &a, &b, &g_sc);
+
+        bool same = true;
+        for (size_t i = 0; i < (size_t)n * n; i++)
+            if (g_got[i] != g_a[i]) same = false;
+        CHECK(same, "A x I != A при n=%u", n);
+    }
+
+    /* Матрица из единиц в квадрате даёт n во всех элементах. */
+    {
+        const uint32_t n = 40;
+        for (size_t i = 0; i < (size_t)n * n; i++) g_a[i] = 1.0f;
+        SmpTensor t = mk(n, n);
+        SmpBuf a = { g_a, &t }, c = { g_got, &t };
+        smp_k_gemm(&c, &a, &a, &g_sc);
+        bool ok = true;
+        for (size_t i = 0; i < (size_t)n * n; i++) if (g_got[i] != (float)n) ok = false;
+        CHECK(ok, "матрица единиц в квадрате: got[0]=%g, ждали %u", g_got[0], n);
+    }
+}
+
+/* ========================================================================== */
+
+int main(void)
+{
+    smp_console_setup();
+    fprintf(stderr, "SMPC3 tests :: Ф6\n\n");
+
+    g_scmem = malloc(smp_k_scratch_bytes());
+    if (!g_scmem) { fprintf(stderr, "нет памяти под ядра\n"); return 70; }
+    smp_k_scratch_bind(&g_sc, g_scmem, smp_k_scratch_bytes());
+
+    test_available();
+    test_elementwise();
+    test_reduce();
+    test_gemm();
+    test_fallback();
+    test_identity();
+
+    smp_kernels_select(SMP_KB_AUTO);
+    free(g_scmem);
+    return REPORT();
+}

@@ -1,0 +1,7 @@
+build/*.o
+build/*.d
+build/*.exe
+build/*.pdb
+build/*.ilk
+build/golden_tmp/
+*.s3b

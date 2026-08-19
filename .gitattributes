@@ -1,0 +1,8 @@
+# Переводы строк — только LF, в репозитории и в рабочей копии.
+# core.autocrlf=true у Git for Windows иначе портит и shell-скрипты
+# (bash спотыкается о \r), и golden-снимки, которые сверяются посимвольно.
+* text=auto eol=lf
+
+*.s3b  binary
+*.exe  binary
+*.o    binary
