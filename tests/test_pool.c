@@ -301,6 +301,54 @@ static void test_threads(void)
     CHECK(c == 6, "счётчик = %d", (int)c);
 }
 
+/* Заявленный потолок обязан быть достижимым. Раньше журналом инстанса был
+ * tmpfile(), и пул упирался в лимит открытых файлов CRT: 509 вместо 1024.
+ * Отказ выглядел как "пул не поднялся" — без кода и без объяснения. */
+static void test_max_instances(void)
+{
+    SECTION("заявленный потолок инстансов");
+
+    if (!compile_str("*&A<f32:4,4> -> @fill(2.0) => *&A;\n"
+                     "*&A -> @reduce.add => $s;\n")) return;
+
+    SmpVMPool p;
+    const uint32_t n = SMP_POOL_MAX_INSTANCES;
+
+    CHECK(smp_vm_pool_init(&p, &g_mod, n, 4) == SMP_OK,
+          "пул из %u инстансов не поднялся", n);
+    CHECK(p.n_inst == n, "инстансов %u, ждали %u", p.n_inst, n);
+    CHECK(smp_vm_pool_run(&p) == SMP_OK, "прогон %u инстансов", n);
+
+    /* Каждый считает своё и независимо: 16 элементов по 2.0 дают 32. */
+    bool all = true;
+    for (uint32_t i = 0; i < p.n_inst; i++)
+        if (!near(pool_reg(&p, i, "s"), 32.0)) all = false;
+    CHECK(all, "не все инстансы досчитали до 32");
+
+    smp_vm_pool_release(&p);
+}
+
+/* Журнал конечен, и переполнение обязано быть заметным, а не тихим. */
+static void test_log_truncation(void)
+{
+    SECTION("обрезка журнала");
+
+    SmpLog l;
+    char   buf[16];
+    smp_log_bind(&l, buf, sizeof buf);
+
+    smp_log_write(&l, "0123456789", 10);
+    CHECK(l.len == 10 && !l.truncated, "10 из 16 не влезли");
+
+    smp_log_write(&l, "abcdefghij", 10);
+    CHECK(l.len == 16, "журнал вышел за буфер: len=%zu", l.len);
+    CHECK(l.truncated, "переполнение не отмечено");
+    CHECK(memcmp(buf, "0123456789abcdef", 16) == 0, "хвост записан не тот");
+
+    smp_log_reset(&l);
+    CHECK(l.len == 0 && !l.truncated, "сброс не очистил журнал");
+}
+
 /* ========================================================================== */
 
 int main(void)
@@ -321,6 +369,8 @@ int main(void)
     test_gemm_race();
     test_failure();
     test_limits();
+    test_max_instances();
+    test_log_truncation();
 
     fclose(g_sink);
     smp_arena_release(&g_arena);

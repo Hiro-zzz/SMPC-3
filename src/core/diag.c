@@ -175,6 +175,61 @@ static const char *smp__sev_banner(SmpSeverity s)
 /*  Контекст                                                                  */
 /* ========================================================================== */
 
+/* ========================================================================== */
+/*  Журнал в памяти                                                           */
+/* ========================================================================== */
+
+void smp_log_bind(SmpLog *l, char *buf, size_t cap)
+{
+    l->buf = buf; l->cap = cap; l->len = 0; l->truncated = false;
+}
+
+void smp_log_reset(SmpLog *l) { l->len = 0; l->truncated = false; }
+
+/* Дописывает сколько влезло и поднимает truncated, если влезло не всё. Молча
+ * терять хвост диагностики этот язык не станет — про обрезку скажет отчёт. */
+void smp_log_write(SmpLog *l, const char *p, size_t n)
+{
+    if (!l->buf || n == 0) return;
+
+    const size_t room = (l->len < l->cap) ? l->cap - l->len : 0u;
+    if (n > room) { l->truncated = true; n = room; }
+    if (n) { memcpy(l->buf + l->len, p, n); l->len += n; }
+}
+
+void smp_diag_set_log(SmpDiagCtx *d, SmpLog *log)
+{
+    d->log = log;
+    if (log) d->color = false;   /* журнал читает отчёт пула, а не терминал */
+}
+
+void smp_diag_write(SmpDiagCtx *d, const char *fmt, ...)
+{
+    va_list ap;
+
+    if (!d->log) {
+        va_start(ap, fmt);
+        vfprintf(d->out, fmt, ap);
+        va_end(ap);
+        return;
+    }
+
+    /* Через промежуточный буфер: писать сразу в хвост журнала нельзя, пока не
+     * известно, влезет ли — vsnprintf усечёт по своему разумению, а решать это
+     * должен журнал. */
+    char tmp[SMP_FMT_SLOTLEN];
+    va_start(ap, fmt);
+    const int n = vsnprintf(tmp, sizeof tmp, fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+
+    size_t len = (size_t)n;
+    if (len >= sizeof tmp) { len = sizeof tmp - 1u; d->log->truncated = true; }
+    smp_log_write(d->log, tmp, len);
+}
+
+/* ========================================================================== */
+
 void smp_diag_init(SmpDiagCtx *d, const SmpSource *src, FILE *out)
 {
     memset(d, 0, sizeof(*d));
@@ -338,7 +393,6 @@ static void smp__render_line(const SmpLineRef *ln, const SmpSpan *sp, SmpRendere
 static void smp__field(SmpDiagCtx *d, uint32_t gutter, char corner,
                        const char *label, const char *body)
 {
-    FILE       *o    = d->out;
     const char *dim  = smp__c(d, C_DIM);
     const char *rst  = smp__c(d, C_RESET);
     const char *bold = smp__c(d, C_BOLD);
@@ -354,11 +408,12 @@ static void smp__field(SmpDiagCtx *d, uint32_t gutter, char corner,
         const int   seg = nl ? (int)(nl - p) : (int)strlen(p);
 
         if (first) {
-            fprintf(o, "%s%*s%c--%s %s%s:%s %.*s\n",
-                    dim, (int)gutter, "", corner, rst, bold, label, rst, seg, p);
+            smp_diag_write(d, "%s%*s%c--%s %s%s:%s %.*s\n",
+                           dim, (int)gutter, "", corner, rst, bold,
+                           label, rst, seg, p);
         } else {
-            fprintf(o, "%s%*s|%s%*s%.*s\n",
-                    dim, (int)gutter, "", rst, lead, "", seg, p);
+            smp_diag_write(d, "%s%*s|%s%*s%.*s\n",
+                           dim, (int)gutter, "", rst, lead, "", seg, p);
         }
 
         if (!nl) break;
@@ -382,7 +437,6 @@ static void smp__snippet(SmpDiagCtx *d, SmpSpan sp, SmpSeverity sev, uint32_t gu
     static SmpRendered r;   /* ~10 KiB: держим в .bss, а не на стеке */
     smp__render_line(&ln, &sp, &r);
 
-    FILE       *o    = d->out;
     const char *dim  = smp__c(d, C_DIM);
     const char *rst  = smp__c(d, C_RESET);
     const char *sevc = smp__sev_color(d, sev);
@@ -402,8 +456,8 @@ static void smp__snippet(SmpDiagCtx *d, SmpSpan sp, SmpSeverity sev, uint32_t gu
     const char  *lead   = (vstart > 0)      ? "\xE2\x80\xA6" : "";  /* … */
     const char  *trail  = (vend < r.ncols)  ? "\xE2\x80\xA6" : "";
 
-    fprintf(o, "%s%*u |%s %s%.*s%s\n",
-            dim, (int)gutter - 1, sp.line, rst, lead, seglen, seg, trail);
+    smp_diag_write(d, "%s%*u |%s %s%.*s%s\n",
+                   dim, (int)gutter - 1, sp.line, rst, lead, seglen, seg, trail);
 
     /* Каретка. */
     uint32_t cc = (r.caret_col >= vstart) ? r.caret_col - vstart : 0u;
@@ -412,17 +466,16 @@ static void smp__snippet(SmpDiagCtx *d, SmpSpan sp, SmpSeverity sev, uint32_t gu
     if (cc + cl > SMP_VIEW_COLS + 1u) cl = SMP_VIEW_COLS + 1u - cc;
     if (cl == 0) cl = 1;
 
-    fprintf(o, "%s%*s|%s %*s%s%s", dim, (int)gutter, "", rst, (int)cc, "",
-            smp__c(d, C_BOLD), sevc);
-    fputc('^', o);
-    for (uint32_t i = 1; i < cl; i++) fputc('~', o);
-    fprintf(o, "%s\n", rst);
+    smp_diag_write(d, "%s%*s|%s %*s%s%s", dim, (int)gutter, "", rst, (int)cc, "",
+                   smp__c(d, C_BOLD), sevc);
+    smp_diag_write(d, "^");
+    for (uint32_t i = 1; i < cl; i++) smp_diag_write(d, "~");
+    smp_diag_write(d, "%s\n", rst);
 }
 
 static void smp__emit(SmpDiagCtx *d, const SmpDiagMsg *m)
 {
     const SmpDiagInfo *inf = smp_diag_info(m->code);
-    FILE              *o   = d->out;
 
     switch (inf->sev) {
         case SMP_SEV_FATAL: d->n_fatal++; break;
@@ -439,18 +492,19 @@ static void smp__emit(SmpDiagCtx *d, const SmpDiagMsg *m)
     const uint32_t gutter   = has_span ? (2u + smp__ndigits(m->span.line) + 1u) : 5u;
 
     /* --- шапка --- */
-    fputc('\n', o);
-    fprintf(o, "%s%s[%s :: %s]%s",
-            bold, sevc, smp__sev_banner(inf->sev), inf->text, rst);
+    smp_diag_write(d, "\n");
+    smp_diag_write(d, "%s%s[%s :: %s]%s",
+                   bold, sevc, smp__sev_banner(inf->sev), inf->text, rst);
 
     if (has_span) {
-        fprintf(o, " %sin%s %s:%u:%u\n", dim, rst,
-                d->src->path ? d->src->path : "<memory>", m->span.line, m->span.col);
+        smp_diag_write(d, " %sin%s %s:%u:%u\n", dim, rst,
+                       d->src->path ? d->src->path : "<memory>",
+                       m->span.line, m->span.col);
         smp__snippet(d, m->span, inf->sev, gutter);
     } else if (d->src && d->src->path) {
-        fprintf(o, " %sin%s %s\n", dim, rst, d->src->path);
+        smp_diag_write(d, " %sin%s %s\n", dim, rst, d->src->path);
     } else {
-        fputc('\n', o);
+        smp_diag_write(d, "\n");
     }
 
     /* --- тело --- */
@@ -465,11 +519,11 @@ static void smp__emit(SmpDiagCtx *d, const SmpDiagMsg *m)
     smp__field(d, gutter, '+', "ИСПРАВЛЕНИЕ", m->fix ? m->fix : inf->fix);
 
     if (m->dump_regs && d->regdump) {
-        fputc('\n', o);
-        d->regdump(o, d->regdump_user, d->color);
+        smp_diag_write(d, "\n");
+        d->regdump(d, d->regdump_user, d->color);
     }
 
-    fflush(o);
+    if (!d->log) fflush(d->out);
 }
 
 void smp_diag_emit(SmpDiagCtx *d, const SmpDiagMsg *m)

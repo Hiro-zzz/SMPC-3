@@ -34,15 +34,22 @@ const char *smp_emit_fmt_name(uint8_t f)
  * между putc и fwrite измеряется секундами. */
 #define OUTBUF 4096u
 
+/* Приёмник ровно один: либо поток, либо журнал в памяти. Второй нужен пулу —
+ * вывод инстансов нельзя ни смешивать, ни разводить по файлам (их не хватает
+ * на тысячу инстансов). */
 typedef struct {
     FILE   *f;
+    SmpLog *log;
     char    b[OUTBUF];
     size_t  n;
 } Out;
 
 static void out_flush(Out *o)
 {
-    if (o->n) { fwrite(o->b, 1, o->n, o->f); o->n = 0; }
+    if (!o->n) return;
+    if (o->log) smp_log_write(o->log, o->b, o->n);
+    else        fwrite(o->b, 1, o->n, o->f);
+    o->n = 0;
 }
 
 static void out_byte(Out *o, char c)
@@ -170,12 +177,13 @@ static bool put_elem(Out *o, uint8_t fmt, double v, uint32_t *out_cp)
 
 /* ========================================================================== */
 
-SmpStatus smp_vm_emit(FILE *dst, const SmpBuf *src, uint8_t fmt,
+SmpStatus smp_vm_emit(FILE *dst, SmpLog *log, const SmpBuf *src, uint8_t fmt,
                       uint64_t *n_written, uint32_t *bad_cp)
 {
     Out o;
-    o.f = dst ? dst : stdout;
-    o.n = 0;
+    o.log = log;
+    o.f   = dst ? dst : stdout;
+    o.n   = 0;
 
     const SmpTensor *t  = src->t;
     const SmpDType   dt = (SmpDType)t->dtype;

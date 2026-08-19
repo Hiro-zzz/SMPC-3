@@ -121,14 +121,14 @@ static const char *reg_label(const SmpVM *vm, uint32_t i, char *buf, size_t cap)
     return buf;
 }
 
-void smp_vm_regdump(FILE *out, void *user, bool color)
+void smp_vm_regdump(SmpDiagCtx *d, void *user, bool color)
 {
     const SmpVM *vm = (const SmpVM *)user;
     const char *dim = color ? "\x1b[2m" : "";
     const char *rst = color ? "\x1b[0m" : "";
 
-    fprintf(out, "%s  --- ДАМП РЕГИСТРОВ (инструкция %u) ------------------%s\n",
-            dim, vm->pc, rst);
+    smp_diag_write(d, "%s  --- ДАМП РЕГИСТРОВ (инструкция %u) ------------------%s\n",
+                   dim, vm->pc, rst);
 
     for (uint32_t i = 0; i < vm->n_regs; i++) {
         const SmpReg *r = &vm->regs[i];
@@ -140,28 +140,28 @@ void smp_vm_regdump(FILE *out, void *user, bool color)
         if (r->is_tensor) {
             char sig[80];
             smp_tensor_sig(&r->t, sig, sizeof sig);
-            fprintf(out, "   %-8s = tensor{ a%u:0x%08X  %-18s stride=",
-                    lbl, smp_tf_arena(r->t.flags), r->t.off, sig);
+            smp_diag_write(d, "   %-8s = tensor{ a%u:0x%08X  %-18s stride=",
+                           lbl, smp_tf_arena(r->t.flags), r->t.off, sig);
             for (uint32_t k = 0; k < r->t.rank; k++)
-                fprintf(out, "%s%u", k ? "," : "", (unsigned)r->t.stride[k]);
-            fprintf(out, "  flags=%s%s%s }\n",
+                smp_diag_write(d, "%s%u", k ? "," : "", (unsigned)r->t.stride[k]);
+            smp_diag_write(d, "  flags=%s%s%s }\n",
                     (r->t.flags & SMP_TF_CONTIG)     ? "CONTIG" : "STRIDED",
                     (r->t.flags & SMP_TF_ALIGN64)    ? "|A64"   : "",
                     (r->t.flags & SMP_TF_TRANSPOSED) ? "|T"     : "");
         } else {
-            fprintf(out, "   %-8s = %-8s %.9g\n", lbl,
-                    smp_dtype_name((SmpDType)r->dtype), r->s.f);
+            smp_diag_write(d, "   %-8s = %-8s %.9g\n", lbl,
+                           smp_dtype_name((SmpDType)r->dtype), r->s.f);
         }
     }
 
     const SmpInstr *in = (vm->pc < vm->mod->n_code) ? &vm->mod->code[vm->pc] : NULL;
-    fprintf(out, "   MXCSR = 0x%04X   ядра = %s   исполнено = %llu\n",
-            smp_fpu_get_mxcsr(), smp_kernels_name(),
-            (unsigned long long)vm->n_executed);
+    smp_diag_write(d, "   MXCSR = 0x%04X   ядра = %s   исполнено = %llu\n",
+                   smp_fpu_get_mxcsr(), smp_kernels_name(),
+                   (unsigned long long)vm->n_executed);
     if (in)
-        fprintf(out, "   опкод = %s   ширина = %s\n",
-                smp_opcode_def((SmpOpcode)in->op)->mnemonic,
-                smp_vec_name(smp_vec_bits(in->flags & SMP_IF_VEC_MASK)));
+        smp_diag_write(d, "   опкод = %s   ширина = %s\n",
+                       smp_opcode_def((SmpOpcode)in->op)->mnemonic,
+                       smp_vec_name(smp_vec_bits(in->flags & SMP_IF_VEC_MASK)));
 }
 
 /* ========================================================================== */
@@ -482,7 +482,7 @@ dispatch_switch:
              * согласуем: печатаем через f64. */
             one.dtype = (uint8_t)SMP_DT_F64;
             uint64_t n = 0;
-            smp_vm_emit(vm->out, &b, in->aux, &n, NULL);
+            smp_vm_emit(vm->out, vm->out_log, &b, in->aux, &n, NULL);
             R[in->d].is_tensor = false;
             R[in->d].s.f       = (double)n;
             R[in->d].dtype     = (uint8_t)SMP_DT_U64;
@@ -493,7 +493,7 @@ dispatch_switch:
 
         uint64_t n   = 0;
         uint32_t bad = 0;
-        if (smp_vm_emit(vm->out, &ba, in->aux, &n, &bad) != SMP_OK) {
+        if (smp_vm_emit(vm->out, vm->out_log, &ba, in->aux, &n, &bad) != SMP_OK) {
             vm_fatal(vm, SMP_E0605,
                      vfmt(vm, "Элемент #%llu равен 0x%X. Это %s.",
                           (unsigned long long)n, bad,

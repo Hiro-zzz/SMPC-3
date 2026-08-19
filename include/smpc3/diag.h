@@ -61,12 +61,43 @@ SMP_INLINE bool smp_span_valid(SmpSpan s) { return s.line != 0; }
 #define SMP_FMT_SLOTS   8u     /* кольцо временных строк                     */
 #define SMP_FMT_SLOTLEN 1024u
 
-/* Хук дампа регистров: VM подставляет свой, компилятор оставляет NULL. */
-typedef void (*SmpRegDumpFn)(FILE *out, void *user, bool color);
+/* --- Журнал в памяти -------------------------------------------------------
+ *
+ * Пулу нужен отдельный журнал на инстанс, иначе диагностика шестнадцати
+ * потоков склеится в кашу. Раньше это был tmpfile(), то есть открытый
+ * дескриптор на инстанс — и пул упирался в лимит CRT (512 на Windows, минус
+ * stdin/stdout/stderr), не поднимаясь с 510 при заявленных 1024.
+ *
+ * Буфер выделяется один раз при подъёме пула и не растёт: обещание про
+ * отсутствие аллокаций на исполнении остаётся в силе. Если написанное не
+ * влезло, журнал НЕ продолжает писать молча — он поднимает truncated, и отчёт
+ * об этом сообщает. */
+typedef struct SmpLog {
+    char  *buf;
+    size_t cap;
+    size_t len;
+    bool   truncated;
+} SmpLog;
+
+void smp_log_bind(SmpLog *l, char *buf, size_t cap);
+void smp_log_reset(SmpLog *l);
+void smp_log_write(SmpLog *l, const char *p, size_t n);
+
+/* Хук дампа регистров: VM подставляет свой, компилятор оставляет NULL.
+ * Печатает через smp_diag_write, а не в FILE*, чтобы дамп уходил туда же,
+ * куда и остальное сообщение — в том числе в журнал в памяти.
+ *
+ * Тег объявляется заранее: контекст определён ниже, а typedef на него в C99
+ * повторить нельзя. */
+struct SmpDiagCtx;
+typedef void (*SmpRegDumpFn)(struct SmpDiagCtx *d, void *user, bool color);
 
 typedef struct SmpDiagCtx {
     const SmpSource *src;
+
+    /* Куда идёт вывод. Если задан log, пишем в него, а out не трогаем. */
     FILE            *out;
+    SmpLog          *log;
     bool             color;
     bool             deterministic;  /* ДИАГНОЗ выбирается детерминированно */
     uint64_t         rng;
@@ -84,6 +115,14 @@ typedef struct SmpDiagCtx {
 } SmpDiagCtx;
 
 void smp_diag_init(SmpDiagCtx *d, const SmpSource *src, FILE *out);
+
+/* Перенаправить вывод в память. Цвет при этом гасится: журнал читает не
+ * терминал, а отчёт пула. */
+void smp_diag_set_log(SmpDiagCtx *d, SmpLog *log);
+
+/* Единая точка вывода диагностики: в журнал, если он задан, иначе в out.
+ * Публична, потому что через неё печатает и хук дампа регистров. */
+SMP_PRINTF(2, 3) void smp_diag_write(SmpDiagCtx *d, const char *fmt, ...);
 
 /* Включает UTF-8 и ANSI-последовательности в консоли Windows. Вызвать один
  * раз на старте процесса до любой печати. */

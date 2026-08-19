@@ -31,9 +31,14 @@ SmpStatus smp_vm_pool_init(SmpVMPool *p, const SmpModule *mod,
 
     p->inst   = (SmpVM      *)calloc(n_inst, sizeof(SmpVM));
     p->diag   = (SmpDiagCtx *)calloc(n_inst, sizeof(SmpDiagCtx));
-    p->log    = (FILE      **)calloc(n_inst, sizeof(FILE *));
+    p->log    = (SmpLog     *)calloc(n_inst, sizeof(SmpLog));
     p->status = (SmpStatus  *)calloc(n_inst, sizeof(SmpStatus));
-    if (!p->inst || !p->diag || !p->log || !p->status) {
+
+    /* Журналы одним блоком: тысяча отдельных выделений здесь не нужна, а
+     * освобождать проще один указатель. */
+    p->logmem = (char *)calloc(n_inst, SMP_POOL_LOG_BYTES);
+
+    if (!p->inst || !p->diag || !p->log || !p->status || !p->logmem) {
         smp_vm_pool_release(p);
         return SMP_ERR_OOM;
     }
@@ -41,17 +46,18 @@ SmpStatus smp_vm_pool_init(SmpVMPool *p, const SmpModule *mod,
     for (uint32_t i = 0; i < n_inst; i++) {
         /* Свой журнал: диагностика шестнадцати потоков в один поток вывода
          * склеилась бы в нечитаемую кашу. Печатаем позже и по очереди. */
-        p->log[i] = tmpfile();
-        if (!p->log[i]) { smp_vm_pool_release(p); return SMP_ERR_IO; }
+        smp_log_bind(&p->log[i], p->logmem + (size_t)i * SMP_POOL_LOG_BYTES,
+                     SMP_POOL_LOG_BYTES);
 
-        smp_diag_init(&p->diag[i], NULL, p->log[i]);
+        smp_diag_init(&p->diag[i], NULL, NULL);
+        smp_diag_set_log(&p->diag[i], &p->log[i]);
 
         if (smp_vm_init(&p->inst[i], mod, &p->diag[i]) != SMP_OK) {
             smp_vm_pool_release(p);
             return SMP_ERR_OOM;
         }
         p->inst[i].instance = i;
-        p->inst[i].out      = p->log[i];   /* @emit тоже в свой журнал */
+        p->inst[i].out_log  = &p->log[i];   /* @emit тоже в свой журнал */
 
         p->diag[i].regdump      = smp_vm_regdump;
         p->diag[i].regdump_user = &p->inst[i];
@@ -65,10 +71,8 @@ void smp_vm_pool_release(SmpVMPool *p)
         for (uint32_t i = 0; i < p->n_inst; i++) smp_vm_release(&p->inst[i]);
         free(p->inst);
     }
-    if (p->log) {
-        for (uint32_t i = 0; i < p->n_inst; i++) if (p->log[i]) fclose(p->log[i]);
-        free(p->log);
-    }
+    free(p->log);
+    free(p->logmem);
     free(p->diag);
     free(p->status);
     memset(p, 0, sizeof *p);
@@ -120,15 +124,16 @@ void smp_vm_pool_report(FILE *out, SmpVMPool *p)
 {
     for (uint32_t i = 0; i < p->n_inst; i++) {
         if (p->status[i] == SMP_OK) continue;
-        if (!p->log[i]) continue;
+        if (!p->log || !p->log[i].len) continue;
 
         fprintf(out, "\n=== инстанс #%u ===\n", i);
-        rewind(p->log[i]);
+        fwrite(p->log[i].buf, 1, p->log[i].len, out);
 
-        char buf[1024];
-        size_t n;
-        while ((n = fread(buf, 1, sizeof buf, p->log[i])) > 0)
-            fwrite(buf, 1, n, out);
+        /* Про обрезку говорим прямо: молча отдать половину диагностики хуже,
+         * чем не отдать ничего. */
+        if (p->log[i].truncated)
+            fprintf(out, "\n[журнал инстанса #%u обрезан: не влез в %u байт]\n",
+                    i, (unsigned)SMP_POOL_LOG_BYTES);
     }
     fflush(out);
 }

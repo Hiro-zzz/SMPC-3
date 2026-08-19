@@ -49,8 +49,11 @@ typedef struct SmpVM {
      * убила бы процесс аппаратной ловушкой в произвольном месте. */
     bool      live;
 
-    /* Куда пишет @emit. NULL означает stdout. */
+    /* Куда пишет @emit. Если задан out_log — в него, иначе в out; NULL там
+     * означает stdout. Журнал нужен пулу: файл на инстанс упирался в лимит
+     * открытых дескрипторов CRT. */
     FILE     *out;
+    SmpLog   *out_log;
 
     /* Рабочая память ядер — своя у каждого инстанса. Именно она делает
      * несколько VM в разных потоках безопасными. */
@@ -65,15 +68,15 @@ void      smp_vm_release(SmpVM *vm);
 
 /* Дамп регистров — тот самый, который спецификация обещает при фатальной
  * ошибке. Подходит под SmpRegDumpFn и ставится в диагностический контекст. */
-void      smp_vm_regdump(FILE *out, void *vm, bool color);
+void      smp_vm_regdump(SmpDiagCtx *d, void *vm, bool color);
 
 /* Показать содержимое именованных тензоров после прогона. */
 void      smp_vm_dump_tensors(FILE *out, const SmpVM *vm, uint32_t max_elems);
 
 /* Вывод тензора в поток. Живёт отдельным файлом: к диспетчеризации отношения
  * не имеет, а вот к философии — прямое. */
-SmpStatus smp_vm_emit(FILE *dst, const struct SmpBuf *src, uint8_t fmt,
-                      uint64_t *n_written, uint32_t *bad_cp);
+SmpStatus smp_vm_emit(FILE *dst, SmpLog *log, const struct SmpBuf *src,
+                      uint8_t fmt, uint64_t *n_written, uint32_t *bad_cp);
 
 /* Строка «какая ветка ядер выбрана» — для отчётов. */
 const char *smp_vm_backend(void);

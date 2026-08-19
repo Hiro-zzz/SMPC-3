@@ -699,16 +699,16 @@ static const char g_demo_src[] =
     "// Выборка строки, активация и редукция в скаляр\n"
     "[^raw]  *&C[0, ..] -> @relu -> @reduce.add => $f0  [~flush-to-zero];\n";
 
-static void demo_regdump(FILE *out, void *user, bool color)
+static void demo_regdump(SmpDiagCtx *dg, void *user, bool color)
 {
     SMP_UNUSED(user);
     const char *dim = color ? "\x1b[2m" : "";
     const char *rst = color ? "\x1b[0m" : "";
-    fprintf(out, "%s  --- ДАМП РЕГИСТРОВ ---------------------------------%s\n", dim, rst);
-    fprintf(out, "   $r1 = tensor{ off=0x00000000  f32:1024,1024  stride=1024,1  flags=CONTIG|A64 }\n");
-    fprintf(out, "   $r2 = tensor{ off=0x00400000  f32:1024,512   stride=512,1   flags=CONTIG|A64 }\n");
-    fprintf(out, "   $f0 = 0.000000e+00\n");
-    fprintf(out, "   MXCSR = 0x%04X   ISA = %s\n",
+    smp_diag_write(dg, "%s  --- ДАМП РЕГИСТРОВ ---------------------------------%s\n", dim, rst);
+    smp_diag_write(dg, "   $r1 = tensor{ off=0x00000000  f32:1024,1024  stride=1024,1  flags=CONTIG|A64 }\n");
+    smp_diag_write(dg, "   $r2 = tensor{ off=0x00400000  f32:1024,512   stride=512,1   flags=CONTIG|A64 }\n");
+    smp_diag_write(dg, "   $f0 = 0.000000e+00\n");
+    smp_diag_write(dg, "   MXCSR = 0x%04X   ISA = %s\n",
             smp_fpu_get_mxcsr(), smp_vec_name(smp_cpu()->max_vec_bits));
 }
 
