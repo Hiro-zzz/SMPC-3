@@ -108,26 +108,38 @@ static uint32_t const_f64(Em *m, double f)   { SmpConst c; c.f = f; return inter
 static uint32_t add_tens(Em *m, const SmpValue *v, uint32_t abs_off,
                          uint32_t name_id, uint32_t arena_id)
 {
+    SmpTensor t;
+    memset(&t, 0, sizeof t);
+    t.off     = abs_off;
+    t.dtype   = (uint8_t)v->dtype;
+    t.rank    = (uint8_t)v->rank;
+    t.flags   = smp_tf_with_arena(v->flags, arena_id);
+    t.name_id = name_id;
+
+    uint32_t n = 1;
+    for (uint32_t i = 0; i < v->rank; i++) {
+        t.shape[i]  = v->shape[i];
+        t.stride[i] = v->stride[i];
+        n *= v->shape[i];
+    }
+    t.nelem = v->rank ? n : 1u;
+
+    /* Один и тот же тензор упоминается в десятке инструкций, и каждая клала в
+     * таблицу собственную копию дескриптора: A из семи строк давал восемь
+     * одинаковых записей по 32 байта. Сравнение побайтовое и потому полное —
+     * в дескрипторе нет ни выравнивающих дыр, ни полей, которые здесь можно
+     * было бы не учесть (32 байта без дыр — инвариант, закреплённый в types.h).
+     * Срез отличается формой, шагом или смещением, так что с полным видом он
+     * не сольётся. */
+    for (uint32_t i = 0; i < m->n_tens; i++)
+        if (memcmp(&m->tens[i], &t, sizeof t) == 0) return i;
+
     if (m->n_tens >= EM_MAX_TENS) {
         eerr(m, SMP_E0207, m->cur_span,
              efmt(m, "Дескрипторов больше %u.", EM_MAX_TENS));
         return 0xFFFFFFFFu;
     }
-    SmpTensor *t = &m->tens[m->n_tens];
-    memset(t, 0, sizeof *t);
-    t->off     = abs_off;
-    t->dtype   = (uint8_t)v->dtype;
-    t->rank    = (uint8_t)v->rank;
-    t->flags   = smp_tf_with_arena(v->flags, arena_id);
-    t->name_id = name_id;
-
-    uint32_t n = 1;
-    for (uint32_t i = 0; i < v->rank; i++) {
-        t->shape[i]  = v->shape[i];
-        t->stride[i] = v->stride[i];
-        n *= v->shape[i];
-    }
-    t->nelem = v->rank ? n : 1u;
+    m->tens[m->n_tens] = t;
     return m->n_tens++;
 }
 
