@@ -24,7 +24,11 @@ typedef struct Em {
     char       *strs;    uint32_t n_strs;
     uint32_t   *rnames;
 
+    /* Курсор размещения — он же откатывается между инструкциями — и максимум,
+     * которого он когда-либо достигал. В модуль едет максимум: арене нужен
+     * размер, которого хватило самой прожорливой инструкции, а не сумма всех. */
     uint64_t arena_bytes[SMP_MAX_ARENAS];
+    uint64_t arena_peak[SMP_MAX_ARENAS];
     uint32_t max_arena;
 
     /* Распределение регистров. */
@@ -347,10 +351,11 @@ static bool needs_buffer(SmpOpKind k)
 /*  Инструкция целиком                                                        */
 /* ========================================================================== */
 
-static void emit_stmt(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
+/* Собирает одну инструкцию. Возвращает true, если её временные буферы обязаны
+ * пережить её саму: дескриптор уехал в именованный регистр, и откатывать под
+ * ним место нельзя. */
+static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
 {
-    if (!in->ok) return;
-
     m->cur_span   = s->span;
     m->next_temp  = m->n_named;
     const uint8_t flags = stmt_flags(in);
@@ -425,7 +430,7 @@ static void emit_stmt(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
                 t = tens_scratch(m, &in->stage_out[i], in->arena_id);
             }
 
-            if (t == 0xFFFFFFFFu) return;
+            if (t == 0xFFFFFFFFu) return false;
             if (t != 0xFFFFFFFEu) {
                 d = alloc_temp(m);
                 emit(m, SMP_BC_LOADT, flags, d, 0, 0, t);
@@ -460,18 +465,45 @@ static void emit_stmt(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
             }
         }
         if (dr != r) emit(m, SMP_BC_MOVE, flags, dr, r, 0, 0);
-        return;
+
+        /* Приёмник — регистр, и в него уехал наш временный буфер. Читать его
+         * будут следующие инструкции, так что место за ним закрепляется. */
+        return m->reg_scratch[r];
     }
 
     /* Если последняя стадия уже писала в приёмник, копировать нечего. */
     const SmpOpKind lastk = s->nstages ? in->ops[s->nstages - 1u] : SMP_OP__COUNT;
     const bool wrote_direct = s->nstages && needs_buffer(lastk) &&
                               !dest_is_read && (in->dest_val.flags & SMP_TF_CONTIG);
-    if (wrote_direct) return;
+    if (wrote_direct) return false;
 
     const uint32_t dt = tens_for_value(m, &in->dest_val, in->arena_id);
-    if (dt == 0xFFFFFFFFu) return;
+    if (dt == 0xFFFFFFFFu) return false;
     emit(m, SMP_BC_STORET, flags, 0, r, 0, dt);
+
+    /* Результат лёг в именованный тензор — временные больше не нужны. */
+    return false;
+}
+
+/* Временный буфер живёт ровно столько, сколько инструкция, которая его завела.
+ * Держать за ним место до конца программы незачем: следующая инструкция
+ * получит те же байты. Раньше курсор шёл только вверх, и программа из десяти
+ * строк над матрицей 1024x1024 просила сорок мегабайт под давно мёртвое —
+ * причём отдельно в каждом инстансе пула. */
+static void emit_stmt(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
+{
+    if (!in->ok) return;
+
+    uint64_t mark[SMP_MAX_ARENAS];
+    memcpy(mark, m->arena_bytes, sizeof mark);
+
+    const bool pin = emit_stmt_body(m, s, in);
+
+    for (uint32_t a = 0; a < SMP_MAX_ARENAS; a++) {
+        if (m->arena_bytes[a] > m->arena_peak[a])
+            m->arena_peak[a] = m->arena_bytes[a];
+        if (!pin) m->arena_bytes[a] = mark[a];
+    }
 }
 
 /* ========================================================================== */
@@ -511,7 +543,10 @@ SmpStatus smp_emit(SmpEmitter *e, const SmpAstProgram *prog,
     m.strs[0] = '\0';
     m.n_strs  = 1;
 
+    /* Именованные тензоры разместила семантика — это неподвижный префикс арены.
+     * Курсор и максимум стартуют с его конца: откатываться ниже некуда. */
     memcpy(m.arena_bytes, sema->arena_bytes, sizeof m.arena_bytes);
+    memcpy(m.arena_peak,  sema->arena_bytes, sizeof m.arena_peak);
     m.max_arena = sema->max_arena_id;
 
     /* Именованные регистры получают постоянные номера на всю программу. */
@@ -546,7 +581,7 @@ SmpStatus smp_emit(SmpEmitter *e, const SmpAstProgram *prog,
                         (m.max_arena + 1u) * sizeof(uint64_t), 8);
     if (!ab) return SMP_ERR_OOM;
     for (uint32_t i = 0; i <= m.max_arena; i++)
-        ab[i] = SMP_ALIGN_UP(m.arena_bytes[i], SMP_CACHELINE);
+        ab[i] = SMP_ALIGN_UP(m.arena_peak[i], SMP_CACHELINE);
     out->arena_bytes = ab;
     out->n_arenas    = m.max_arena + 1u;
 

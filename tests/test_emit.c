@@ -474,6 +474,80 @@ static void test_formats(void)
 }
 
 /* ========================================================================== */
+/*  Переиспользование арены под временные буферы                              */
+/* ========================================================================== */
+
+/* Смещения всех временных буферов модуля (их имена начинаются с '%'). */
+static uint32_t scratch_offs(const SmpModule *m, uint32_t *out, uint32_t cap)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < m->n_tens && n < cap; i++)
+        if (smp_module_str(m, m->tens[i].name_id)[0] == '%')
+            out[n++] = m->tens[i].off;
+    return n;
+}
+
+static void test_scratch_reuse(void)
+{
+    SECTION("переиспользование временных буферов");
+
+    SmpModule mod;
+    uint32_t  off[16], n;
+
+    /* Два мёртвых временных подряд обязаны лечь на один адрес: буфер живёт
+     * ровно столько, сколько инструкция, которая его завела. */
+    static const char *two =
+        "[#arena:0] *&A<f32:64> -> @fill(2.0) => *&A;\n"
+        "*&A -> @relu -> @reduce.add => $x;\n"
+        "*&A -> @abs  -> @reduce.add => $y;\n";
+    uint64_t bytes_two = 0;
+    if (build_str(two, &mod)) {
+        n = scratch_offs(&mod, off, SMP_ARRLEN(off));
+        CHECK(n == 2, "ожидалось 2 временных, найдено %u", n);
+        if (n == 2) CHECK(off[0] == off[1],
+                          "временные не переиспользованы: 0x%X и 0x%X", off[0], off[1]);
+        bytes_two = mod.arena_bytes[0];
+    }
+
+    /* Шесть таких же инструкций не должны стоить дороже двух: размер арены
+     * задаёт самая прожорливая инструкция, а не их сумма. */
+    static const char *six =
+        "[#arena:0] *&A<f32:64> -> @fill(2.0) => *&A;\n"
+        "*&A -> @relu       -> @reduce.add => $x;\n"
+        "*&A -> @abs        -> @reduce.add => $y;\n"
+        "*&A -> @scale(2.0) -> @reduce.add => $z;\n"
+        "*&A -> @relu       -> @reduce.max => $u;\n"
+        "*&A -> @abs        -> @reduce.max => $v;\n"
+        "*&A -> @scale(3.0) -> @reduce.max => $w;\n";
+    if (build_str(six, &mod)) {
+        n = scratch_offs(&mod, off, SMP_ARRLEN(off));
+        CHECK(n == 6, "ожидалось 6 временных, найдено %u", n);
+        for (uint32_t i = 1; i < n; i++)
+            CHECK(off[i] == off[0], "временный #%u уехал: 0x%X != 0x%X",
+                  i, off[i], off[0]);
+        CHECK(mod.arena_bytes[0] == bytes_two,
+              "арена растёт с числом инструкций: %llu против %llu",
+              (unsigned long long)mod.arena_bytes[0],
+              (unsigned long long)bytes_two);
+    }
+
+    /* А вот буфер, чей дескриптор уехал в именованный регистр, переживает свою
+     * инструкцию: его читают следующие. Место под ним закрепляется, и
+     * следующий временный обязан лечь мимо. */
+    static const char *pinned =
+        "[#arena:0] *&A<f32:64> -> @fill(2.0) => *&A;\n"
+        "*&A -> @relu => $keep;\n"
+        "*&A -> @abs -> @reduce.add => $y;\n"
+        "$keep -> @reduce.add => $z;\n";
+    if (build_str(pinned, &mod)) {
+        n = scratch_offs(&mod, off, SMP_ARRLEN(off));
+        CHECK(n == 2, "ожидалось 2 временных, найдено %u", n);
+        if (n == 2) CHECK(off[0] != off[1],
+                          "закреплённый буфер затёрт: оба на 0x%X", off[0]);
+    }
+}
+
+/* ========================================================================== */
 
 int main(void)
 {
@@ -491,6 +565,7 @@ int main(void)
     test_shape();
     test_pipeline();
     test_direct_write();
+    test_scratch_reuse();
     test_pools();
     test_container();
     test_hostile();
