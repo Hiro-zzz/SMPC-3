@@ -246,6 +246,153 @@ static void test_diag(void)
 
 /* ========================================================================== */
 
+/* ========================================================================== */
+/*  Пулы диагнозов                                                            */
+/* ========================================================================== */
+
+static void test_diag_pools(void)
+{
+    SECTION("пулы диагнозов");
+
+    static const char *const cat_name[SMP_CAT__COUNT] = {
+        "LEX", "PARSE", "TYPE", "MEM", "SIMD", "RUNTIME", "INTERNAL"
+    };
+
+    unsigned total = 0;
+
+    for (unsigned c = 0; c < SMP_CAT__COUNT; c++) {
+        const unsigned n = smp_diag_pool_size((SmpDiagCat)c);
+        CHECK(n >= 2u, "%s: диагнозов всего %u", cat_name[c], n);
+        total += n;
+
+        for (unsigned i = 0; i < n; i++) {
+            const char *a = smp_diag_pool_at((SmpDiagCat)c, i);
+            CHECK(a != NULL && a[0] != '\0', "%s[%u]: пустой диагноз", cat_name[c], i);
+            if (!a) continue;
+
+            /* Дубликат внутри пула молча сокращает разнообразие: выбор идёт по
+             * остатку от деления, и две одинаковые строки просто съедают долю. */
+            for (unsigned j = i + 1u; j < n; j++) {
+                const char *b = smp_diag_pool_at((SmpDiagCat)c, j);
+                CHECK(b && strcmp(a, b) != 0,
+                      "%s: диагнозы %u и %u совпадают", cat_name[c], i, j);
+            }
+        }
+    }
+    CHECK(total >= 60u, "диагнозов на все категории всего %u", total);
+
+    /* Выход за границы — NULL, а не чужая память. */
+    CHECK(smp_diag_pool_at(SMP_CAT_LEX, smp_diag_pool_size(SMP_CAT_LEX)) == NULL,
+          "индекс за пулом не отсечён");
+    CHECK(smp_diag_pool_at((SmpDiagCat)SMP_CAT__COUNT, 0) == NULL,
+          "несуществующая категория не отсечена");
+    CHECK(smp_diag_pool_size((SmpDiagCat)SMP_CAT__COUNT) == 0u,
+          "размер несуществующей категории не ноль");
+
+    /* Пул должен реально перебираться, а не отдавать одну строку на всё.
+     * Один код, разные позиции в исходнике — диагнозы обязаны различаться. */
+    SmpSource src = { "t.smpc", "x", 1 };
+    SmpDiagCtx D;
+    FILE *f = tmpfile();
+    if (!f) { CHECK(0, "tmpfile недоступен"); return; }
+
+    smp_diag_init(&D, &src, f);
+    D.deterministic = true;
+
+    /* Строки копируются, а не запоминаются указателем: буфер чтения один на
+     * все итерации, и указатель в него после следующего прогона показывает уже
+     * не то, что запомнили. */
+    static char seen[64][48];
+    unsigned    nseen = 0;
+    for (uint32_t line = 1; line <= 60u && nseen < SMP_ARRLEN(seen); line++) {
+        rewind(f);
+        smp_diag_emit(&D, &(SmpDiagMsg){
+            .code = SMP_E0421, .span = (SmpSpan){ line, 1, 1 }
+        });
+
+        static char buf[4096];
+        const long end = ftell(f);
+        rewind(f);
+        const size_t got = fread(buf, 1, sizeof(buf) - 1u, f);
+        buf[got] = '\0';
+        if (end <= 0 || got == 0) continue;
+
+        const char *d = strstr(buf, "ДИАГНОЗ: ");
+        if (!d) continue;
+        d += strlen("ДИАГНОЗ: ");
+
+        bool known = false;
+        for (unsigned i = 0; i < nseen; i++)
+            if (strncmp(seen[i], d, sizeof(seen[0]) - 1u) == 0) known = true;
+        if (!known && nseen < SMP_ARRLEN(seen)) {
+            memcpy(seen[nseen], d, sizeof(seen[0]) - 1u);
+            seen[nseen][sizeof(seen[0]) - 1u] = '\0';
+            nseen++;
+        }
+    }
+    fclose(f);
+
+    /* E0421 — категория MEM, своего диагноза у него нет. Хотя бы половина пула
+     * обязана встретиться на шестидесяти позициях, иначе выбор перекошен. */
+    CHECK(nseen * 2u >= smp_diag_pool_size(SMP_CAT_MEM),
+          "на 60 позиций выпало лишь %u диагнозов из %u",
+          nseen, smp_diag_pool_size(SMP_CAT_MEM));
+}
+
+static void test_diag_own(void)
+{
+    SECTION("собственный диагноз кода");
+
+    unsigned n_own = 0, n_pool = 0;
+    for (unsigned i = 0; i < SMP_DIAG__COUNT; i++) {
+        const SmpDiagInfo *inf = smp_diag_info((SmpDiagCode)i);
+        CHECK(inf->title && inf->title[0], "код %u без строки ОШИБКА", i);
+        CHECK(inf->fix && inf->fix[0], "код %u без строки ИСПРАВЛЕНИЕ", i);
+        if (inf->diagnosis) {
+            CHECK(inf->diagnosis[0] != '\0', "код %s: пустой свой диагноз", inf->text);
+            n_own++;
+        } else {
+            n_pool++;
+        }
+    }
+    CHECK(n_own >= 5u, "кодов со своим диагнозом всего %u", n_own);
+    CHECK(n_pool > n_own, "своих диагнозов больше, чем взятых из пула");
+
+    /* Свой диагноз перебивает пул и не зависит от позиции в исходнике: он на
+     * то и свой, чтобы говорить именно про эту беду, а не про категорию. */
+    SmpSource src = { "t.smpc", "x", 1 };
+    SmpDiagCtx D;
+    FILE *f = tmpfile();
+    if (!f) { CHECK(0, "tmpfile недоступен"); return; }
+
+    smp_diag_init(&D, &src, f);
+    D.deterministic = true;
+
+    const SmpDiagInfo *inf = smp_diag_info(SMP_E0419);
+    CHECK(inf->diagnosis != NULL, "у E0419 нет своего диагноза");
+
+    if (inf->diagnosis) {
+        for (uint32_t line = 1; line <= 20u; line++) {
+            rewind(f);
+            smp_diag_emit(&D, &(SmpDiagMsg){
+                .code = SMP_E0419, .span = (SmpSpan){ line, 1, 1 }
+            });
+
+            static char b2[4096];
+            const long end = ftell(f);
+            rewind(f);
+            const size_t got = fread(b2, 1, sizeof(b2) - 1u, f);
+            b2[got] = '\0';
+            if (end <= 0 || got == 0) { CHECK(0, "нет вывода на строке %u", line); break; }
+
+            CHECK(strstr(b2, inf->diagnosis) != NULL,
+                  "на строке %u свой диагноз подменён пулом", line);
+        }
+    }
+    fclose(f);
+}
+
+
 int main(void)
 {
     smp_console_setup();
@@ -255,6 +402,8 @@ int main(void)
     test_types();
     test_cpu();
     test_diag();
+    test_diag_pools();
+    test_diag_own();
 
     return REPORT();
 }

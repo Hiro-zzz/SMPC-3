@@ -15,7 +15,7 @@
 #include <stdio.h>
 
 /* --- Коды ----------------------------------------------------------------- */
-#define SMP_DIAG_ENUM(id, text, sev, cat, title, fix) id,
+#define SMP_DIAG_ENUM(id, text, sev, cat, title, fix, diag) id,
 typedef enum SmpDiagCode {
     SMP_DIAG_CODES(SMP_DIAG_ENUM)
     SMP_DIAG__COUNT
@@ -34,9 +34,19 @@ typedef struct SmpDiagInfo {
     SmpDiagCat  cat;
     const char *title;     /* строка ОШИБКА по умолчанию                     */
     const char *fix;       /* строка ИСПРАВЛЕНИЕ по умолчанию                */
+
+    /* Собственная строка ДИАГНОЗ. NULL — брать из пула категории. Пул даёт
+     * разнообразие ценой общности формулировки; там, где код обозначает одну
+     * конкретную беду, точная строка полезнее случайной. */
+    const char *diagnosis;
 } SmpDiagInfo;
 
 const SmpDiagInfo *smp_diag_info(SmpDiagCode c);
+
+/* Пул строк ДИАГНОЗ по категории. Наружу торчит ради тестов: дубликат в пуле
+ * молча сокращает разнообразие, и заметить это иначе нечем. */
+unsigned    smp_diag_pool_size(SmpDiagCat cat);
+const char *smp_diag_pool_at(SmpDiagCat cat, unsigned i);
 SmpDiagCode        smp_diag_lookup(const char *text); /* "E0418" -> код; SMP_DIAG__COUNT если нет */
 
 /* --- Исходник и позиция --------------------------------------------------- */
