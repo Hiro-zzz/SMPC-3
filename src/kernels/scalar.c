@@ -396,6 +396,16 @@ double smp_ks_reduce_max(const SmpBuf *src)
 /*  GEMM                                                                      */
 /* ========================================================================== */
 
+/* Тело тройного цикла с известным типом. Шаги остаются произвольными: срез и
+ * транспозиция обязаны работать и здесь, поэтому индексы считаются, а не
+ * инкрементируются. STORE задаёт запись элемента — у целых через clamp_to. */
+#define KS_GEMM_LOOP(T, STORE)                                                     do {                                                                               T *cp = (T *)c->p;                                                             const T *ap = (const T *)a->p, *bp = (const T *)b->p;                          for (uint32_t i = 0; i < M; i++) {                                                 for (uint32_t j = 0; j < N; j++)                                                   cp[(size_t)i * sc0 + (size_t)j * sc1] = (T)0;                              for (uint32_t k = 0; k < K; k++) {                                                 const double av =                                                                  (double)ap[(size_t)i * sa0 + (size_t)k * sa1];                             if (av == 0.0) continue;                                                       for (uint32_t j = 0; j < N; j++) {                                                 const size_t oc = (size_t)i * sc0 + (size_t)j * sc1;                           const double bv =                                                                  (double)bp[(size_t)k * sb0 + (size_t)j * sb1];                             cp[oc] = STORE((double)cp[oc] + av * bv);                                  }                                                                          }                                                                          }                                                                              return;                                                                    } while (0)
+
+#define KS_GST_F32(V) (float)(V)
+#define KS_GST_F64(V) (double)(V)
+#define KS_GST_I32(V) (int32_t)clamp_to((V), -2147483648.0, 2147483647.0)
+#define KS_GST_U64(V) (uint64_t)clamp_to((V), 0.0, 18446744073709549568.0)
+
 void smp_ks_gemm(const SmpBuf *c, const SmpBuf *a, const SmpBuf *b)
 {
     const SmpTensor *tc = c->t, *ta = a->t, *tb = b->t;
@@ -403,6 +413,24 @@ void smp_ks_gemm(const SmpBuf *c, const SmpBuf *a, const SmpBuf *b)
     const SmpDType   da = (SmpDType)ta->dtype, db = (SmpDType)tb->dtype;
 
     const uint32_t M = ta->shape[0], K = ta->shape[1], N = tb->shape[1];
+
+    /* Во внутреннем цикле два чтения и запись, и каждая разбирала dtype заново.
+     * На f64:256,256 это 1.6 ГФЛОПС — при том, что арифметики здесь на порядок
+     * меньше, чем работы по выяснению типа. Когда типы совпадают, разбираем их
+     * один раз до циклов. */
+    const uint32_t sc0 = tc->stride[0], sc1 = tc->stride[1];
+    const uint32_t sa0 = ta->stride[0], sa1 = ta->stride[1];
+    const uint32_t sb0 = tb->stride[0], sb1 = tb->stride[1];
+
+    if (dc == da && dc == db) {
+        switch (dc) {
+            case SMP_DT_F32: KS_GEMM_LOOP(float,    KS_GST_F32);
+            case SMP_DT_F64: KS_GEMM_LOOP(double,   KS_GST_F64);
+            case SMP_DT_I32: KS_GEMM_LOOP(int32_t,  KS_GST_I32);
+            case SMP_DT_U64: KS_GEMM_LOOP(uint64_t, KS_GST_U64);
+            default: break;
+        }
+    }
 
     /* Порядок i-k-j, а не i-j-k: даже в эталоне внутренний цикл идёт по
      * последней оси обоих операндов, иначе на 1024x1024 это невыносимо. */
