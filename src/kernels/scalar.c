@@ -88,6 +88,54 @@ static void store_at(void *p, SmpDType dt, size_t i, double v)
 }
 
 /* ========================================================================== */
+/*  Плотный путь с заранее известным типом                                    */
+/* ========================================================================== */
+
+/* Общий обход ниже разбирает dtype на КАЖДОМ элементе через load_at/store_at и
+ * вдобавок зовёт операцию по указателю. На элемент это стоит дороже самой
+ * арифметики, а компилятор через косвенный вызов не видит цикла и не
+ * векторизует его.
+ *
+ * Мириться с этим было бы можно, будь файл только эталоном для сверки. Но
+ * диспетчер отправляет сюда всё, что не f32 с плотной раскладкой: весь f64,
+ * i32, u64 и любой срез с шагом. Замер сложения 1024x1024 показывает цену:
+ * f64 — 1550 мкс, f32 через avx2 — 200 мкс, и это при вдвое большем объёме
+ * данных.
+ *
+ * Поэтому там, где типы совпадают и тензоры плотные, тип разбирается ОДИН раз
+ * до цикла, а дальше идёт обычный цикл по массиву. Общий путь никуда не делся
+ * и обслуживает всё остальное — разные типы, шаги, транспозицию.
+ *
+ * Семантика обязана совпадать с общим путём поэлементно, поэтому насыщение
+ * целых берётся из того же clamp_to с теми же границами, а не пишется заново.
+ * Порядок обхода тот же, так что и свёртки дают бит в бит прежний результат.
+ *
+ * restrict здесь не ставится сознательно: эмиттер умеет писать результат
+ * поверх входа (relu r4, r4), то есть dst и src законно совпадают. */
+
+/* Плотны ли оба и одного ли типа. */
+static bool dense_same(const SmpBuf *dst, const SmpBuf *src)
+{
+    return dst->t->dtype == src->t->dtype &&
+           dst->t->nelem == src->t->nelem &&
+           dense(dst->t) && dense(src->t);
+}
+
+#define KS_U_FLT(T, EXPR)                                                          do {                                                                               T *dp = (T *)dst->p; const T *sp = (const T *)src->p;                          for (uint32_t i = 0; i < n; i++) {                                                 const double x = (double)sp[i];                                                dp[i] = (T)(EXPR);                                                         }                                                                          } while (0)
+
+#define KS_U_INT(T, LO, HI, EXPR)                                                  do {                                                                               T *dp = (T *)dst->p; const T *sp = (const T *)src->p;                          for (uint32_t i = 0; i < n; i++) {                                                 const double x = (double)sp[i];                                                dp[i] = (T)clamp_to((EXPR), LO, HI);                                       }                                                                          } while (0)
+
+/* Разворачивается по всем типам и возвращает управление, если тип известен.
+ * Для raw_ptr и мусора проваливается в общий путь. */
+#define KS_UNARY_DENSE(EXPR)                                                       switch (dt) {                                                                      case SMP_DT_F32: KS_U_FLT(float,  EXPR); return;                               case SMP_DT_F64: KS_U_FLT(double, EXPR); return;                               case SMP_DT_I32: KS_U_INT(int32_t, -2147483648.0, 2147483647.0, EXPR);                           return;                                                       case SMP_DT_U64: KS_U_INT(uint64_t, 0.0, 18446744073709549568.0, EXPR);                          return;                                                       default: break;                                                            }
+
+#define KS_B_FLT(T, EXPR)                                                          do {                                                                               T *dp = (T *)dst->p;                                                           const T *ap = (const T *)a->p, *bp = (const T *)b->p;                          for (uint32_t i = 0; i < n; i++) {                                                 const double x = (double)ap[i], y = (double)bp[i];                             dp[i] = (T)(EXPR);                                                         }                                                                          } while (0)
+
+#define KS_B_INT(T, LO, HI, EXPR)                                                  do {                                                                               T *dp = (T *)dst->p;                                                           const T *ap = (const T *)a->p, *bp = (const T *)b->p;                          for (uint32_t i = 0; i < n; i++) {                                                 const double x = (double)ap[i], y = (double)bp[i];                             dp[i] = (T)clamp_to((EXPR), LO, HI);                                       }                                                                          } while (0)
+
+#define KS_BINARY_DENSE(EXPR)                                                      switch (dt) {                                                                      case SMP_DT_F32: KS_B_FLT(float,  EXPR); return;                               case SMP_DT_F64: KS_B_FLT(double, EXPR); return;                               case SMP_DT_I32: KS_B_INT(int32_t, -2147483648.0, 2147483647.0, EXPR);                           return;                                                       case SMP_DT_U64: KS_B_INT(uint64_t, 0.0, 18446744073709549568.0, EXPR);                          return;                                                       default: break;                                                            }
+
+/* ========================================================================== */
 /*  Поэлементные                                                              */
 /* ========================================================================== */
 
@@ -117,19 +165,95 @@ static void unary(const SmpBuf *dst, const SmpBuf *src, UnaryFn f, double k)
     } while (idx_next(ts, idx));
 }
 
-void smp_ks_relu(const SmpBuf *d, const SmpBuf *s)           { unary(d, s, f_relu,  0.0); }
-void smp_ks_abs (const SmpBuf *d, const SmpBuf *s)           { unary(d, s, f_abs,   0.0); }
-void smp_ks_scale(const SmpBuf *d, const SmpBuf *s, double k) { unary(d, s, f_scale, k);   }
-void smp_ks_copy(const SmpBuf *d, const SmpBuf *s)           { unary(d, s, f_id,    0.0); }
-void smp_ks_cast(const SmpBuf *d, const SmpBuf *s)           { unary(d, s, f_id,    0.0); }
+void smp_ks_relu(const SmpBuf *dst, const SmpBuf *src)
+{
+    if (dense_same(dst, src)) {
+        const uint32_t n = dst->t->nelem;
+        const SmpDType dt = (SmpDType)dst->t->dtype;
+        KS_UNARY_DENSE(x > 0.0 ? x : 0.0);
+    }
+    unary(dst, src, f_relu, 0.0);
+}
+
+void smp_ks_abs(const SmpBuf *dst, const SmpBuf *src)
+{
+    if (dense_same(dst, src)) {
+        const uint32_t n = dst->t->nelem;
+        const SmpDType dt = (SmpDType)dst->t->dtype;
+        KS_UNARY_DENSE(x < 0.0 ? -x : x);
+    }
+    unary(dst, src, f_abs, 0.0);
+}
+
+void smp_ks_scale(const SmpBuf *dst, const SmpBuf *src, double k)
+{
+    if (dense_same(dst, src)) {
+        const uint32_t n = dst->t->nelem;
+        const SmpDType dt = (SmpDType)dst->t->dtype;
+        KS_UNARY_DENSE(x * k);
+    }
+    unary(dst, src, f_scale, k);
+}
+
+void smp_ks_copy(const SmpBuf *dst, const SmpBuf *src)
+{
+    /* Плотная копия одного типа — это memcpy и есть. Совпадение указателей
+     * законно (эмиттер пишет поверх входа), а memcpy на равных указателях —
+     * UB; копировать в таком случае и нечего. */
+    if (dense_same(dst, src)) {
+        if (dst->p != src->p)
+            memcpy(dst->p, src->p,
+                   (size_t)dst->t->nelem * smp_dtype_size((SmpDType)dst->t->dtype));
+        return;
+    }
+    unary(dst, src, f_id, 0.0);
+}
+
+/* Приведение по определению меняет тип, так что быстрый путь ему достаётся
+ * только на вырожденном случае «тип тот же». Остальное — общий обход. */
+void smp_ks_cast(const SmpBuf *dst, const SmpBuf *src)
+{
+    if (dense_same(dst, src)) { smp_ks_copy(dst, src); return; }
+    unary(dst, src, f_id, 0.0);
+}
 
 void smp_ks_fill(const SmpBuf *dst, double v)
 {
     const SmpTensor *t = dst->t;
     const SmpDType   dt = (SmpDType)t->dtype;
 
+    /* Значение одно на весь тензор, поэтому и насыщение считается один раз:
+     * store_at пересчитывал бы его на каждом элементе с тем же результатом. */
     if (dense(t)) {
-        for (uint32_t i = 0; i < t->nelem; i++) store_at(dst->p, dt, i, v);
+        const uint32_t n = t->nelem;
+        switch (dt) {
+            case SMP_DT_F32: {
+                float *dp = (float *)dst->p; const float fv = (float)v;
+                for (uint32_t i = 0; i < n; i++) dp[i] = fv;
+                return;
+            }
+            case SMP_DT_F64: {
+                double *dp = (double *)dst->p;
+                for (uint32_t i = 0; i < n; i++) dp[i] = v;
+                return;
+            }
+            case SMP_DT_I32: {
+                int32_t *dp = (int32_t *)dst->p;
+                const int32_t iv =
+                    (int32_t)clamp_to(v, -2147483648.0, 2147483647.0);
+                for (uint32_t i = 0; i < n; i++) dp[i] = iv;
+                return;
+            }
+            case SMP_DT_U64: {
+                uint64_t *dp = (uint64_t *)dst->p;
+                const uint64_t uv =
+                    (uint64_t)clamp_to(v, 0.0, 18446744073709549568.0);
+                for (uint32_t i = 0; i < n; i++) dp[i] = uv;
+                return;
+            }
+            default: break;
+        }
+        for (uint32_t i = 0; i < n; i++) store_at(dst->p, dt, i, v);
         return;
     }
     uint32_t idx[SMP_MAX_RANK] = { 0, 0, 0, 0 };
@@ -172,8 +296,31 @@ static void binary(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b, bool mul
     } while (idx_next(td, idx));
 }
 
-void smp_ks_add(const SmpBuf *d, const SmpBuf *a, const SmpBuf *b) { binary(d, a, b, false); }
-void smp_ks_mul(const SmpBuf *d, const SmpBuf *a, const SmpBuf *b) { binary(d, a, b, true);  }
+/* Все три одного типа и плотные — условие быстрого пути для бинарных. */
+static bool dense_same3(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b)
+{
+    return dense_same(dst, a) && dense_same(dst, b);
+}
+
+void smp_ks_add(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b)
+{
+    if (dense_same3(dst, a, b)) {
+        const uint32_t n = dst->t->nelem;
+        const SmpDType dt = (SmpDType)dst->t->dtype;
+        KS_BINARY_DENSE(x + y);
+    }
+    binary(dst, a, b, false);
+}
+
+void smp_ks_mul(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b)
+{
+    if (dense_same3(dst, a, b)) {
+        const uint32_t n = dst->t->nelem;
+        const SmpDType dt = (SmpDType)dst->t->dtype;
+        KS_BINARY_DENSE(x * y);
+    }
+    binary(dst, a, b, true);
+}
 
 /* ========================================================================== */
 /*  Свёртки                                                                   */
@@ -185,8 +332,22 @@ double smp_ks_reduce_add(const SmpBuf *src)
     const SmpDType   dt = (SmpDType)t->dtype;
     double acc = 0.0;
 
+    /* Порядок обхода и тип накопителя те же, что в общем пути, поэтому
+     * результат совпадает бит в бит — на этом стоит сверка векторных ядер. */
     if (dense(t)) {
-        for (uint32_t i = 0; i < t->nelem; i++) acc += load_at(src->p, dt, i);
+        const uint32_t n = t->nelem;
+        switch (dt) {
+            case SMP_DT_F32: { const float    *sp = (const float    *)src->p;
+                for (uint32_t i = 0; i < n; i++) acc += (double)sp[i]; return acc; }
+            case SMP_DT_F64: { const double   *sp = (const double   *)src->p;
+                for (uint32_t i = 0; i < n; i++) acc += sp[i];         return acc; }
+            case SMP_DT_I32: { const int32_t  *sp = (const int32_t  *)src->p;
+                for (uint32_t i = 0; i < n; i++) acc += (double)sp[i]; return acc; }
+            case SMP_DT_U64: { const uint64_t *sp = (const uint64_t *)src->p;
+                for (uint32_t i = 0; i < n; i++) acc += (double)sp[i]; return acc; }
+            default: break;
+        }
+        for (uint32_t i = 0; i < n; i++) acc += load_at(src->p, dt, i);
         return acc;
     }
     uint32_t idx[SMP_MAX_RANK] = { 0, 0, 0, 0 };
@@ -201,7 +362,23 @@ double smp_ks_reduce_max(const SmpBuf *src)
     double best = -INFINITY;
 
     if (dense(t)) {
-        for (uint32_t i = 0; i < t->nelem; i++) {
+        const uint32_t n = t->nelem;
+        switch (dt) {
+            case SMP_DT_F32: { const float    *sp = (const float    *)src->p;
+                for (uint32_t i = 0; i < n; i++) { const double v = (double)sp[i];
+                    if (v > best) best = v; } return best; }
+            case SMP_DT_F64: { const double   *sp = (const double   *)src->p;
+                for (uint32_t i = 0; i < n; i++) { const double v = sp[i];
+                    if (v > best) best = v; } return best; }
+            case SMP_DT_I32: { const int32_t  *sp = (const int32_t  *)src->p;
+                for (uint32_t i = 0; i < n; i++) { const double v = (double)sp[i];
+                    if (v > best) best = v; } return best; }
+            case SMP_DT_U64: { const uint64_t *sp = (const uint64_t *)src->p;
+                for (uint32_t i = 0; i < n; i++) { const double v = (double)sp[i];
+                    if (v > best) best = v; } return best; }
+            default: break;
+        }
+        for (uint32_t i = 0; i < n; i++) {
             const double v = load_at(src->p, dt, i);
             if (v > best) best = v;
         }
