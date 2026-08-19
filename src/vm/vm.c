@@ -248,6 +248,16 @@ static int fuse_op_of(uint8_t bc)
     }
 }
 
+/* Какой свёрткой закрывается цепочка; SMP_FRED_NONE — не свёртка. */
+static int fuse_red_of(uint8_t bc)
+{
+    switch (bc) {
+        case SMP_BC_REDADD: return (int)SMP_FRED_ADD;
+        case SMP_BC_REDMAX: return (int)SMP_FRED_MAX;
+        default:            return (int)SMP_FRED_NONE;
+    }
+}
+
 /* Собирает цепочку, размеченную SMP_IF_FUSE, и считает её за один проход.
  *
  * false означает «слить не вышло» — вызывающий тогда исполняет инструкцию
@@ -263,11 +273,22 @@ static bool vm_fuse(SmpVM *vm, const SmpInstr **ipp, const SmpInstr *first)
     SmpReg          *R   = vm->regs;
 
     const SmpInstr *chain[SMP_FUSE_MAX];
-    const SmpInstr *ip  = *ipp;
-    const SmpInstr *cur = first;
-    uint32_t        n   = 0;
+    const SmpInstr *ip   = *ipp;
+    const SmpInstr *cur  = first;
+    const SmpInstr *tail = NULL;      /* свёртка, закрывающая цепочку */
+    uint8_t         red  = (uint8_t)SMP_FRED_NONE;
+    uint32_t        n    = 0;
 
     for (;;) {
+        const int r = fuse_red_of(cur->op);
+        if (r != (int)SMP_FRED_NONE) {
+            /* Свёртка обязана быть последней: продолжать цепочку скаляром
+             * нечем, и флаг на ней означал бы испорченный модуль. */
+            if (cur->flags & SMP_IF_FUSE) return false;
+            red  = (uint8_t)r;
+            tail = cur;
+            break;
+        }
         if (n >= SMP_FUSE_MAX)             return false;
         if (fuse_op_of(cur->op) < 0)       return false;
         chain[n++] = cur;
@@ -275,12 +296,14 @@ static bool vm_fuse(SmpVM *vm, const SmpInstr **ipp, const SmpInstr *first)
         if (ip >= mod->code + mod->n_code) return false;
         cur = ip++;
     }
-    if (n < 2u) return false;
 
-    /* Источник цепочки — вход первой стадии, приёмник — выход последней.
-     * Всё, что между ними, в память не попадает вообще. */
-    if (!R[first->a].is_tensor)           return false;
-    if (!R[chain[n - 1u]->d].is_tensor)   return false;
+    /* Без свёртки цепочка из одной стадии смысла не имеет: экономить нечего. */
+    if (n < (tail ? 1u : 2u)) return false;
+
+    /* Источник цепочки — вход первой стадии; приёмник — выход последней, а со
+     * свёрткой его нет вовсе: результат скаляр. */
+    if (!R[first->a].is_tensor) return false;
+    if (!tail && !R[chain[n - 1u]->d].is_tensor) return false;
     for (uint32_t i = 0; i < n; i++) {
         const int f = fuse_op_of(chain[i]->op);
         if ((f == (int)SMP_FOP_ADD || f == (int)SMP_FOP_MUL) &&
@@ -291,9 +314,14 @@ static bool vm_fuse(SmpVM *vm, const SmpInstr **ipp, const SmpInstr *first)
     SmpFuseStep steps[SMP_FUSE_MAX];
 
     /* Дальше отказы уже фатальные: диагностика выдана, и повторять работу
-     * обычным путём не нужно — отсюда true, а не false. */
-    if (!make_buf(vm, &src, &R[first->a].t))          return true;
-    if (!make_buf(vm, &dst, &R[chain[n - 1u]->d].t))  return true;
+     * обычным путём не нужно — отсюда true, а не false.
+     *
+     * pc по ходу двигается на ту стадию, которую разбираем: слияние не должно
+     * стоить точности диагностики. Иначе дамп регистров при падении на свёртке
+     * показывал бы первую инструкцию цепочки, а пользователь читал бы про
+     * @reduce.add рядом с опкодом relu. */
+    if (!make_buf(vm, &src, &R[first->a].t)) return true;
+    if (!tail && !make_buf(vm, &dst, &R[chain[n - 1u]->d].t)) return true;
 
     for (uint32_t i = 0; i < n; i++) {
         const SmpInstr *c = chain[i];
@@ -305,12 +333,35 @@ static bool vm_fuse(SmpVM *vm, const SmpInstr **ipp, const SmpInstr *first)
         if (f == (int)SMP_FOP_SCALE) {
             steps[i].k = smp_const_as_double(mod->consts[c->k], c->aux);
         } else if (f == (int)SMP_FOP_ADD || f == (int)SMP_FOP_MUL) {
+            vm->pc = (uint32_t)(c - mod->code);
             if (!make_buf(vm, &steps[i].b, &R[c->b].t)) return true;
         }
     }
 
     apply_fp(vm, first->flags);
-    smp_k_fuse(&dst, &src, steps, n);
+
+    if (tail) {
+        vm->pc = (uint32_t)(tail - mod->code);
+        const double v = smp_k_fuse_reduce(&src, steps, n, red);
+
+        /* Проверка на вырождение та же, что у обычной свёртки: слияние меняет
+         * число проходов по памяти, а не то, за что ругается ?strict. */
+        if (!strict_check(vm, tail->flags, v,
+                          red == (uint8_t)SMP_FRED_MAX ? "@reduce.max"
+                                                       : "@reduce.add"))
+            return true;
+
+        /* Тип берётся у промежуточного буфера, а не у источника: ровно так же
+         * поступает несливаемый путь, и дескриптор буфера в регистре есть —
+         * его loadt эмиттер поднял выше цепочки. */
+        R[tail->d].is_tensor = false;
+        R[tail->d].s.f       = v;
+        R[tail->d].dtype     = R[tail->a].is_tensor ? R[tail->a].t.dtype
+                                                    : (uint8_t)SMP_DT_F64;
+        n += 1u;   /* свёртка тоже израсходована */
+    } else {
+        smp_k_fuse(&dst, &src, steps, n);
+    }
 
     /* Диспетчеризация была одна, а инструкций израсходовано n: счётчик должен
      * показывать исполненное, а не продиспетчеризованное. */

@@ -662,7 +662,75 @@ static void test_fusion(void)
               "исполнено %llu против %llu без слияния",
               (unsigned long long)g_vm.n_executed, (unsigned long long)fused);
     }
+    /* --- свёрточный хвост ---------------------------------------------------
+     *
+     * Свёртка закрывает цепочку, и промежуточный буфер не пишется вовсе.
+     * Проверяем тем же способом: со снятыми флагами обязано выйти то же самое. */
+
+    /* @relu -> @reduce.add: половина значений срезается в ноль. */
+    static const char *red_add =
+        "[#arena:0] *&A<f32:64> -> @fill(-4.0) => *&A;\n"
+        "[#arena:0] *&B<f32:64> -> @fill(7.0) => *&B;\n"
+        "[#simd:v256] *&A -> @add(*&B) -> @relu -> @reduce.add => $s;\n"
+        "*&A -> @emit.num => $n;\n";
+    if (run_str(red_add)) {
+        bool ok = false;
+        const double fused = regval("s", &ok);
+        CHECK(ok, "регистр $s не найден");
+        CHECK(count_fuse() == 2, "ждали 2 пометки слияния, нашли %u", count_fuse());
+        CHECK(near(fused, 3.0 * 64.0), "(-4+7)*64 дало %g, ждали 192", fused);
+
+        CHECK(rerun_unfused(), "прогон без слияния не дошёл до halt");
+        const double plain = regval("s", &ok);
+        CHECK(ok && near(plain, fused),
+              "слияние изменило свёртку: %g против %g", fused, plain);
+    }
+
+    /* @abs -> @reduce.max поверх отрицательных: максимум обязан взяться из
+     * модулей, а не из исходных значений. */
+    static const char *red_max =
+        "[#arena:0] *&A<f32:64> -> @fill(-9.0) => *&A;\n"
+        "[#simd:v256] *&A -> @abs -> @reduce.max => $m;\n"
+        "*&A -> @emit.num => $n;\n";
+    if (run_str(red_max)) {
+        bool ok = false;
+        const double fused = regval("m", &ok);
+        CHECK(ok, "регистр $m не найден");
+        CHECK(count_fuse() == 1, "ждали 1 пометку слияния, нашли %u", count_fuse());
+        CHECK(near(fused, 9.0), "max(|-9|) дало %g, ждали 9", fused);
+
+        CHECK(rerun_unfused(), "прогон без слияния не дошёл до halt");
+        const double plain = regval("m", &ok);
+        CHECK(ok && near(plain, fused),
+              "слияние изменило свёртку: %g против %g", fused, plain);
+    }
+
+    /* f64 идёт мимо векторной ветки — считает скалярное слитое ядро. */
+    static const char *red_wide =
+        "[#arena:0] *&A<f64:32> -> @fill(-1.5) => *&A;\n"
+        "*&A -> @abs -> @scale(2.0) -> @reduce.add => $s;\n"
+        "*&A -> @emit.num => $n;\n";
+    if (run_str(red_wide)) {
+        bool ok = false;
+        const double fused = regval("s", &ok);
+        CHECK(ok && near(fused, 3.0 * 32.0),
+              "|-1.5|*2*32 дало %g, ждали 96", fused);
+        CHECK(rerun_unfused(), "прогон без слияния не дошёл до halt");
+        const double plain = regval("s", &ok);
+        CHECK(ok && near(plain, fused),
+              "слияние изменило свёртку f64: %g против %g", fused, plain);
+    }
+
+    /* Счётчик исполненного обязан учесть и саму свёртку. */
+    if (run_str(red_max)) {
+        const uint64_t fused = g_vm.n_executed;
+        CHECK(rerun_unfused(), "прогон без слияния не дошёл до halt");
+        CHECK(g_vm.n_executed == fused,
+              "со свёрткой исполнено %llu против %llu",
+              (unsigned long long)g_vm.n_executed, (unsigned long long)fused);
+    }
 }
+
 
 /* ========================================================================== */
 

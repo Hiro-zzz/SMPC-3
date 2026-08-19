@@ -375,7 +375,9 @@ void smp_disasm(FILE *out, const SmpModule *m, bool color)
         if (in->flags & SMP_IF_NOALIAS) fn += (size_t)snprintf(fl + fn, sizeof(fl) - fn, ",na");
         if (in->flags & SMP_IF_RAW)     fn += (size_t)snprintf(fl + fn, sizeof(fl) - fn, ",raw");
         if (in->flags & SMP_IF_FUSE)    snprintf(fl + fn, sizeof(fl) - fn, ",fuse");
-        fprintf(out, "%s[%-14s]%s ", dc(color, D_DIM), fl, dc(color, D_RESET));
+        /* Ширина под самую длинную реальную комбинацию: v256,ftz,raw,fuse.
+         * Колонка на то и колонка, чтобы не разъезжаться от лишнего флага. */
+        fprintf(out, "%s[%-18s]%s ", dc(color, D_DIM), fl, dc(color, D_RESET));
 
         fprintf(out, "%s%-8s%s ", dc(color, D_OP), def->mnemonic, dc(color, D_RESET));
 

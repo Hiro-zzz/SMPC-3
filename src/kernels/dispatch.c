@@ -158,6 +158,24 @@ void smp_k_fuse(const SmpBuf *dst, const SmpBuf *src,
     smp_ks_fuse(dst, src, steps, nsteps);
 }
 
+double smp_k_fuse_reduce(const SmpBuf *src, const SmpFuseStep *steps,
+                         uint32_t nsteps, uint8_t red)
+{
+    resolve();
+
+    if (g_use_avx2 && dense_f32(src->t)) {
+        bool ok = true;
+        for (uint32_t i = 0; i < nsteps && ok; i++)
+            if (steps[i].op == SMP_FOP_ADD || steps[i].op == SMP_FOP_MUL)
+                ok = dense_f32(steps[i].b.t) &&
+                     steps[i].b.t->nelem == src->t->nelem;
+        if (ok)
+            return smp_ka_fuse_reduce((const float *)src->p, src->t->nelem,
+                                      steps, nsteps, red);
+    }
+    return smp_ks_fuse_reduce(src, steps, nsteps, red);
+}
+
 double smp_k_reduce_add(const SmpBuf *s)
 {
     resolve();

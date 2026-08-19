@@ -211,6 +211,93 @@ double smp_ka_reduce_max(const float *src, size_t n)
     return best;
 }
 
+/* Свёртка поверх цепочки. Накопителей четыре — ровно как в обычной свёртке: у
+ * сложения f32 задержка около четырёх тактов, и одна цепочка зависимостей
+ * загрузила бы конвейер на четверть. Структура накопления та же, значит и
+ * точность та же: сверять слитый вариант с обычным можно с прежним допуском. */
+double smp_ka_fuse_reduce(const float *src, size_t n,
+                          const SmpFuseStep *st, uint32_t ns, uint8_t red)
+{
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 absm = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+
+    __m256 kv[SMP_FUSE_MAX];
+    for (uint32_t s = 0; s < ns; s++)
+        kv[s] = _mm256_set1_ps((float)st[s].k);
+
+/* Прогоняет вектор через всю цепочку. OFF — смещение для бинарных операндов. */
+#define FUSE_APPLY(V, OFF)                                                     \
+    for (uint32_t s = 0; s < ns; s++) {                                        \
+        switch (st[s].op) {                                                    \
+            case SMP_FOP_RELU:  V = _mm256_max_ps(V, zero); break;             \
+            case SMP_FOP_ABS:   V = _mm256_and_ps(V, absm); break;             \
+            case SMP_FOP_SCALE: V = _mm256_mul_ps(V, kv[s]); break;            \
+            case SMP_FOP_ADD:                                                  \
+                V = _mm256_add_ps(V,                                           \
+                    _mm256_loadu_ps((const float *)st[s].b.p + (OFF)));        \
+                break;                                                         \
+            case SMP_FOP_MUL:                                                  \
+                V = _mm256_mul_ps(V,                                           \
+                    _mm256_loadu_ps((const float *)st[s].b.p + (OFF)));        \
+                break;                                                         \
+            default: break;                                                    \
+        }                                                                      \
+    }
+
+#define FUSE_RED_BODY(COMBINE)                                                 \
+    for (; i + 32 <= n; i += 32) {                                             \
+        __m256 x0 = _mm256_loadu_ps(src + i +  0); FUSE_APPLY(x0, i +  0)      \
+        __m256 x1 = _mm256_loadu_ps(src + i +  8); FUSE_APPLY(x1, i +  8)      \
+        __m256 x2 = _mm256_loadu_ps(src + i + 16); FUSE_APPLY(x2, i + 16)      \
+        __m256 x3 = _mm256_loadu_ps(src + i + 24); FUSE_APPLY(x3, i + 24)      \
+        a0 = COMBINE(a0, x0); a1 = COMBINE(a1, x1);                            \
+        a2 = COMBINE(a2, x2); a3 = COMBINE(a3, x3);                            \
+    }                                                                          \
+    for (; i + 8 <= n; i += 8) {                                               \
+        __m256 x = _mm256_loadu_ps(src + i); FUSE_APPLY(x, i)                  \
+        a0 = COMBINE(a0, x);                                                   \
+    }
+
+    size_t i = 0;
+    double acc;
+
+    if (red == SMP_FRED_MAX) {
+        __m256 a0 = _mm256_set1_ps(-INFINITY), a1 = a0, a2 = a0, a3 = a0;
+        FUSE_RED_BODY(_mm256_max_ps)
+        acc = (n >= 8) ? (double)hmax256(_mm256_max_ps(_mm256_max_ps(a0, a1),
+                                                       _mm256_max_ps(a2, a3)))
+                       : -INFINITY;
+    } else {
+        __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+        FUSE_RED_BODY(_mm256_add_ps)
+        acc = (double)hsum256(_mm256_add_ps(_mm256_add_ps(a0, a1),
+                                            _mm256_add_ps(a2, a3)));
+    }
+
+#undef FUSE_RED_BODY
+#undef FUSE_APPLY
+
+    /* Хвост (n % 8) — скалярно, теми же формулами. */
+    for (; i < n; i++) {
+        float x = src[i];
+        for (uint32_t s = 0; s < ns; s++) {
+            const float y = (st[s].op == SMP_FOP_ADD || st[s].op == SMP_FOP_MUL)
+                                ? ((const float *)st[s].b.p)[i] : 0.0f;
+            switch (st[s].op) {
+                case SMP_FOP_RELU:  x = x > 0.0f ? x : 0.0f; break;
+                case SMP_FOP_ABS:   x = x < 0.0f ? -x : x;   break;
+                case SMP_FOP_SCALE: x = x * (float)st[s].k;  break;
+                case SMP_FOP_ADD:   x = x + y;               break;
+                case SMP_FOP_MUL:   x = x * y;               break;
+                default: break;
+            }
+        }
+        if (red == SMP_FRED_MAX) { if ((double)x > acc) acc = (double)x; }
+        else                     { acc += (double)x; }
+    }
+    return acc;
+}
+
 /* ========================================================================== */
 /*  GEMM                                                                      */
 /* ========================================================================== */

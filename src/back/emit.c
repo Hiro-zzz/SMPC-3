@@ -372,6 +372,14 @@ static bool fusable_op(SmpOpKind k)
     }
 }
 
+/* Свёртка закрывает цепочку: она читает поэлементный результат и отдаёт
+ * скаляр. Промежуточного буфера при этом не возникает вовсе — ни прохода по
+ * памяти, ни записи. Продолжать цепочку после неё нечем, дальше скаляр. */
+static bool fusable_tail(SmpOpKind k)
+{
+    return k == SMP_OP_REDUCE_ADD || k == SMP_OP_REDUCE_MAX;
+}
+
 /* Какие поля инструкции реально заняты — по формату из реестра опкодов, а не
  * по догадке: у унарных операций b просто ноль, и принимать этот ноль за
  * номер регистра значило бы отказываться от слияния почти всегда. */
@@ -558,8 +566,8 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
          * промежуточный буфер читает только следующая стадия, и писать его
          * незачем. Утверждать это может лишь компилятор — VM сама не знает,
          * что буфер больше никем не читается. */
-        bool chain = (prev_instr != 0xFFFFFFFFu) &&
-                     fusable_op(prev_kind) && fusable_op(k);
+        bool chain = (prev_instr != 0xFFFFFFFFu) && fusable_op(prev_kind) &&
+                     (fusable_op(k) || fusable_tail(k));
         if (chain) {
             const uint32_t ns = hoist_loads(m, chain_start, prev_instr + 1u);
             if (ns == 0xFFFFFFFFu) chain = false;

@@ -24,6 +24,8 @@ void   smp_ks_add  (const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b);
 void   smp_ks_mul  (const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b);
 void   smp_ks_fuse (const SmpBuf *dst, const SmpBuf *src,
                     const SmpFuseStep *steps, uint32_t nsteps);
+double smp_ks_fuse_reduce(const SmpBuf *src, const SmpFuseStep *steps,
+                          uint32_t nsteps, uint8_t red);
 double smp_ks_reduce_add(const SmpBuf *src);
 double smp_ks_reduce_max(const SmpBuf *src);
 void   smp_ks_gemm (const SmpBuf *c, const SmpBuf *a, const SmpBuf *b);
@@ -37,6 +39,9 @@ void   smp_ka_add  (float *dst, const float *a, const float *b, size_t n);
 void   smp_ka_mul  (float *dst, const float *a, const float *b, size_t n);
 void   smp_ka_fuse (float *dst, const float *src, size_t n,
                     const SmpFuseStep *steps, uint32_t nsteps);
+double smp_ka_fuse_reduce(const float *src, size_t n,
+                          const SmpFuseStep *steps, uint32_t nsteps,
+                          uint8_t red);
 double smp_ka_reduce_add(const float *src, size_t n);
 double smp_ka_reduce_max(const float *src, size_t n);
 

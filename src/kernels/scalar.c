@@ -378,6 +378,55 @@ void smp_ks_fuse(const SmpBuf *dst, const SmpBuf *src,
     }
 }
 
+/* Свёртка поверх цепочки: промежуточного буфера нет вовсе. @relu -> @reduce.add
+ * читает вход один раз и сразу отдаёт скаляр — ни прохода по памяти на запись,
+ * ни самого буфера.
+ *
+ * Порядок обхода и тип накопителя те же, что у обычной свёртки, поэтому
+ * результат совпадает с неслитым вариантом бит в бит. */
+double smp_ks_fuse_reduce(const SmpBuf *src, const SmpFuseStep *st,
+                          uint32_t ns, uint8_t red)
+{
+    const SmpTensor *ts = src->t;
+    const SmpDType   ds = (SmpDType)ts->dtype;
+
+    double acc = (red == SMP_FRED_MAX) ? -INFINITY : 0.0;
+    if (ts->nelem == 0) return acc;
+
+    const bool lin = dense(ts);
+    uint32_t idx[SMP_MAX_RANK] = { 0, 0, 0, 0 };
+    uint32_t i = 0;
+
+    for (;;) {
+        const size_t oi = lin ? (size_t)i : elem_index(ts, idx);
+        double x = load_at(src->p, ds, oi);
+
+        for (uint32_t s = 0; s < ns; s++) {
+            switch (st[s].op) {
+                case SMP_FOP_RELU:  x = x > 0.0 ? x : 0.0; break;
+                case SMP_FOP_ABS:   x = x < 0.0 ? -x : x;  break;
+                case SMP_FOP_SCALE: x = x * st[s].k;       break;
+                case SMP_FOP_ADD:
+                case SMP_FOP_MUL: {
+                    const SmpTensor *tb = st[s].b.t;
+                    const size_t ob = lin ? (size_t)i : elem_index(tb, idx);
+                    const double y = load_at(st[s].b.p, (SmpDType)tb->dtype, ob);
+                    x = (st[s].op == SMP_FOP_ADD) ? x + y : x * y;
+                    break;
+                }
+                default: break;
+            }
+        }
+
+        if (red == SMP_FRED_MAX) { if (x > acc) acc = x; }
+        else                     { acc += x; }
+
+        if (lin) { if (++i >= ts->nelem) break; }
+        else     { if (!idx_next(ts, idx)) break; }
+    }
+    return acc;
+}
+
 /* ========================================================================== */
 /*  Свёртки                                                                   */
 /* ========================================================================== */

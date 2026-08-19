@@ -56,9 +56,21 @@ typedef struct SmpFuseStep {
     SmpBuf  b;       /* SMP_FOP_ADD, SMP_FOP_MUL                     */
 } SmpFuseStep;
 
+/* Свёртка, закрывающая цепочку. Промежуточного буфера тогда нет вовсе:
+ * @relu -> @reduce.add читает вход один раз и отдаёт скаляр. */
+typedef enum SmpFuseRed {
+    SMP_FRED_NONE = 0,
+    SMP_FRED_ADD,
+    SMP_FRED_MAX
+} SmpFuseRed;
+
 /* dst = chain(src) за один проход. Формы обязаны совпадать. */
 void smp_k_fuse(const SmpBuf *dst, const SmpBuf *src,
                 const SmpFuseStep *steps, uint32_t nsteps);
+
+/* reduce(chain(src)) за один проход, без промежуточного буфера. */
+double smp_k_fuse_reduce(const SmpBuf *src, const SmpFuseStep *steps,
+                         uint32_t nsteps, uint8_t red);
 
 /* Приведение типа с копированием. */
 void smp_k_cast(const SmpBuf *dst, const SmpBuf *src);
