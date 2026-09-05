@@ -192,21 +192,44 @@ double smp_k_reduce_max(const SmpBuf *s)
     return smp_ks_reduce_max(s);
 }
 
-void smp_k_gemm(const SmpBuf *c, const SmpBuf *a, const SmpBuf *b,
-                SmpKScratch *scratch)
+/* Плотны ли все операнды цепочки и той же длины, что C. Проверка ровно та же,
+ * что у обычного слияния: векторный эпилог адресует их линейным индексом. */
+static bool ep_dense(const SmpBuf *c, const SmpFuseStep *st, uint32_t ns)
+{
+    for (uint32_t i = 0; i < ns; i++)
+        if (st[i].op == SMP_FOP_ADD || st[i].op == SMP_FOP_MUL)
+            if (!dense_f32(st[i].b.t) || st[i].b.t->nelem != c->t->nelem)
+                return false;
+    return true;
+}
+
+void smp_k_gemm_ep(const SmpBuf *c, const SmpBuf *a, const SmpBuf *b,
+                   SmpKScratch *scratch, const SmpFuseStep *steps, uint32_t nsteps)
 {
     resolve();
     /* Без рабочей памяти векторная ветка не запускается: молча подсунуть ей
      * общий буфер значило бы вернуть ровно ту гонку, ради устранения которой
      * scratch и появился. */
     if (g_use_avx2 && scratch && scratch->bytes &&
-        rowmajor_f32(c->t) && rowmajor_f32(a->t) && rowmajor_f32(b->t)) {
-        smp_ka_gemm((float *)c->p, c->t->stride[0],
-                    (const float *)a->p, a->t->stride[0],
-                    (const float *)b->p, b->t->stride[0],
-                    a->t->shape[0], b->t->shape[1], a->t->shape[1],
-                    scratch->apack, scratch->bpack);
+        rowmajor_f32(c->t) && rowmajor_f32(a->t) && rowmajor_f32(b->t) &&
+        ep_dense(c, steps, nsteps)) {
+        smp_ka_gemm_ep((float *)c->p, c->t->stride[0],
+                       (const float *)a->p, a->t->stride[0],
+                       (const float *)b->p, b->t->stride[0],
+                       a->t->shape[0], b->t->shape[1], a->t->shape[1],
+                       scratch->apack, scratch->bpack, steps, nsteps);
         return;
     }
+
+    /* Эталон считает GEMM как считал, а цепочку докладывает отдельным
+     * проходом. Результат тот же; экономии прохода по C здесь нет, и обещать
+     * её было бы нечестно. */
     smp_ks_gemm(c, a, b);
+    if (nsteps) smp_ks_fuse(c, c, steps, nsteps);
+}
+
+void smp_k_gemm(const SmpBuf *c, const SmpBuf *a, const SmpBuf *b,
+                SmpKScratch *scratch)
+{
+    smp_k_gemm_ep(c, a, b, scratch, NULL, 0u);
 }

@@ -371,6 +371,128 @@ static bool vm_fuse(SmpVM *vm, const SmpInstr **ipp, const SmpInstr *first)
 }
 
 /* ========================================================================== */
+/*  Эпилог GEMM                                                               */
+/* ========================================================================== */
+
+/* Сколько байт адресует дескриптор от первого элемента до последнего
+ * включительно. Считается по шагам, а не по nelem: у среза с шагом занятый
+ * диапазон шире, чем его содержимое, и для проверки перекрытия важен именно
+ * диапазон. */
+static size_t buf_span(const SmpBuf *b)
+{
+    const SmpTensor *t   = b->t;
+    const size_t     esz = smp_dtype_size((SmpDType)t->dtype);
+    size_t           far = 0;
+
+    for (uint32_t i = 0; i < t->rank; i++)
+        if (t->shape[i]) far += (size_t)(t->shape[i] - 1u) * (size_t)t->stride[i];
+    return (far + 1u) * esz;
+}
+
+static bool buf_overlap(const SmpBuf *x, const SmpBuf *y)
+{
+    const unsigned char *px = (const unsigned char *)x->p;
+    const unsigned char *py = (const unsigned char *)y->p;
+    return px < py + buf_span(y) && py < px + buf_span(x);
+}
+
+/* Собирает поэлементную цепочку за @mmul и считает её в выгрузке тайла.
+ *
+ * Возврат false означает «слить не вышло»: вызывающий тогда исполняет mmul
+ * обычным путём, а стадии цепочки сольются между собой сами — флаги на них
+ * никуда не делись. Поэтому отказ здесь ничего не портит и ничего не теряет,
+ * кроме одного прохода по C.
+ *
+ * Свёртка цепочку не закрывает: @reduce после @mmul отдаёт скаляр, приёмника
+ * у GEMM тогда нет вовсе, и это уже другое ядро. Такая цепочка сюда попадёт и
+ * получит отказ — дальше её разберёт обычное слияние. */
+static bool vm_fuse_gemm(SmpVM *vm, const SmpInstr **ipp, const SmpInstr *first)
+{
+    const SmpModule *mod = vm->mod;
+    SmpReg          *R   = vm->regs;
+
+    const SmpInstr *chain[SMP_FUSE_MAX];
+    const SmpInstr *ip = *ipp;
+    const SmpInstr *cur;
+    uint32_t        n = 0;
+
+    if (ip >= mod->code + mod->n_code) return false;
+    cur = ip++;
+
+    for (;;) {
+        if (n >= SMP_FUSE_MAX)             return false;
+        if (fuse_op_of(cur->op) < 0)       return false;
+        chain[n++] = cur;
+        if (!(cur->flags & SMP_IF_FUSE))   break;
+        if (ip >= mod->code + mod->n_code) return false;
+        cur = ip++;
+    }
+
+    /* Границы цепочки VM перепроверяет сама: флаг — утверждение компилятора о
+     * мёртвом буфере, а не разрешение читать что попало. */
+    if (!R[first->a].is_tensor || !R[first->b].is_tensor) return false;
+    if (!R[chain[n - 1u]->d].is_tensor)                   return false;
+    for (uint32_t i = 0; i < n; i++) {
+        const int f = fuse_op_of(chain[i]->op);
+        if ((f == (int)SMP_FOP_ADD || f == (int)SMP_FOP_MUL) &&
+            !R[chain[i]->b].is_tensor) return false;
+    }
+
+    const SmpTensor *tc = &R[chain[n - 1u]->d].t;
+    const SmpTensor *ta = &R[first->a].t;
+    const SmpTensor *tb = &R[first->b].t;
+
+    /* Приёмник цепочки становится приёмником самого GEMM, так что его форма
+     * обязана быть формой произведения, а не просто совпадать поэлементно с
+     * промежуточным буфером. */
+    if (tc->rank != 2u || ta->rank != 2u || tb->rank != 2u) return false;
+    if (tc->shape[0] != ta->shape[0] || tc->shape[1] != tb->shape[1]) return false;
+
+    SmpBuf      dst, ba, bb;
+    SmpFuseStep steps[SMP_FUSE_MAX];
+
+    /* Дальше отказы фатальные: диагностика выдана, повторять работу обычным
+     * путём не нужно — отсюда true, а не false. */
+    if (!make_buf(vm, &dst, tc) ||
+        !make_buf(vm, &ba,  ta) ||
+        !make_buf(vm, &bb,  tb)) return true;
+
+    for (uint32_t i = 0; i < n; i++) {
+        const SmpInstr *c = chain[i];
+        const int       f = fuse_op_of(c->op);
+
+        memset(&steps[i], 0, sizeof steps[i]);
+        steps[i].op = (uint8_t)f;
+
+        if (f == (int)SMP_FOP_SCALE) {
+            steps[i].k = smp_const_as_double(mod->consts[c->k], c->aux);
+        } else if (f == (int)SMP_FOP_ADD || f == (int)SMP_FOP_MUL) {
+            vm->pc = (uint32_t)(c - mod->code);
+            if (!make_buf(vm, &steps[i].b, &R[c->b].t)) return true;
+        }
+    }
+
+    /* Неслитый GEMM писал в свой временный буфер, а цепочка читала его отдельно
+     * от A, B и операндов @add. Слитый пишет в приёмник ПОСРЕДИ счёта, и если
+     * тот перекрывается с чьим-то входом — читаться будет уже испорченное.
+     * Компилятор про это знать не обязан: срез с динамическим индексом сходится
+     * с чужой памятью только в рантайме. */
+    if (buf_overlap(&dst, &ba) || buf_overlap(&dst, &bb)) return false;
+    for (uint32_t i = 0; i < n; i++)
+        if ((steps[i].op == SMP_FOP_ADD || steps[i].op == SMP_FOP_MUL) &&
+            buf_overlap(&dst, &steps[i].b)) return false;
+
+    apply_fp(vm, first->flags);
+    smp_k_gemm_ep(&dst, &ba, &bb, &vm->scratch, steps, n);
+
+    /* Диспетчеризация была одна, а инструкций израсходовано n сверх самого
+     * mmul: счётчик показывает исполненное, а не продиспетчеризованное. */
+    vm->n_executed += n;
+    *ipp = ip;
+    return true;
+}
+
+/* ========================================================================== */
 /*  Главный цикл                                                              */
 /* ========================================================================== */
 
@@ -520,6 +642,10 @@ dispatch_switch:
         VM_NEXT();
 
     VM_CASE(MMUL)
+        /* Эпилог: @mmul -> @relu -> @add считается в выгрузке тайла, пока тот
+         * лежит в L1. Не сошлось — обычный путь, а цепочка сольётся сама. */
+        if (SMP_UNLIKELY(in->flags & SMP_IF_FUSE) && vm_fuse_gemm(vm, &ip, in))
+            VM_NEXT();
         apply_fp(vm, in->flags);
         if (!make_buf(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t) ||

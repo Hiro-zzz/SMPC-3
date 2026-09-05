@@ -51,4 +51,12 @@ void   smp_ka_gemm(float *C, size_t ldc, const float *A, size_t lda,
                    const float *B, size_t ldb, size_t M, size_t N, size_t K,
                    float *apack, float *bpack);
 
+/* То же с эпилогом, применяемым в выгрузке тайла на последнем k-блоке.
+ * Операнды цепочки адресуются как плотные [M,N]: элемент (i,j) лежит по
+ * индексу i*N + j — их плотность проверил диспетчер. */
+void   smp_ka_gemm_ep(float *C, size_t ldc, const float *A, size_t lda,
+                      const float *B, size_t ldb, size_t M, size_t N, size_t K,
+                      float *apack, float *bpack,
+                      const SmpFuseStep *steps, uint32_t nsteps);
+
 #endif /* SMPC3_KERNELS_IMPL_H */

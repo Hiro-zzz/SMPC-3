@@ -498,9 +498,45 @@ static void micro_6x16(size_t kc, const float *Ap, const float *Bp, float *ctile
     _mm256_store_ps(ctile + 80, c50); _mm256_store_ps(ctile + 88, c51);
 }
 
-void smp_ka_gemm(float *C, size_t ldc, const float *A, size_t lda,
-                 const float *B, size_t ldb, size_t M, size_t N, size_t K,
-                 float *apack, float *bpack)
+/* ========================================================================== */
+/*  Эпилог                                                                    */
+/* ========================================================================== */
+
+/* Цепочка по строке панели C.
+ *
+ * Стадии идут отдельными проходами по строке, а не все сразу на каждый
+ * элемент: они поэлементные и независимые, так что порядок «стадия за
+ * стадией» даёт то же самое. Зато разбор стадии перестаёт приходиться на
+ * каждые восемь чисел — в тайле шириной NR=16 это стоило дороже самой
+ * арифметики, и слияние съедало собственный выигрыш.
+ *
+ * Лишние проходы здесь ничего не стоят: строка не длиннее NC и только что
+ * посчитана, то есть лежит в L1. Тем же и объясняется, почему стадии зовутся
+ * готовыми ядрами вместо своей копии формул — второй реализации relu в файле
+ * быть не должно.
+ *
+ * base — линейный индекс начала строки в плотном [M,N]: так адресуются
+ * операнды @add и @mul, их плотность проверил диспетчер. */
+static void ep_row(float *row, size_t n, const SmpFuseStep *st, uint32_t ns,
+                   size_t base)
+{
+    for (uint32_t s = 0; s < ns; s++) {
+        const float *b = (const float *)st[s].b.p + base;
+        switch (st[s].op) {
+            case SMP_FOP_RELU:  smp_ka_relu (row, row, n);                  break;
+            case SMP_FOP_ABS:   smp_ka_abs  (row, row, n);                  break;
+            case SMP_FOP_SCALE: smp_ka_scale(row, row, n, (float)st[s].k);  break;
+            case SMP_FOP_ADD:   smp_ka_add  (row, row, b, n);               break;
+            case SMP_FOP_MUL:   smp_ka_mul  (row, row, b, n);               break;
+            default: break;
+        }
+    }
+}
+
+void smp_ka_gemm_ep(float *C, size_t ldc, const float *A, size_t lda,
+                    const float *B, size_t ldb, size_t M, size_t N, size_t K,
+                    float *apack, float *bpack,
+                    const SmpFuseStep *steps, uint32_t nsteps)
 {
     for (size_t i = 0; i < M; i++)
         memset(C + i * ldc, 0, N * sizeof(float));
@@ -514,6 +550,11 @@ void smp_ka_gemm(float *C, size_t ldc, const float *A, size_t lda,
 
         for (size_t k0 = 0; k0 < K; k0 += BKC) {
             const size_t kc = (K - k0 < BKC) ? (K - k0) : BKC;
+
+            /* Эпилог ложится ровно один раз — на последнем k-блоке. До него в
+             * C лежит незаконченная сумма, и @relu над ней дал бы не «relu от
+             * произведения», а срез промежуточного шага. */
+            const bool ep = (nsteps != 0u) && (k0 + kc == K);
 
             pack_b(bpack, B + k0 * ldb + j0, ldb, kc, nc);
 
@@ -537,8 +578,23 @@ void smp_ka_gemm(float *C, size_t ldc, const float *A, size_t lda,
                             for (size_t j = 0; j < nr; j++) c[j] += ctile[r * NR + j];
                         }
                     }
+
+                    /* Строки панели готовы целиком — эпилог берёт их одним
+                     * куском по nc, а не кусками по NR: так проход длиннее
+                     * разбора стадии, а не короче. */
+                    if (ep)
+                        for (size_t r = 0; r < mr; r++)
+                            ep_row(C + (i0 + ir + r) * ldc + j0, nc,
+                                   steps, nsteps, (i0 + ir + r) * N + j0);
                 }
             }
         }
     }
+}
+
+void smp_ka_gemm(float *C, size_t ldc, const float *A, size_t lda,
+                 const float *B, size_t ldb, size_t M, size_t N, size_t K,
+                 float *apack, float *bpack)
+{
+    smp_ka_gemm_ep(C, ldc, A, lda, B, ldb, M, N, K, apack, bpack, NULL, 0u);
 }

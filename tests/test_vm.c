@@ -734,6 +734,102 @@ static void test_fusion(void)
 
 /* ========================================================================== */
 
+/* ========================================================================== */
+/*  Эпилог GEMM                                                               */
+/* ========================================================================== */
+
+/* Цепочка за @mmul считается в цикле выгрузки тайла. Проверка та же, что у
+ * поэлементного слияния: со снятыми флагами обязано выйти то же самое.
+ * Замером это не проверить — разброс bench больше ожидаемого выигрыша. */
+static void test_gemm_epilogue(void)
+{
+    SECTION("эпилог GEMM");
+
+    static double want[64];
+
+    /* Одна стадия за произведением: 8 * (1.5 * 2) = 24, вдвое меньше — 12. */
+    static const char *scaled =
+        "[#arena:0] *&A<f32:8,8> -> @fill(1.5) => *&A;\n"
+        "[#arena:0] *&B<f32:8,8> -> @fill(2.0) => *&B;\n"
+        "[#simd:v256] *&A -> @mmul(*&B) -> @scale(0.5)"
+        " => *&C<f32:8,8> [!no-alias];\n";
+    if (run_str(scaled)) {
+        CHECK(count_fuse() == 1, "ждали 1 пометку слияния, нашли %u", count_fuse());
+        snapshot("C", want, 64);
+        CHECK(near(want[0], 12.0), "8*(1.5*2)/2 дало %g, ждали 12", want[0]);
+        CHECK(rerun_unfused(), "прогон без слияния не дошёл до halt");
+        check_same("C", want, 64);
+    }
+
+    /* relu обязан срезать: произведение отрицательное. */
+    static const char *clipped =
+        "[#arena:0] *&A<f32:8,8> -> @fill(-1.5) => *&A;\n"
+        "[#arena:0] *&B<f32:8,8> -> @fill(2.0) => *&B;\n"
+        "[#simd:v256] *&A -> @mmul(*&B) -> @relu"
+        " => *&C<f32:8,8> [!no-alias];\n";
+    if (run_str(clipped)) {
+        snapshot("C", want, 64);
+        CHECK(near(want[0], 0.0), "relu не срезал произведение: %g", want[0]);
+        CHECK(rerun_unfused(), "прогон без слияния не дошёл до halt");
+        check_same("C", want, 64);
+    }
+
+    /* Две стадии, вторая с тензорным операндом: 0 + 100. */
+    static const char *biased =
+        "[#arena:0] *&A<f32:8,8> -> @fill(-1.5) => *&A;\n"
+        "[#arena:0] *&B<f32:8,8> -> @fill(2.0) => *&B;\n"
+        "[#arena:0] *&E<f32:8,8> -> @fill(100.0) => *&E;\n"
+        "[#simd:v256] *&A -> @mmul(*&B) -> @relu -> @add(*&E)"
+        " => *&C<f32:8,8> [!no-alias];\n";
+    if (run_str(biased)) {
+        CHECK(count_fuse() == 2, "ждали 2 пометки слияния, нашли %u", count_fuse());
+        snapshot("C", want, 64);
+        CHECK(near(want[0], 100.0), "relu(-24)+100 дало %g, ждали 100", want[0]);
+        CHECK(rerun_unfused(), "прогон без слияния не дошёл до halt");
+        check_same("C", want, 64);
+    }
+
+    /* K = 600 при KC = 256 — три k-блока. Эпилог обязан лечь ровно один раз:
+     * применённый на каждом, дал бы 600/8, а не 600/2. */
+    static const char *kblocks =
+        "[#arena:0] *&A<f32:40,600> -> @fill(1.0) => *&A;\n"
+        "[#arena:0] *&B<f32:600,40> -> @fill(1.0) => *&B;\n"
+        "[#simd:v256] *&A -> @mmul(*&B) -> @scale(0.5)"
+        " => *&C<f32:40,40> [!no-alias];\n";
+    if (run_str(kblocks)) {
+        snapshot("C", want, 40);
+        CHECK(near(want[0], 300.0), "600/2 дало %g, ждали 300", want[0]);
+        CHECK(rerun_unfused(), "прогон без слияния не дошёл до halt");
+        check_same("C", want, 40);
+    }
+
+    /* Свёртка за произведением цепочку не начинает: приёмника у GEMM тогда
+     * нет. Отказ обязан остаться правильным, а не потерять результат. */
+    static const char *reduced =
+        "[#arena:0] *&A<f32:8,8> -> @fill(1.5) => *&A;\n"
+        "[#arena:0] *&B<f32:8,8> -> @fill(2.0) => *&B;\n"
+        "[#simd:v256] *&A -> @mmul(*&B) -> @relu -> @reduce.add => $s;\n";
+    if (run_str(reduced)) {
+        bool ok = false;
+        const double fused = regval("s", &ok);
+        CHECK(ok, "регистр $s не найден");
+        CHECK(near(fused, 24.0 * 64.0), "сумма дала %g, ждали 1536", fused);
+        CHECK(rerun_unfused(), "прогон без слияния не дошёл до halt");
+        const double plain = regval("s", &ok);
+        CHECK(ok && near(plain, fused),
+              "слияние изменило свёртку за mmul: %g против %g", fused, plain);
+    }
+
+    /* Счётчик исполненного не должен врать и здесь. */
+    if (run_str(biased)) {
+        const uint64_t fused = g_vm.n_executed;
+        CHECK(rerun_unfused(), "прогон без слияния не дошёл до halt");
+        CHECK(g_vm.n_executed == fused,
+              "исполнено %llu против %llu без слияния",
+              (unsigned long long)g_vm.n_executed, (unsigned long long)fused);
+    }
+}
+
 int main(void)
 {
     smp_console_setup();
@@ -759,6 +855,7 @@ int main(void)
     test_regdump();
     test_roundtrip();
     test_fusion();
+    test_gemm_epilogue();
 
     smp_vm_release(&g_vm);
     fclose(g_sink);

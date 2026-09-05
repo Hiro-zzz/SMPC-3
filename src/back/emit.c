@@ -380,6 +380,15 @@ static bool fusable_tail(SmpOpKind k)
     return k == SMP_OP_REDUCE_ADD || k == SMP_OP_REDUCE_MAX;
 }
 
+/* Чем цепочка может начаться. Матричное умножение её начинает, но не
+ * продолжает: оно не поэлементное, и вклиниться в середину ему некуда. Зато
+ * его собственный цикл выгрузки тайла — уже проход по результату, и цепочка
+ * умещается прямо в него. */
+static bool fusable_head(SmpOpKind k)
+{
+    return fusable_op(k) || k == SMP_OP_MMUL;
+}
+
 /* Какие поля инструкции реально заняты — по формату из реестра опкодов, а не
  * по догадке: у унарных операций b просто ноль, и принимать этот ноль за
  * номер регистра значило бы отказываться от слияния почти всегда. */
@@ -566,7 +575,7 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
          * промежуточный буфер читает только следующая стадия, и писать его
          * незачем. Утверждать это может лишь компилятор — VM сама не знает,
          * что буфер больше никем не читается. */
-        bool chain = (prev_instr != 0xFFFFFFFFu) && fusable_op(prev_kind) &&
+        bool chain = (prev_instr != 0xFFFFFFFFu) && fusable_head(prev_kind) &&
                      (fusable_op(k) || fusable_tail(k));
         if (chain) {
             const uint32_t ns = hoist_loads(m, chain_start, prev_instr + 1u);

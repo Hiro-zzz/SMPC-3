@@ -25,6 +25,7 @@ static float SMP_ALIGNED(64) g_a[MAXN];
 static float SMP_ALIGNED(64) g_b[MAXN];
 static float SMP_ALIGNED(64) g_ref[MAXN];
 static float SMP_ALIGNED(64) g_got[MAXN];
+static float SMP_ALIGNED(64) g_e[MAXN];   /* операнд @add/@mul в эпилоге */
 
 /* Детерминированный генератор: тест обязан падать одинаково при каждом
  * запуске, иначе отлаживать его невозможно. */
@@ -222,6 +223,81 @@ static void gemm_case(uint32_t M, uint32_t N, uint32_t K)
     const double e = max_rel_err(g_ref, g_got, (size_t)M * N);
     CHECK(e < 1e-4, "gemm %ux%ux%u: отн. ошибка %g", M, N, K, e);
 }
+
+/* Эпилог за GEMM: C = chain(A x B). Эталон собирается порознь — скалярный
+ * GEMM плюс отдельный проход цепочки, ровно то, что делал неслитый путь.
+ * Слияние меняет число проходов по памяти, а не арифметику, поэтому
+ * расхождение здесь означало бы ошибку, а не иной порядок сложения. */
+static void gemm_ep_case(uint32_t M, uint32_t N, uint32_t K,
+                         const uint8_t *ops, uint32_t ns, const char *what)
+{
+    if ((size_t)M * K > MAXN || (size_t)K * N > MAXN || (size_t)M * N > MAXN) return;
+
+    fill_rand(g_a, (size_t)M * K);
+    fill_rand(g_b, (size_t)K * N);
+    fill_rand(g_e, (size_t)M * N);
+
+    SmpTensor ta = mk(M, K), tb = mk(K, N), tc = mk(M, N);
+    SmpBuf a = { g_a, &ta }, b = { g_b, &tb };
+    SmpBuf ref = { g_ref, &tc }, got = { g_got, &tc };
+    const SmpBuf eb = { g_e, &tc };
+
+    SmpFuseStep st[SMP_FUSE_MAX];
+    memset(st, 0, sizeof st);
+    for (uint32_t i = 0; i < ns; i++) {
+        st[i].op = ops[i];
+        st[i].k  = 0.5 + (double)i;
+        st[i].b  = eb;
+    }
+
+    memset(g_ref, 0xCD, (size_t)M * N * sizeof(float));
+    memset(g_got, 0xCD, (size_t)M * N * sizeof(float));
+
+    smp_kernels_select(SMP_KB_SCALAR);
+    smp_k_gemm(&ref, &a, &b, &g_sc);
+    if (ns) smp_k_fuse(&ref, &ref, st, ns);
+
+    smp_kernels_select(SMP_KB_AVX2);
+    smp_k_gemm_ep(&got, &a, &b, &g_sc, st, ns);
+
+    const double e = max_rel_err(g_ref, g_got, (size_t)M * N);
+    CHECK(e < 1e-4, "эпилог %s на %ux%ux%u: отн. ошибка %g", what, M, N, K, e);
+}
+
+static void test_gemm_epilogue(void)
+{
+    SECTION("эпилог GEMM");
+
+    if (!smp_kernels_select(SMP_KB_AVX2)) return;
+
+    static const uint8_t relu[]    = { SMP_FOP_RELU };
+    static const uint8_t relu_add[] = { SMP_FOP_RELU, SMP_FOP_ADD };
+    static const uint8_t scale_abs[] = { SMP_FOP_SCALE, SMP_FOP_ABS };
+    static const uint8_t triple[] = { SMP_FOP_MUL, SMP_FOP_RELU, SMP_FOP_SCALE };
+
+    /* Те же хвосты, что у обычного GEMM: эпилог живёт в выгрузке тайла, и
+     * ошибиться он может ровно там же, где ошибается она. */
+    gemm_ep_case(6, 16, 8,  relu, 1, "relu");
+    gemm_ep_case(1, 1, 1,   relu, 1, "relu");
+    gemm_ep_case(7, 17, 13, relu, 1, "relu");
+    gemm_ep_case(5, 16, 8,  relu_add, 2, "relu+add");
+    gemm_ep_case(6, 15, 8,  relu_add, 2, "relu+add");
+    gemm_ep_case(6, 17, 8,  relu_add, 2, "relu+add");
+    gemm_ep_case(13, 100, 7, scale_abs, 2, "scale+abs");
+    gemm_ep_case(23, 41, 37, triple, 3, "mul+relu+scale");
+
+    /* Больше одного k-блока. Эпилог обязан лечь ровно один раз: применённый на
+     * каждом, он дал бы scale в кубе — и это видно, в отличие от повторного
+     * relu, который прошёл бы незамеченным. */
+    gemm_ep_case(70, 260, 520, scale_abs, 2, "scale+abs, k-блоков много");
+    gemm_ep_case(40, 40, 600,  triple, 3, "mul+relu+scale, k-блоков много");
+    gemm_ep_case(64, 300, 300, relu_add, 2, "relu+add, блоков много");
+
+    /* Пустая цепочка — это просто GEMM, и вести себя обязана как он. */
+    gemm_ep_case(12, 32, 16, NULL, 0, "пустая цепочка");
+}
+
+/* ========================================================================== */
 
 static void test_gemm(void)
 {
@@ -461,6 +537,7 @@ int main(void)
     test_elementwise();
     test_reduce();
     test_gemm();
+    test_gemm_epilogue();
     test_fallback();
     test_identity();
     test_gemm_block();
