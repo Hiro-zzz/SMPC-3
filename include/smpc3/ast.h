@@ -13,6 +13,7 @@
 #ifndef SMPC3_AST_H
 #define SMPC3_AST_H
 
+#include "smpc3/arena.h"
 #include "smpc3/common.h"
 #include "smpc3/diag.h"
 #include "smpc3/types.h"
@@ -21,6 +22,10 @@
 #define SMP_MAX_SUFFIX  8u    /* элементов суффикса на инструкцию            */
 #define SMP_MAX_STAGES 32u    /* стадий в конвейере                          */
 #define SMP_MAX_ARGS    8u    /* аргументов у стадии                         */
+
+/* Потолок развёртки [#repeat:N]. Это не цикл: тело дублируется в байткоде, и
+ * потолок здесь — прямая цена в размере модуля, а не произвольное число. */
+#define SMP_MAX_REPEAT 4096u
 
 /* --- Имя, указывающее внутрь исходника ------------------------------------ */
 typedef struct SmpName {
@@ -136,6 +141,14 @@ typedef struct SmpAstStmt {
 
     uint32_t       nsuffix;
     SmpAstSuffix  *suffix;
+
+    /* Копия, порождённая [#repeat:N]. Диагностике эти поля нужны буквально:
+     * все копии указывают на одну и ту же строку исходника, и без номера
+     * повтора N одинаковых сообщений о ней не различить. */
+    bool           from_repeat;
+    uint32_t       repeat_idx;   /* 0 .. repeat_n-1                           */
+    uint32_t       repeat_n;
+    uint32_t       repeat_of;    /* номер оригинала до развёртки              */
 } SmpAstStmt;
 
 /* --- Программа ------------------------------------------------------------ */
@@ -150,6 +163,22 @@ const SmpAstPrefix *smp_stmt_directive(const SmpAstStmt *s, const char *name);
 const SmpAstSuffix *smp_stmt_suffix(const SmpAstStmt *s, SmpSuffixKind k,
                                     const char *name);
 bool                smp_stmt_has_mode(const SmpAstStmt *s, const char *name);
+
+/* --- Развёртка ------------------------------------------------------------ */
+
+/* Разворачивает [#repeat:N] в N копий, подставляя вместо регистра из #index
+ * номер повтора.
+ *
+ * Делается ДО семантики намеренно. Только тогда каждая копия проверяется со
+ * своим конкретным индексом, и выход за границу оси или поехавшее под #simd
+ * выравнивание ловятся на компиляции — а не фаталом на седьмой итерации, где
+ * их уже не отличить от настоящей ошибки в данных.
+ *
+ * Программа переписывается на месте, память берётся из той же арены. Дерево
+ * после этого не содержит ни одной копии, помнящей про регистр-индекс: он
+ * существовал только на время развёртки. */
+SmpStatus smp_ast_expand(SmpAstProgram *prog, SmpArena *arena,
+                         SmpDiagCtx *diag, uint32_t *n_errors);
 
 /* --- Печать дерева -------------------------------------------------------- */
 void smp_ast_dump(FILE *out, const SmpAstProgram *prog, bool color);

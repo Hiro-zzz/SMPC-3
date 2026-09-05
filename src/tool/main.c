@@ -284,6 +284,12 @@ static int frontend(const char *path, SmpArena *arena, SmpDiagCtx *D,
     smp_parse(&P, prog);
     if (P.n_errors) return 65;
 
+    /* Развёртка [#repeat:N] идёт до семантики: каждая копия обязана
+     * проверяться со своим индексом, иначе смысл развёртки теряется. */
+    uint32_t n_exp = 0;
+    smp_ast_expand(prog, arena, D, &n_exp);
+    if (n_exp) return 65;
+
     smp_sema_init(sm, arena, D, src);
     smp_sema_run(sm, prog, res);
     return sm->n_errors ? 65 : -1;
@@ -315,7 +321,10 @@ static int cmd_check(const char *path, bool dump)
     }
 
     char sum[128];
-    if (sm.n_errors || sm.n_warnings)
+    /* Считаем по напечатанному, а не по счётчикам семантики: до неё доходят
+     * не все ошибки. Развёртка [#repeat] отсеивается раньше, и её претензии
+     * оставались бы без итоговой строки. */
+    if (D.n_fatal || D.n_warn)
         fprintf(stderr, "\nитог: %s\n", smp_diag_summary(&D, sum, sizeof sum));
     else if (rc < 0)
         fprintf(stderr, "проверка пройдена: замечаний нет\n");

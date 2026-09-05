@@ -188,6 +188,242 @@ static void pr_stmt(const Pr *pr, const SmpAstStmt *s, uint32_t idx)
     }
 }
 
+/* ========================================================================== */
+/*  Развёртка [#repeat:N]                                                     */
+/* ========================================================================== */
+
+static bool name_eq(SmpName a, SmpName b)
+{
+    return a.len == b.len && a.p && b.p && memcmp(a.p, b.p, a.len) == 0;
+}
+
+static void rep_err(SmpDiagCtx *d, uint32_t *nerr, SmpSpan sp,
+                    const char *details, const char *fix)
+{
+    (*nerr)++;
+    if (!d) return;
+
+    SmpDiagMsg m;
+    memset(&m, 0, sizeof m);
+    m.code    = SMP_E0310;
+    m.span    = sp;
+    m.details = details;
+    m.fix     = fix;
+    smp_diag_emit(d, &m);
+}
+
+/* Копия ссылки на тензор с подставленным индексом. Копия нужна даже там, где
+ * подставлять нечего: узлы разных повторов не должны делить память, иначе
+ * правка одного тихо меняла бы остальные. */
+static SmpAstTensor *subst_tensor(const SmpAstTensor *t, SmpName ix, bool has_ix,
+                                  uint64_t v, SmpArena *ar)
+{
+    SmpAstTensor *n = (SmpAstTensor *)smp_arena_push_raw(ar, sizeof *n, 8);
+    if (!n) return NULL;
+    *n = *t;
+
+    if (!has_ix) return n;
+    for (uint32_t i = 0; i < n->nidx; i++)
+        if (n->idx[i].kind == SMP_IDX_REG && name_eq(n->idx[i].reg, ix)) {
+            n->idx[i].kind = SMP_IDX_INT;
+            n->idx[i].ival = v;
+        }
+    return n;
+}
+
+/* Операнд на месте: регистр-индекс становится литералом, тензор копируется.
+ *
+ * Индекс подставляется и там, где он стоит просто операндом, а не только в
+ * квадратных скобках. Иначе половина упоминаний одного имени была бы числом,
+ * а половина осталась бы регистром, и объяснить это правило было бы нечем. */
+static bool subst_operand(SmpAstOperand *o, SmpName ix, bool has_ix,
+                          uint64_t v, SmpArena *ar)
+{
+    if (has_ix && o->kind == SMP_OPD_REG && name_eq(o->reg, ix)) {
+        o->kind = SMP_OPD_INT;
+        o->ival = v;
+        return true;
+    }
+    if (o->kind == SMP_OPD_TENSOR && o->tensor) {
+        SmpAstTensor *t = subst_tensor(o->tensor, ix, has_ix, v, ar);
+        if (!t) return false;
+        o->tensor = t;
+    }
+    return true;
+}
+
+/* Одна копия инструкции с подставленным номером повтора. Префикс и суффикс не
+ * копируются: развёртка их не трогает, а делить неизменяемое безопасно. */
+static bool clone_stmt(SmpAstStmt *dst, const SmpAstStmt *src, SmpName ix,
+                       bool has_ix, uint64_t v, SmpArena *ar)
+{
+    *dst = *src;
+
+    if (!subst_operand(&dst->source, ix, has_ix, v, ar)) return false;
+    if (dst->has_dest && !subst_operand(&dst->dest, ix, has_ix, v, ar)) return false;
+
+    if (dst->nstages) {
+        SmpAstStage *st = (SmpAstStage *)smp_arena_push_raw(
+            ar, dst->nstages * sizeof *st, 8);
+        if (!st) return false;
+        memcpy(st, src->stages, dst->nstages * sizeof *st);
+
+        for (uint32_t i = 0; i < dst->nstages; i++) {
+            if (!st[i].nargs) continue;
+            SmpAstOperand *ag = (SmpAstOperand *)smp_arena_push_raw(
+                ar, st[i].nargs * sizeof *ag, 8);
+            if (!ag) return false;
+            memcpy(ag, src->stages[i].args, st[i].nargs * sizeof *ag);
+            for (uint32_t j = 0; j < st[i].nargs; j++)
+                if (!subst_operand(&ag[j], ix, has_ix, v, ar)) return false;
+            st[i].args = ag;
+        }
+        dst->stages = st;
+    }
+    return true;
+}
+
+/* Объявляет ли инструкция тензор. Внутри развёртки это всегда ошибка: N копий
+ * объявили бы одно имя N раз, и человек получил бы N сообщений о повторном
+ * объявлении, все указывающие на одну и ту же строку. Лучше сказать прямо. */
+static const SmpAstTensor *declares_tensor(const SmpAstStmt *s)
+{
+    if (s->source.kind == SMP_OPD_TENSOR && s->source.tensor &&
+        s->source.tensor->has_type) return s->source.tensor;
+    if (s->has_dest && s->dest.kind == SMP_OPD_TENSOR && s->dest.tensor &&
+        s->dest.tensor->has_type) return s->dest.tensor;
+
+    for (uint32_t i = 0; i < s->nstages; i++)
+        for (uint32_t j = 0; j < s->stages[i].nargs; j++) {
+            const SmpAstOperand *a = &s->stages[i].args[j];
+            if (a->kind == SMP_OPD_TENSOR && a->tensor && a->tensor->has_type)
+                return a->tensor;
+        }
+    return NULL;
+}
+
+/* Занято ли имя индекса обычным регистром где-то ещё в программе. Развёртка
+ * подставляет литерал по имени, так что совпадение молча затенило бы чужой
+ * регистр внутри этой инструкции — ровно тот случай, после которого говорят
+ * «оно почему-то считает не то». */
+static bool name_taken_by_reg(const SmpAstProgram *prog, SmpName ix)
+{
+    for (uint32_t i = 0; i < prog->nstmts; i++) {
+        const SmpAstStmt *s = &prog->stmts[i];
+        if (s->has_dest && s->dest.kind == SMP_OPD_REG && name_eq(s->dest.reg, ix))
+            return true;
+    }
+    return false;
+}
+
+SmpStatus smp_ast_expand(SmpAstProgram *prog, SmpArena *arena,
+                         SmpDiagCtx *diag, uint32_t *n_errors)
+{
+    uint32_t nerr  = 0;
+    uint32_t total = 0;
+    bool     any   = false;
+
+    /* Сколько инструкций получится, считаем заранее: массив обязан остаться
+     * непрерывным, а дописывать в bump-арену посреди чужих выделений нельзя. */
+    for (uint32_t i = 0; i < prog->nstmts; i++) {
+        const SmpAstStmt   *s = &prog->stmts[i];
+        const SmpAstPrefix *r = smp_stmt_directive(s, "repeat");
+        const SmpAstPrefix *x = smp_stmt_directive(s, "index");
+
+        if (!r) {
+            if (x) rep_err(diag, &nerr, x->span,
+                           "Директива #index задана без #repeat: нумеровать нечего.",
+                           "Добавь #repeat:N или убери #index.");
+            total++;
+            continue;
+        }
+        any = true;
+
+        if (!r->has_value || !r->value_is_int) {
+            rep_err(diag, &nerr, r->span,
+                    "Директива #repeat требует число повторов, известное на компиляции.",
+                    "Запиши #repeat:N, где N — целое от 1 до 4096.");
+            total++;
+            continue;
+        }
+        if (r->ival == 0 || r->ival > SMP_MAX_REPEAT) {
+            rep_err(diag, &nerr, r->value_span,
+                    smp_fmt(diag, "Запрошено %llu повторов, допустимо от 1 до %u.",
+                            (unsigned long long)r->ival, SMP_MAX_REPEAT),
+                    "Это развёртка, а не цикл: каждый повтор — свои инструкции в модуле.");
+            total++;
+            continue;
+        }
+        if (x && (!x->has_value || x->value_is_int)) {
+            rep_err(diag, &nerr, x->span,
+                    "Директива #index требует имя регистра, записанное без сигила.",
+                    "Запиши #index:i, а в теле пиши $i.");
+            total++;
+            continue;
+        }
+        if (x && name_taken_by_reg(prog, x->sval)) {
+            rep_err(diag, &nerr, x->value_span,
+                    smp_fmt(diag, "Имя '$%.*s' уже принадлежит обычному регистру.",
+                            (int)x->sval.len, x->sval.p),
+                    "Возьми индексу другое имя: внутри развёртки он затенил бы регистр.");
+            total++;
+            continue;
+        }
+
+        const SmpAstTensor *decl = declares_tensor(s);
+        if (decl && r->ival > 1) {
+            rep_err(diag, &nerr, decl->span,
+                    smp_fmt(diag, "Тензор '%.*s' объявлен внутри развёртки с числом "
+                                  "повторов %llu:\nодно имя объявлялось бы заново "
+                                  "на каждом из них.",
+                            (int)decl->name.len, decl->name.p,
+                            (unsigned long long)r->ival),
+                    "Объяви тензор отдельной инструкцией до [#repeat].");
+            total++;
+            continue;
+        }
+
+        total += (uint32_t)r->ival;
+    }
+
+    if (n_errors) *n_errors = nerr;
+    if (nerr) return SMP_ERR_SYNTAX;
+    if (!any) return SMP_OK;           /* развёртывать нечего — дерево как было */
+
+    SmpAstStmt *out = (SmpAstStmt *)smp_arena_push_raw(
+        arena, (size_t)total * sizeof *out, 8);
+    if (!out) return SMP_ERR_OOM;
+
+    uint32_t w = 0;
+    for (uint32_t i = 0; i < prog->nstmts; i++) {
+        const SmpAstStmt   *s = &prog->stmts[i];
+        const SmpAstPrefix *r = smp_stmt_directive(s, "repeat");
+        const SmpAstPrefix *x = smp_stmt_directive(s, "index");
+
+        if (!r) { out[w++] = *s; continue; }
+
+        const uint32_t n      = (uint32_t)r->ival;
+        const bool     has_ix = (x != NULL);
+        SmpName        ix;
+        ix.p   = has_ix ? x->sval.p : NULL;
+        ix.len = has_ix ? x->sval.len : 0u;
+
+        for (uint32_t k = 0; k < n; k++) {
+            if (!clone_stmt(&out[w], s, ix, has_ix, (uint64_t)k, arena))
+                return SMP_ERR_OOM;
+            out[w].from_repeat = true;
+            out[w].repeat_idx  = k;
+            out[w].repeat_n    = n;
+            out[w].repeat_of   = i;
+            w++;
+        }
+    }
+
+    prog->stmts  = out;
+    prog->nstmts = w;
+    return SMP_OK;
+}
+
 void smp_ast_dump(FILE *out, const SmpAstProgram *prog, bool color)
 {
     Pr pr = { out, color };

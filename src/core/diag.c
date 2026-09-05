@@ -180,8 +180,19 @@ static const char *smp__diagnosis(SmpDiagCtx *d, SmpDiagCode code, SmpSpan sp)
     const SmpPool *p = &g_pools[(unsigned)inf->cat < SMP_CAT__COUNT ? inf->cat : SMP_CAT_INTERNAL];
     if (p->n == 0) return "Диагноз не сформулирован.";
 
+    /* Затравка берётся из ТЕКСТА кода, а не из его номера в перечислении.
+     * Номер сдвигается, стоит вставить новый код в середину реестра, — и
+     * диагноз меняется у всех кодов после него, хотя их никто не трогал.
+     * Один раз это уже переписало 21 снимок вывода из 31, и заметить такое
+     * можно было только по объёму диффа. Текст кода не сдвигается никогда. */
+    uint64_t h = 1469598103934665603ull;              /* FNV-1a 64 */
+    for (const char *t = inf->text; *t; t++) {
+        h ^= (unsigned char)*t;
+        h *= 1099511628211ull;
+    }
+
     uint64_t seed = d->deterministic
-        ? smp__mix(((uint64_t)code << 40) ^ ((uint64_t)sp.line << 16) ^ sp.col)
+        ? smp__mix(h ^ ((uint64_t)sp.line << 16) ^ sp.col)
         : smp__mix(d->rng += 0x2545F4914F6CDD1Dull);
     return p->items[seed % p->n];
 }

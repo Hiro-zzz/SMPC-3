@@ -140,7 +140,17 @@ typedef struct SmpSema {
     uint32_t         host_vec_bits;   /* что умеет железо; 0 -> спросить CPUID */
     uint32_t         n_errors;
     uint32_t         n_warnings;
+
+    /* Какой группе повторов претензия уже высказана. Развёртка размножает одну
+     * написанную строку в N инструкций, и правило «одна претензия на
+     * инструкцию» обязано считать по написанному: иначе опечатка внутри
+     * [#repeat:1024] выдала бы тысячу одинаковых сообщений об одной строке.
+     * SMP_REPEAT_NONE — ещё ни одной. */
+    uint32_t         repeat_told;
+    uint32_t         repeat_warned;
 } SmpSema;
+
+#define SMP_REPEAT_NONE 0xFFFFFFFFu
 
 void      smp_sema_init(SmpSema *sm, SmpArena *arena, SmpDiagCtx *diag,
                         const SmpSource *src);

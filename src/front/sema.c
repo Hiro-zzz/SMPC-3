@@ -52,7 +52,9 @@ typedef struct { const char *name; AttrVal val; const char *desc; } AttrDef;
 static const AttrDef g_directives[] = {
     { "arena",  VAL_INT,   "номер арены, 0..7" },
     { "simd",   VAL_IDENT, "ширина вектора: v128, v256, v512" },
-    { "unroll", VAL_INT,   "коэффициент разворота цикла" }
+    { "unroll", VAL_INT,   "коэффициент разворота цикла" },
+    { "repeat", VAL_INT,   "развернуть инструкцию N раз, 1..4096" },
+    { "index",  VAL_IDENT, "имя индекса повтора для #repeat" }
 };
 static const AttrDef g_modes[] = {
     { "raw",      VAL_NONE, "сырой указатель, вывод шага отключён" },
@@ -167,13 +169,39 @@ typedef struct Ctx {
     uint32_t           cur_stage;   /* индекс разбираемой стадии */
 } Ctx;
 
+static const char *sfmt(Ctx *c, const char *f, ...) SMP_PRINTF(2, 3);
+
+/* Дописать к деталям, каким по счёту повтором порождена эта инструкция.
+ * Без этого N копий одной строки дают N неотличимых сообщений, и понять, на
+ * каком именно индексе всё разъехалось, нечем. */
+static const char *repeat_note(Ctx *c, const char *details)
+{
+    const SmpAstPrefix *r = smp_stmt_directive(c->stmt, "repeat");
+    return sfmt(c, "%s\nЭто повтор #%u из %u: развёртка [#repeat] в %u:%u.",
+                details ? details : "",
+                c->stmt->repeat_idx, c->stmt->repeat_n,
+                r ? r->span.line : c->stmt->span.line,
+                r ? r->span.col  : c->stmt->span.col);
+}
+
 static void serr(Ctx *c, SmpDiagCode code, SmpSpan sp,
                  const char *details, const char *fix)
 {
     if (c->bad) return;          /* одна претензия на инструкцию */
     c->bad = true;
+
+    /* Копии одной развёртки — это одна написанная инструкция, и претензия к
+     * ним одна. Латч стоит ДО счётчика намеренно: иначе опечатка внутри
+     * [#repeat:1024] отчиталась бы тысячей ошибок об одной строке, и число в
+     * итоговой сводке перестало бы что-либо значить. */
+    if (c->stmt->from_repeat) {
+        if (c->sm->repeat_told == c->stmt->repeat_of) return;
+        c->sm->repeat_told = c->stmt->repeat_of;
+    }
+
     c->sm->n_errors++;
     if (!c->sm->diag) return;
+    if (c->stmt->from_repeat) details = repeat_note(c, details);
 
     SmpDiagMsg m;
     memset(&m, 0, sizeof m);
@@ -184,8 +212,14 @@ static void serr(Ctx *c, SmpDiagCode code, SmpSpan sp,
 static void swarn(Ctx *c, SmpDiagCode code, SmpSpan sp,
                   const char *details, const char *fix)
 {
+    if (c->stmt->from_repeat) {
+        if (c->sm->repeat_warned == c->stmt->repeat_of) return;
+        c->sm->repeat_warned = c->stmt->repeat_of;
+    }
+
     c->sm->n_warnings++;
     if (!c->sm->diag) return;
+    if (c->stmt->from_repeat) details = repeat_note(c, details);
 
     SmpDiagMsg m;
     memset(&m, 0, sizeof m);
@@ -510,13 +544,18 @@ static bool apply_index(Ctx *c, const SmpAstTensor *t, SmpValue *v)
                 break;
 
             case SMP_IDX_REG: {
-                const SmpSym *r = sym_find(c->res, SMP_SYM_REG, ix->reg);
+                SmpSym *r = sym_find(c->res, SMP_SYM_REG, ix->reg);
                 if (!r) {
                     serr(c, SMP_E0307, ix->span,
                          sfmt(c, "Регистр $%.*s не определён.",
                               (int)ix->reg.len, ix->reg.p), NULL);
                     return false;
                 }
+                /* Индекс — такое же чтение регистра, как и любое другое.
+                 * Пока это не считалось, `2 => $i;` рядом с *&M[$i, ..] давал
+                 * ложный W0301: значение записано и «никем не прочитано». */
+                r->n_reads++;
+
                 /* Смещение станет известно только в рантайме — статические
                  * проверки выравнивания по этой оси отключаются. */
                 out.flags |= SMP_TF_DYNOFF;
@@ -1071,6 +1110,8 @@ void smp_sema_init(SmpSema *sm, SmpArena *arena, SmpDiagCtx *diag,
     sm->diag          = diag;
     sm->src           = src;
     sm->host_vec_bits = smp_cpu()->max_vec_bits;
+    sm->repeat_told   = SMP_REPEAT_NONE;
+    sm->repeat_warned = SMP_REPEAT_NONE;
 
     /* SMPC3_VEC_BITS выдаёт компилятору другую ширину вектора, чем есть в
      * кремнии. Нужно в двух местах: снимки диагностики должны совпадать на

@@ -1,0 +1,137 @@
+$ smpc3 build examples/repeat.smpc -o <tmp>/repeat.s3b -S
+--- код возврата: 0
+
+[SKILL ISSUE :: W0301] in examples/repeat.smpc:49:21
+  49 | *&R -> @emit.num => $shown;
+     |                     ^~~~~~
+     |-- ОШИБКА: Записанное значение ни разу не прочитано.
+     |-- ДЕТАЛИ: В регистр $shown записано значение, но ни одна инструкция его не читает.
+     |-- ДИАГНОЗ: Приведение пишется явно. Молча округлять язык не станет.
+     +-- ИСПРАВЛЕНИЕ: Либо используй результат, либо не вычисляй его.
+
+[SKILL ISSUE :: W0301] in examples/repeat.smpc:50:21
+  50 | *&A -> @emit.num => $shown2;
+     |                     ^~~~~~~
+     |-- ОШИБКА: Записанное значение ни разу не прочитано.
+     |-- ДЕТАЛИ: В регистр $shown2 записано значение, но ни одна инструкция его не читает.
+     |-- ДИАГНОЗ: Тип — не пожелание, а обязательство. Ты его нарушил.
+     +-- ИСПРАВЛЕНИЕ: Либо используй результат, либо не вычисляй его.
+
+; модуль: 104 инструкций, 35 дескрипторов, 8 констант, 5 регистров
+; арена #0: 448 байт
+
+; строка 16
+0000  [v256              ] loadt    r2, T0 M<f32:8,8> a0:0x0
+0001  [v256              ] alloc    r2
+0002  [v256              ] storet   T0 M<f32:8,8> a0:0x0, r2
+; строка 22
+0003  [v256              ] loadt    r2, T1 M<f32:8> a0:0x0
+0004  [v256              ] fill     r2, r2, K0 (i32 0)
+0005  [v256              ] storet   T1 M<f32:8> a0:0x0, r2
+0006  [v256              ] loadt    r2, T2 M<f32:8> a0:0x20
+0007  [v256              ] fill     r2, r2, K1 (i32 1)
+0008  [v256              ] storet   T2 M<f32:8> a0:0x20, r2
+0009  [v256              ] loadt    r2, T3 M<f32:8> a0:0x40
+0010  [v256              ] fill     r2, r2, K2 (i32 2)
+0011  [v256              ] storet   T3 M<f32:8> a0:0x40, r2
+0012  [v256              ] loadt    r2, T4 M<f32:8> a0:0x60
+0013  [v256              ] fill     r2, r2, K3 (i32 3)
+0014  [v256              ] storet   T4 M<f32:8> a0:0x60, r2
+0015  [v256              ] loadt    r2, T5 M<f32:8> a0:0x80
+0016  [v256              ] fill     r2, r2, K4 (i32 4)
+0017  [v256              ] storet   T5 M<f32:8> a0:0x80, r2
+0018  [v256              ] loadt    r2, T6 M<f32:8> a0:0xA0
+0019  [v256              ] fill     r2, r2, K5 (i32 5)
+0020  [v256              ] storet   T6 M<f32:8> a0:0xA0, r2
+0021  [v256              ] loadt    r2, T7 M<f32:8> a0:0xC0
+0022  [v256              ] fill     r2, r2, K6 (i32 6)
+0023  [v256              ] storet   T7 M<f32:8> a0:0xC0, r2
+0024  [v256              ] loadt    r2, T8 M<f32:8> a0:0xE0
+0025  [v256              ] fill     r2, r2, K7 (i32 7)
+0026  [v256              ] storet   T8 M<f32:8> a0:0xE0, r2
+; строка 26
+0027  [v256              ] loadt    r2, T9 R<f32:8> a0:0x100
+0028  [v256              ] alloc    r2
+0029  [v256              ] storet   T9 R<f32:8> a0:0x100, r2
+; строка 27
+0030  [v256              ] loadt    r2, T1 M<f32:8> a0:0x0
+0031  [v256              ] redadd   r3, r2
+0032  [v256              ] storet   T10 R<f32> a0:0x100, r3
+0033  [v256              ] loadt    r2, T2 M<f32:8> a0:0x20
+0034  [v256              ] redadd   r3, r2
+0035  [v256              ] storet   T11 R<f32> a0:0x104, r3
+0036  [v256              ] loadt    r2, T3 M<f32:8> a0:0x40
+0037  [v256              ] redadd   r3, r2
+0038  [v256              ] storet   T12 R<f32> a0:0x108, r3
+0039  [v256              ] loadt    r2, T4 M<f32:8> a0:0x60
+0040  [v256              ] redadd   r3, r2
+0041  [v256              ] storet   T13 R<f32> a0:0x10C, r3
+0042  [v256              ] loadt    r2, T5 M<f32:8> a0:0x80
+0043  [v256              ] redadd   r3, r2
+0044  [v256              ] storet   T14 R<f32> a0:0x110, r3
+0045  [v256              ] loadt    r2, T6 M<f32:8> a0:0xA0
+0046  [v256              ] redadd   r3, r2
+0047  [v256              ] storet   T15 R<f32> a0:0x114, r3
+0048  [v256              ] loadt    r2, T7 M<f32:8> a0:0xC0
+0049  [v256              ] redadd   r3, r2
+0050  [v256              ] storet   T16 R<f32> a0:0x118, r3
+0051  [v256              ] loadt    r2, T8 M<f32:8> a0:0xE0
+0052  [v256              ] redadd   r3, r2
+0053  [v256              ] storet   T17 R<f32> a0:0x11C, r3
+; строка 35
+0054  [v256              ] loadt    r2, T18 A<f32:8> a0:0x140
+0055  [v256              ] alloc    r2
+0056  [v256              ] storet   T18 A<f32:8> a0:0x140, r2
+; строка 36
+0057  [v256              ] loadt    r2, T1 M<f32:8> a0:0x0
+0058  [v256              ] loadt    r3, T19 %t19<f32:8> a0:0x180
+0059  [v256,fuse         ] abs      r3, r2
+0060  [v256              ] redadd   r4, r3
+0061  [v256              ] storet   T20 A<f32> a0:0x140, r4
+0062  [v256              ] loadt    r2, T2 M<f32:8> a0:0x20
+0063  [v256              ] loadt    r3, T21 %t21<f32:8> a0:0x180
+0064  [v256,fuse         ] abs      r3, r2
+0065  [v256              ] redadd   r4, r3
+0066  [v256              ] storet   T22 A<f32> a0:0x144, r4
+0067  [v256              ] loadt    r2, T3 M<f32:8> a0:0x40
+0068  [v256              ] loadt    r3, T23 %t23<f32:8> aсобрано: <tmp>/repeat.s3b (104 инстр., 35 дескр., 8 конст.)
+итог: 2 предупреждения
+arena#1 'compile' 1.6 MiB / 128.0 MiB (peak 1.6 MiB, 282 allocs)
+0:0x180
+0069  [v256,fuse         ] abs      r3, r2
+0070  [v256              ] redadd   r4, r3
+0071  [v256              ] storet   T24 A<f32> a0:0x148, r4
+0072  [v256              ] loadt    r2, T4 M<f32:8> a0:0x60
+0073  [v256              ] loadt    r3, T25 %t25<f32:8> a0:0x180
+0074  [v256,fuse         ] abs      r3, r2
+0075  [v256              ] redadd   r4, r3
+0076  [v256              ] storet   T26 A<f32> a0:0x14C, r4
+0077  [v256              ] loadt    r2, T5 M<f32:8> a0:0x80
+0078  [v256              ] loadt    r3, T27 %t27<f32:8> a0:0x180
+0079  [v256,fuse         ] abs      r3, r2
+0080  [v256              ] redadd   r4, r3
+0081  [v256              ] storet   T28 A<f32> a0:0x150, r4
+0082  [v256              ] loadt    r2, T6 M<f32:8> a0:0xA0
+0083  [v256              ] loadt    r3, T29 %t29<f32:8> a0:0x180
+0084  [v256,fuse         ] abs      r3, r2
+0085  [v256              ] redadd   r4, r3
+0086  [v256              ] storet   T30 A<f32> a0:0x154, r4
+0087  [v256              ] loadt    r2, T7 M<f32:8> a0:0xC0
+0088  [v256              ] loadt    r3, T31 %t31<f32:8> a0:0x180
+0089  [v256,fuse         ] abs      r3, r2
+0090  [v256              ] redadd   r4, r3
+0091  [v256              ] storet   T32 A<f32> a0:0x158, r4
+0092  [v256              ] loadt    r2, T8 M<f32:8> a0:0xE0
+0093  [v256              ] loadt    r3, T33 %t33<f32:8> a0:0x180
+0094  [v256,fuse         ] abs      r3, r2
+0095  [v256              ] redadd   r4, r3
+0096  [v256              ] storet   T34 A<f32> a0:0x15C, r4
+; строка 49
+0097  [v256              ] loadt    r2, T9 R<f32:8> a0:0x100
+0098  [v256              ] emit     r3, r2  (num)
+0099  [v256              ] move     r0, r3
+; строка 50
+0100  [v256              ] loadt    r2, T18 A<f32:8> a0:0x140
+0101  [v256              ] emit     r3, r2  (num)
+0102  [v256              ] move     r1, r3
+0103  [scalar            ] halt     

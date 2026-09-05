@@ -43,11 +43,18 @@ static uint32_t sema_str(const char *text, SmpSemaResult *res, uint32_t *warns)
     smp_parse(&P, &prog);
     CHECK(P.n_errors == 0, "парсер сломался на семантическом тесте: %s", text);
 
+    /* Развёртка [#repeat:N] идёт до семантики — ровно как в настоящем
+     * конвейере. Прогонять её иначе значило бы проверять не тот компилятор,
+     * который потом собирает модули. */
+    uint32_t n_exp = 0;
+    smp_ast_expand(&prog, &g_arena, &g_diag, &n_exp);
+
     SmpSema sm;
     smp_sema_init(&sm, &g_arena, &g_diag, &g_src);
     /* Железо фиксируем, чтобы тесты не зависели от машины. */
     sm.host_vec_bits = 256;
-    smp_sema_run(&sm, &prog, res);
+    memset(res, 0, sizeof *res);
+    if (!n_exp) smp_sema_run(&sm, &prog, res);
 
     /* Забираем напечатанное для проверки кодов. */
     rewind(g_sink);
@@ -55,7 +62,15 @@ static uint32_t sema_str(const char *text, SmpSemaResult *res, uint32_t *warns)
     g_out[n] = '\0';
 
     if (warns) *warns = sm.n_warnings;
-    return sm.n_errors;
+    return n_exp ? n_exp : sm.n_errors;
+}
+
+/* Сколько инструкций осталось после развёртки. */
+static uint32_t expanded(const char *text)
+{
+    SmpSemaResult res;
+    sema_str(text, &res, NULL);
+    return res.ninfo;
 }
 
 static bool saw(SmpDiagCode c) { return strstr(g_out, smp_diag_info(c)->text) != NULL; }
@@ -434,6 +449,64 @@ static void test_registries(void)
 
 /* ========================================================================== */
 
+
+/* ========================================================================== */
+/*  Развёртка [#repeat:N]                                                     */
+/* ========================================================================== */
+
+#define PM "*&M<f32:4,8> -> @alloc => $m;  "
+
+static void test_repeat(void)
+{
+    SECTION("развёртка [#repeat:N]");
+
+    /* --- что обязано проходить --- */
+    expect_clean(PM "[#repeat:4, #index:i] *&M[$i, ..] -> @abs => *&M[$i, ..];",
+                 "четыре строки подряд");
+    expect_clean(PM "[#repeat:4, #index:i] *&M[$i, ..] -> @fill($i) => *&M[$i, ..];",
+                 "индекс подставляется и как значение");
+    expect_clean(PM "[#repeat:1] *&M -> @abs => *&M;",
+                 "повтор без индекса");
+    expect_clean(PM "*&R<f32:4> -> @alloc => $r;  "
+                    "[#repeat:4, #index:i] *&M[$i, ..] -> @reduce.add => *&R[$i];",
+                 "скаляр в отдельный элемент приёмника");
+
+    /* --- копий ровно столько, сколько просили --- */
+    CHECK(expanded(PM "[#repeat:4, #index:i] *&M[$i, ..] -> @abs => *&M[$i, ..];") == 5,
+          "развёртка на 4 дала %u инструкций вместо 5",
+          expanded(PM "[#repeat:4, #index:i] *&M[$i, ..] -> @abs => *&M[$i, ..];"));
+    CHECK(expanded(PM "*&M -> @abs => *&M;") == 2,
+          "без развёртки инструкций стало %u вместо 2",
+          expanded(PM "*&M -> @abs => *&M;"));
+
+    /* --- индекс не переживает свою инструкцию ---
+     * Он существует только на время развёртки: снаружи это просто имя, в
+     * которое никто ничего не писал. */
+    expect_err(PM "[#repeat:4, #index:i] *&M[$i, ..] -> @abs => *&M[$i, ..];  "
+                  "$i -> @emit.num => $n;",
+               SMP_E0307, "индекс виден за пределами развёртки");
+
+    /* --- ошибки самой развёртки --- */
+    expect_err(PM "[#repeat:0, #index:i] *&M[$i, ..] -> @abs => *&M[$i, ..];",
+               SMP_E0310, "ноль повторов");
+    expect_err(PM "[#repeat:9999, #index:i] *&M[$i, ..] -> @abs => *&M[$i, ..];",
+               SMP_E0310, "повторов больше потолка");
+    expect_err(PM "[#index:i] *&M -> @abs => *&M;",
+               SMP_E0310, "#index без #repeat");
+    expect_err(PM "[#repeat:4, #index:i] *&M[$i, ..] -> @abs => *&BAD<f32:8>;",
+               SMP_E0310, "объявление тензора внутри развёртки");
+    expect_err(PM "2 => $i;  "
+                  "[#repeat:4, #index:i] *&M[$i, ..] -> @abs => *&M[$i, ..];",
+               SMP_E0310, "имя индекса занято обычным регистром");
+
+    /* --- выход за границу оси ловится на компиляции --- *
+     * Ровно одним сообщением: копий-нарушителей две (повторы 4 и 5), но
+     * написана-то одна строка. Если тут когда-нибудь станет две ошибки,
+     * значит латч в serr перестал работать. */
+    expect_err(PM "[#repeat:6, #index:i] *&M[$i, ..] -> @abs => *&M[$i, ..];",
+               SMP_E0410, "индекс за границей оси на пятом повторе");
+}
+
 int main(void)
 {
     smp_console_setup();
@@ -454,6 +527,7 @@ int main(void)
     test_isa();
     test_warnings();
     test_registries();
+    test_repeat();
 
     fclose(g_sink);
     smp_arena_release(&g_arena);
