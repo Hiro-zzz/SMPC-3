@@ -364,6 +364,22 @@ void smp_k_gemm_block_for(uint32_t l2_bytes,
 /* Разрешается один раз. Точка входа гарантированно одна: GEMM не запускается
  * без рабочей памяти, а её размер спрашивают через smp_k_scratch_bytes — и в
  * пуле это происходит на подъёме, до появления потоков. */
+/* "MC,KC,NC": три положительных числа через запятую. Через strtoul, а не
+ * sscanf: форматного ввода от libc больше не требует никто, и ядру ОС, где
+ * этот код тоже собирается, не придётся заводить его ради одной строки. */
+static bool parse_block(const char *s, unsigned v[3])
+{
+    for (int i = 0; i < 3; i++) {
+        char *end;
+        const unsigned long x = strtoul(s, &end, 10);
+        if (end == s || x == 0) return false;
+        v[i] = (unsigned)x;
+        if (i < 2 && *end != ',') return false;
+        s = end + 1;
+    }
+    return true;
+}
+
 static void blk_resolve(void)
 {
     if (g_blk_ready) return;
@@ -371,8 +387,9 @@ static void blk_resolve(void)
     /* Подмена руками — чтобы воспроизвести чужой замер, не имея того же
      * процессора. Ровно та же роль, что у SMPC3_VEC_BITS. */
     const char *env = smp_plat_env("SMPC3_GEMM_BLOCK");
-    unsigned    em = 0, ek = 0, en = 0;
-    if (env && sscanf(env, "%u,%u,%u", &em, &ek, &en) == 3 && em && ek && en) {
+    unsigned    v[3];
+    if (env && parse_block(env, v)) {
+        const unsigned em = v[0], ek = v[1], en = v[2];
         g_mc = (uint32_t)(em - em % MR); if (g_mc < MR) g_mc = MR;
         g_kc = (uint32_t)ek;
         g_nc = (uint32_t)(en - en % NR); if (g_nc < NR) g_nc = NR;
