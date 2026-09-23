@@ -38,6 +38,31 @@ typedef struct SmpBind {
     bool        write;   /* true — выход (@store), false — вход (@load) */
 } SmpBind;
 
+/* --- Хранилище -------------------------------------------------------------
+ *
+ * Второй способ обмена с внешним миром — для хозяина, у которого файлов нет.
+ * Ядро NablaOS держит рабочее пространство: объекты в памяти, которые
+ * переживают программу. С хранилищем @load и @store работают с объектом того
+ * же имени, что и тензор, — без привязок и без путей.
+ *
+ * В отличие от файла, объект хранилища помнит тип и форму, с которыми его
+ * положили, и @load сверяет их, а не один размер: f32:8 и f64:4 здесь уже
+ * различимы, и подсунуть одно вместо другого нельзя. */
+typedef struct SmpStore {
+    void *ctx;
+
+    /* Есть ли объект: true и его тип с формой (dtype, rank, shape) в desc. */
+    bool (*find) (void *ctx, const char *name, SmpTensor *desc);
+
+    /* Содержимое объекта в dst. Тип и форма к этому моменту уже сверены. */
+    void (*read) (void *ctx, const char *name, void *dst, uint64_t bytes);
+
+    /* Положить плотный тензор под именем name, заменив прежний объект.
+     * false — хранилищу не хватило места. */
+    bool (*write)(void *ctx, const char *name, const SmpTensor *desc,
+                  const void *src, uint64_t bytes);
+} SmpStore;
+
 /* Регистр держит либо дескриптор тензора, либо скаляр. */
 typedef struct SmpReg {
     bool      is_tensor;
@@ -82,6 +107,9 @@ typedef struct SmpVM {
     const SmpBind *binds;
     uint32_t       n_binds;
 
+    /* Хранилище вместо файлов; NULL — работают привязки. */
+    const SmpStore *store;
+
     /* Рабочая память ядер — своя у каждого инстанса. Именно она делает
      * несколько VM в разных потоках безопасными. */
     void        *scratch_mem;
@@ -94,6 +122,10 @@ SmpStatus smp_vm_init(SmpVM *vm, const SmpModule *mod, SmpDiagCtx *diag);
 /* Подключить привязки. Зовётся между init и run; без неё @load и @store
  * честно падают с E0606, а не читают что попало. */
 void      smp_vm_bind(SmpVM *vm, const SmpBind *binds, uint32_t n);
+
+/* Подключить хранилище. Тоже между init и run; с ним привязки к файлам не
+ * используются вовсе. */
+void      smp_vm_store(SmpVM *vm, const SmpStore *store);
 SmpStatus smp_vm_run(SmpVM *vm);
 void      smp_vm_release(SmpVM *vm);
 

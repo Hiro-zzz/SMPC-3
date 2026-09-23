@@ -36,6 +36,9 @@ static SmpModule  g_mod;
 static SmpBind  g_binds[4];
 static uint32_t g_n_binds;
 
+/* Хранилище для текущего прогона; NULL — работают привязки. */
+static const SmpStore *g_store;
+
 static bool run_str(const char *text)
 {
     smp_vm_release(&g_vm);
@@ -84,6 +87,7 @@ static bool run_str(const char *text)
         return false;
     }
     smp_vm_bind(&g_vm, g_binds, g_n_binds);
+    smp_vm_store(&g_vm, g_store);
     if (g_emit) { rewind(g_emit); g_vm.out = g_emit; }
     g_diag.regdump      = smp_vm_regdump;
     g_diag.regdump_user = &g_vm;
@@ -944,6 +948,116 @@ static void test_fileio(void)
     remove(out);
 }
 
+/* Хранилище в памяти: как рабочее пространство ядра, только на четыре
+ * объекта. full=true — любое write отказывает, как у исчерпанной памяти. */
+typedef struct {
+    char      name[16];
+    SmpTensor desc;
+    uint8_t   data[256];
+    uint64_t  bytes;
+    bool      used;
+} FakeObj;
+
+static FakeObj g_objs[4];
+static bool    g_store_full;
+
+static FakeObj *fake_find_obj(const char *name)
+{
+    for (int i = 0; i < 4; i++)
+        if (g_objs[i].used && strcmp(g_objs[i].name, name) == 0) return &g_objs[i];
+    return NULL;
+}
+
+static bool fake_find(void *ctx, const char *name, SmpTensor *desc)
+{
+    (void)ctx;
+    FakeObj *o = fake_find_obj(name);
+    if (!o) return false;
+    *desc = o->desc;
+    return true;
+}
+
+static void fake_read(void *ctx, const char *name, void *dst, uint64_t bytes)
+{
+    (void)ctx;
+    memcpy(dst, fake_find_obj(name)->data, (size_t)bytes);
+}
+
+static bool fake_write(void *ctx, const char *name, const SmpTensor *desc,
+                       const void *src, uint64_t bytes)
+{
+    (void)ctx;
+    if (g_store_full || bytes > sizeof g_objs[0].data) return false;
+    FakeObj *o = fake_find_obj(name);
+    for (int i = 0; !o && i < 4; i++)
+        if (!g_objs[i].used) o = &g_objs[i];
+    if (!o) return false;
+    snprintf(o->name, sizeof o->name, "%s", name);
+    o->desc  = *desc;
+    o->bytes = bytes;
+    o->used  = true;
+    memcpy(o->data, src, (size_t)bytes);
+    return true;
+}
+
+static void test_store(void)
+{
+    SECTION("обмен с хранилищем");
+
+    static const SmpStore store = { NULL, fake_find, fake_read, fake_write };
+    memset(g_objs, 0, sizeof g_objs);
+    g_store_full = false;
+    g_store      = &store;
+    g_n_binds    = 0;       /* с хранилищем привязки не нужны вовсе */
+
+    /* --- одна программа кладёт, другая достаёт ---
+     * Ради этого хранилище и есть: объект переживает программу. */
+    if (run_str("[#arena:0] *&V<f32:16> -> @fill(1.5) => *&V;\n"
+                "*&V -> @store => $put;\n")) {
+        bool found = false;
+        const double put = regval("put", &found);
+        CHECK(found && near(put, 64.0), "@store вернул %g байт, ждали 64", put);
+        CHECK(fake_find_obj("V") != NULL, "объект V не появился в хранилище");
+    }
+    if (run_str("[#arena:0] *&V<f32:16> -> @load => *&V;\n"
+                "*&V -> @reduce.add => $s;\n")) {
+        bool found = false;
+        const double sum = regval("s", &found);
+        CHECK(found && near(sum, 24.0), "сумма прочитанного %g, ждали 24", sum);
+    }
+
+    /* --- объекта нет --- */
+    CHECK(!run_str("[#arena:0] *&W<f32:4> -> @load => *&W;\n"
+                   "*&W -> @reduce.add => $s;\n"),
+          "@load несуществующего объекта обязан упасть");
+    CHECK(saw_code("E0608"), "нет E0608 для отсутствующего объекта");
+    CHECK(!saw_code("E0606"), "с хранилищем не должно быть речи о привязках");
+
+    /* --- те же 64 байта, но другой тип ---
+     * Файл этого не различил бы; хранилище помнит, что положили f32:16. */
+    CHECK(!run_str("[#arena:0] *&V<f64:8> -> @load => *&V;\n"
+                   "*&V -> @reduce.add => $s;\n"),
+          "f64:8 вместо f32:16 обязан быть отказом");
+    CHECK(saw_code("E0609"), "нет E0609 при несовпадении типа");
+    CHECK(strstr(g_out, "f32:16") && strstr(g_out, "f64:8"),
+          "в сообщении нет обеих форм");
+
+    /* --- та же форма, другая раскладка осей --- */
+    CHECK(!run_str("[#arena:0] *&V<f32:4,4> -> @load => *&V;\n"
+                   "*&V -> @reduce.add => $s;\n"),
+          "f32:4,4 вместо f32:16 обязан быть отказом");
+    CHECK(saw_code("E0609"), "нет E0609 при несовпадении формы");
+
+    /* --- хранилище отказало --- */
+    g_store_full = true;
+    CHECK(!run_str("[#arena:0] *&Z<f32:4> -> @fill(1.0) => *&Z;\n"
+                   "*&Z -> @store => $put;\n"),
+          "отказ хранилища обязан остановить программу");
+    CHECK(saw_code("E0610"), "нет E0610 при отказе хранилища");
+
+    g_store = NULL;
+}
+
 int main(void)
 {
     smp_console_setup();
@@ -971,6 +1085,7 @@ int main(void)
     test_fusion();
     test_gemm_epilogue();
     test_fileio();
+    test_store();
 
     smp_vm_release(&g_vm);
     fclose(g_sink);

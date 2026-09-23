@@ -242,6 +242,11 @@ void smp_vm_bind(SmpVM *vm, const SmpBind *binds, uint32_t n)
     vm->n_binds = n;
 }
 
+void smp_vm_store(SmpVM *vm, const SmpStore *store)
+{
+    vm->store = store;
+}
+
 /* Привязка ищется по имени тензора и направлению. Вход и выход разведены
  * намеренно: одно и то же имя может быть привязано и на чтение, и на запись —
  * прочитать вектор, посчитать, положить обратно рядом. */
@@ -335,6 +340,66 @@ static bool file_store(SmpVM *vm, const SmpTensor *t, const SmpBuf *buf,
                  vfmt(vm, "В файл '%s' записано %llu байт из %llu.",
                       b->path, (unsigned long long)put, (unsigned long long)want),
                  "Проверь права и свободное место.");
+        return false;
+    }
+    *written = want;
+    return true;
+}
+
+/* ========================================================================== */
+/*  Обмен с хранилищем                                                        */
+/* ========================================================================== */
+
+static bool same_kind(const SmpTensor *a, const SmpTensor *b)
+{
+    if (a->dtype != b->dtype || a->rank != b->rank) return false;
+    for (uint32_t i = 0; i < a->rank; i++)
+        if (a->shape[i] != b->shape[i]) return false;
+    return true;
+}
+
+/* Как у файла — прямо в арену. Но сверяется не размер, а тип и форма: объект
+ * хранилища их помнит, и различать f32:8 и f64:4 здесь есть чем. */
+static bool store_load(SmpVM *vm, const SmpTensor *t, const SmpBuf *buf)
+{
+    const SmpStore *st   = vm->store;
+    const char     *name = smp_module_str(vm->mod, t->name_id);
+
+    SmpTensor have;
+    memset(&have, 0, sizeof have);
+    if (!st->find(st->ctx, name, &have)) {
+        vm_fatal(vm, SMP_E0608,
+                 vfmt(vm, "@load ищет '%s', а такого объекта в хранилище нет.", name),
+                 vfmt(vm, "Сначала положи его туда: *&%s -> @store => $n;", name));
+        return false;
+    }
+    if (!same_kind(&have, t)) {
+        char a[80], b[80];
+        vm_fatal(vm, SMP_E0609,
+                 vfmt(vm, "В хранилище лежит %s<%s>, а объявлен %s<%s>.",
+                      name, smp_tensor_sig(&have, a, sizeof a),
+                      name, smp_tensor_sig(t, b, sizeof b)),
+                 NULL);
+        return false;
+    }
+    st->read(st->ctx, name, buf->p, smp_tensor_bytes(t));
+    return true;
+}
+
+static bool store_store(SmpVM *vm, const SmpTensor *t, const SmpBuf *buf,
+                        uint64_t *written)
+{
+    const SmpStore *st   = vm->store;
+    const char     *name = smp_module_str(vm->mod, t->name_id);
+    const uint64_t  want = smp_tensor_bytes(t);
+
+    if (!st->write(st->ctx, name, t, buf->p, want)) {
+        char sig[80];
+        vm_fatal(vm, SMP_E0610,
+                 vfmt(vm, "'%s' <%s> — %llu байт — положить некуда.",
+                      name, smp_tensor_sig(t, sig, sizeof sig),
+                      (unsigned long long)want),
+                 NULL);
         return false;
     }
     *written = want;
@@ -757,7 +822,8 @@ dispatch_switch:
             return SMP_ERR_INTERNAL;
         }
         if (!make_buf(vm, &bd, &R[in->d].t)) return SMP_ERR_INTERNAL;
-        if (!file_load(vm, &R[in->d].t, &bd)) return SMP_ERR_INTERNAL;
+        if (!(vm->store ? store_load(vm, &R[in->d].t, &bd)
+                        : file_load(vm, &R[in->d].t, &bd))) return SMP_ERR_INTERNAL;
         VM_NEXT();
 
     VM_CASE(STORE) {
@@ -767,7 +833,8 @@ dispatch_switch:
         }
         if (!make_buf(vm, &ba, &R[in->a].t)) return SMP_ERR_INTERNAL;
         uint64_t put = 0;
-        if (!file_store(vm, &R[in->a].t, &ba, &put)) return SMP_ERR_INTERNAL;
+        if (!(vm->store ? store_store(vm, &R[in->a].t, &ba, &put)
+                        : file_store(vm, &R[in->a].t, &ba, &put))) return SMP_ERR_INTERNAL;
 
         /* Отдаём число записанных байт — ровно так же, как @emit отдаёт число
          * выведенных элементов. Отдельной операции без результата в языке нет. */
