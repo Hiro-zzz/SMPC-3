@@ -412,10 +412,21 @@ void smp_k_gemm_block(uint32_t *mc, uint32_t *kc, uint32_t *nc)
  *   B: KC*NC*4 = 256 КиБ
  *   A: MC*KC*4 =  96 КиБ
  * Вместе укладываются в L2 современного ядра. */
-size_t smp_k_scratch_bytes(void)
+/* Комплект выровнен на 64, чтобы B следующего комплекта тоже был. */
+static size_t set_bytes(void)
+{
+    return SMP_ALIGN_UP(panels_bytes(g_mc, g_kc, g_nc), SMP_CACHELINE);
+}
+
+size_t smp_k_scratch_bytes_for(uint32_t sets)
 {
     blk_resolve();
-    return panels_bytes(g_mc, g_kc, g_nc) + SMP_CACHELINE;
+    return set_bytes() * (sets ? sets : 1u) + SMP_CACHELINE;
+}
+
+size_t smp_k_scratch_bytes(void)
+{
+    return smp_k_scratch_bytes_for(1);
 }
 
 void smp_k_scratch_bind(SmpKScratch *s, void *mem, size_t bytes)
@@ -423,6 +434,7 @@ void smp_k_scratch_bind(SmpKScratch *s, void *mem, size_t bytes)
     if (!s) return;
     if (!mem || bytes < smp_k_scratch_bytes()) {
         s->apack = NULL; s->bpack = NULL; s->bytes = 0;
+        s->sets = 0;     s->set_floats = 0;
         return;
     }
     /* Обе панели выровнены на 64: микроядро читает B выровненными загрузками. */
@@ -431,6 +443,8 @@ void smp_k_scratch_bind(SmpKScratch *s, void *mem, size_t bytes)
     s->apack = (float *)p;
     s->bpack = (float *)(p + (size_t)g_mc * g_kc * sizeof(float));
     s->bytes = bytes;
+    s->sets       = (uint32_t)((bytes - SMP_CACHELINE) / set_bytes());
+    s->set_floats = set_bytes() / sizeof(float);
 }
 
 /* B[kc][nc] -> последовательность панелей шириной NR; внутри панели строки
@@ -554,7 +568,8 @@ static void ep_row(float *row, size_t n, const SmpFuseStep *st, uint32_t ns,
 void smp_ka_gemm_ep(float *C, size_t ldc, const float *A, size_t lda,
                     const float *B, size_t ldb, size_t M, size_t N, size_t K,
                     float *apack, float *bpack,
-                    const SmpFuseStep *steps, uint32_t nsteps)
+                    const SmpFuseStep *steps, uint32_t nsteps,
+                    size_t ep_base, size_t ep_ld)
 {
     for (size_t i = 0; i < M; i++)
         memset(C + i * ldc, 0, N * sizeof(float));
@@ -603,7 +618,7 @@ void smp_ka_gemm_ep(float *C, size_t ldc, const float *A, size_t lda,
                     if (ep)
                         for (size_t r = 0; r < mr; r++)
                             ep_row(C + (i0 + ir + r) * ldc + j0, nc,
-                                   steps, nsteps, (i0 + ir + r) * N + j0);
+                                   steps, nsteps, ep_base + (i0 + ir + r) * ep_ld + j0);
                 }
             }
         }
@@ -614,5 +629,5 @@ void smp_ka_gemm(float *C, size_t ldc, const float *A, size_t lda,
                  const float *B, size_t ldb, size_t M, size_t N, size_t K,
                  float *apack, float *bpack)
 {
-    smp_ka_gemm_ep(C, ldc, A, lda, B, ldb, M, N, K, apack, bpack, NULL, 0u);
+    smp_ka_gemm_ep(C, ldc, A, lda, B, ldb, M, N, K, apack, bpack, NULL, 0u, 0u, N);
 }

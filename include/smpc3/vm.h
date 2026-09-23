@@ -119,6 +119,13 @@ typedef struct SmpVM {
 
 SmpStatus smp_vm_init(SmpVM *vm, const SmpModule *mod, SmpDiagCtx *diag);
 
+/* То же, но с явным числом потоков для крупного GEMM: под каждый поток —
+ * свой комплект рабочей памяти. smp_vm_init берёт по числу процессоров;
+ * пул поднимает инстансы с par = 1 — они и так раскиданы по потокам, и
+ * параллелизм внутри параллелизма дал бы только лишнюю память. */
+SmpStatus smp_vm_init_ex(SmpVM *vm, const SmpModule *mod, SmpDiagCtx *diag,
+                         uint32_t par);
+
 /* Подключить привязки. Зовётся между init и run; без неё @load и @store
  * честно падают с E0606, а не читают что попало. */
 void      smp_vm_bind(SmpVM *vm, const SmpBind *binds, uint32_t n);

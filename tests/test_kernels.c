@@ -522,6 +522,93 @@ static void test_gemm_block(void)
           smp_k_scratch_bytes(), blk_panels(mc, kc, nc));
 }
 
+/* Параллельный GEMM обязан давать ТО ЖЕ самое, бит в бит: каждая плитка
+ * считается тем же циклом с тем же разбиением по K, а значит, и с тем же
+ * порядком сложения. Сравнение поэтому точное, а не с допуском. */
+static bool par_case(SmpKScratch *par, uint32_t M, uint32_t N, uint32_t K,
+                     const SmpFuseStep *st, uint32_t ns)
+{
+    SmpTensor ta = mk(M, K), tb = mk(K, N), tc = mk(M, N);
+    SmpBuf a = { g_a, &ta }, b = { g_b, &tb };
+    SmpBuf ref = { g_ref, &tc }, got = { g_got, &tc };
+
+    memset(g_ref, 0xCD, (size_t)M * N * sizeof(float));
+    memset(g_got, 0xAB, (size_t)M * N * sizeof(float));
+    smp_k_gemm_ep(&ref, &a, &b, &g_sc, st, ns);      /* один комплект: один поток */
+    smp_k_gemm_ep(&got, &a, &b, par, st, ns);
+    return memcmp(g_ref, g_got, (size_t)M * N * sizeof(float)) == 0;
+}
+
+static void test_gemm_parallel(void)
+{
+    SECTION("параллельный GEMM");
+
+    const size_t bytes = smp_k_scratch_bytes_for(4);
+    void *mem = malloc(bytes);
+    if (!mem) { CHECK(0, "нет памяти под четыре комплекта"); return; }
+    SmpKScratch par;
+    smp_k_scratch_bind(&par, mem, bytes);
+    CHECK(par.sets == 4, "комплектов %u, ждали 4", par.sets);
+
+    smp_kernels_select(SMP_KB_AVX2);
+    smp_k_gemm_par_min(0);          /* делить всё, даже мелкое */
+
+    /* M=1 — вектор на матрицу: делятся одни столбцы. Остальные — хвосты по
+     * M, N и K мимо MR, NR, MC и KC. */
+    static const uint32_t shapes[][3] = {
+        { 1, 600, 300 }, { 1, 17, 5 }, { 7, 33, 500 }, { 100, 257, 64 },
+        { 293, 47, 129 }, { 300, 300, 300 }, { 96, 256, 256 },
+    };
+    for (size_t i = 0; i < SMP_ARRLEN(shapes); i++) {
+        const uint32_t M = shapes[i][0], N = shapes[i][1], K = shapes[i][2];
+        fill_rand(g_a, (size_t)M * K);
+        fill_rand(g_b, (size_t)K * N);
+        CHECK(par_case(&par, M, N, K, NULL, 0),
+              "параллельный %ux%ux%u разошёлся с однопоточным", M, N, K);
+    }
+
+    /* Эпилог: операнд @add адресуется от угла плитки в полной матрице.
+     * Сдвиг хоть на элемент — и результат разойдётся. */
+    {
+        const uint32_t M = 150, N = 200, K = 90;
+        fill_rand(g_a, (size_t)M * K);
+        fill_rand(g_b, (size_t)K * N);
+        fill_rand(g_e, (size_t)M * N);
+        SmpTensor te = mk(M, N);
+        SmpFuseStep st[2];
+        memset(st, 0, sizeof st);
+        st[0].op = SMP_FOP_ADD;  st[0].b = (SmpBuf){ g_e, &te };
+        st[1].op = SMP_FOP_RELU;
+        CHECK(par_case(&par, M, N, K, st, 2),
+              "параллельный эпилог @add -> @relu разошёлся с однопоточным");
+    }
+
+    /* FTZ переносится на исполнителей: 1e-20 * 1e-20 — денормаль, и с FTZ
+     * она обязана обнулиться на всех потоках, а не только на вызывающем. */
+    {
+        const uint32_t M = 64, N = 64, K = 64;
+        for (size_t i = 0; i < (size_t)M * K; i++) g_a[i] = 1e-20f;
+        for (size_t i = 0; i < (size_t)K * N; i++) g_b[i] = 1e-20f;
+
+        SmpTensor ta = mk(M, K), tb = mk(K, N), tc = mk(M, N);
+        SmpBuf a = { g_a, &ta }, b = { g_b, &tb }, got = { g_got, &tc };
+        smp_k_gemm(&got, &a, &b, &g_sc);
+        const bool denormal = g_got[0] != 0.0f;
+
+        const uint32_t saved = smp_fpu_get_mxcsr();
+        smp_fpu_set_ftz(true);
+        const bool same = par_case(&par, M, N, K, NULL, 0);
+        const bool zero = g_got[(size_t)M * N - 1] == 0.0f;
+        smp_fpu_set_mxcsr(saved);
+
+        CHECK(denormal, "без FTZ результат не денормаль — проверка ни о чём");
+        CHECK(same && zero, "FTZ не дошёл до потоков параллельного GEMM");
+    }
+
+    smp_k_gemm_par_min((uint64_t)1 << 22);
+    free(mem);
+}
+
 /* ========================================================================== */
 
 int main(void)
@@ -541,6 +628,7 @@ int main(void)
     test_fallback();
     test_identity();
     test_gemm_block();
+    test_gemm_parallel();
 
     smp_kernels_select(SMP_KB_AUTO);
     free(g_scmem);

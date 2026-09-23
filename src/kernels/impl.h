@@ -52,11 +52,13 @@ void   smp_ka_gemm(float *C, size_t ldc, const float *A, size_t lda,
                    float *apack, float *bpack);
 
 /* То же с эпилогом, применяемым в выгрузке тайла на последнем k-блоке.
- * Операнды цепочки адресуются как плотные [M,N]: элемент (i,j) лежит по
- * индексу i*N + j — их плотность проверил диспетчер. */
+ * Операнды цепочки плотные — это проверил диспетчер; элемент (i,j) этого
+ * вызова лежит в них по индексу ep_base + i*ep_ld + j. Для целой матрицы это
+ * 0 и N; для плитки параллельного GEMM — её угол и полная ширина. */
 void   smp_ka_gemm_ep(float *C, size_t ldc, const float *A, size_t lda,
                       const float *B, size_t ldb, size_t M, size_t N, size_t K,
                       float *apack, float *bpack,
-                      const SmpFuseStep *steps, uint32_t nsteps);
+                      const SmpFuseStep *steps, uint32_t nsteps,
+                      size_t ep_base, size_t ep_ld);
 
 #endif /* SMPC3_KERNELS_IMPL_H */

@@ -6,6 +6,7 @@
  */
 #include "impl.h"
 #include "smpc3/cpu.h"
+#include "smpc3/thread.h"
 
 #include <string.h>
 
@@ -203,6 +204,99 @@ static bool ep_dense(const SmpBuf *c, const SmpFuseStep *st, uint32_t ns)
     return true;
 }
 
+/* --- Параллельный GEMM ------------------------------------------------------ */
+
+/* Ниже этого M*N*K раздача потокам дороже самой арифметики: 2^22 — это
+ * около восьми миллионов операций, доли миллисекунды на одном ядре. */
+static uint64_t g_par_min = (uint64_t)1 << 22;
+
+void smp_k_gemm_par_min(uint64_t work) { g_par_min = work; }
+
+typedef struct {
+    float             *C;
+    const float       *A, *B;
+    size_t             ldc, lda, ldb, M, N, K;
+    size_t             tile_m, tile_n;
+    uint32_t           tiles_n, tiles;
+    const SmpFuseStep *steps;
+    uint32_t           nsteps;
+    const SmpKScratch *sc;
+    uint32_t           mxcsr;
+    volatile int32_t   next;       /* следующая свободная плитка */
+} ParGemm;
+
+/* Поток t пакует в свой комплект и берёт плитки, пока они не кончатся. */
+static void par_worker(void *ctx, uint32_t t)
+{
+    ParGemm *g = (ParGemm *)ctx;
+
+    /* FTZ и прочие режимы — свойство потока, а не программы. Без этого
+     * плитки на чужих потоках считались бы в режиме по умолчанию. */
+    const uint32_t saved = smp_fpu_get_mxcsr();
+    smp_fpu_set_mxcsr(g->mxcsr);
+
+    float *ap = g->sc->apack + (size_t)t * g->sc->set_floats;
+    float *bp = g->sc->bpack + (size_t)t * g->sc->set_floats;
+
+    for (;;) {
+        const int32_t i = smp_atomic_fetch_add(&g->next, 1);
+        if (i < 0 || (uint32_t)i >= g->tiles) break;
+
+        const size_t r0 = ((uint32_t)i / g->tiles_n) * g->tile_m;
+        const size_t c0 = ((uint32_t)i % g->tiles_n) * g->tile_n;
+        const size_t m  = SMP_MIN(g->tile_m, g->M - r0);
+        const size_t n  = SMP_MIN(g->tile_n, g->N - c0);
+
+        smp_ka_gemm_ep(g->C + r0 * g->ldc + c0, g->ldc,
+                       g->A + r0 * g->lda, g->lda,
+                       g->B + c0, g->ldb, m, n, g->K,
+                       ap, bp, g->steps, g->nsteps, r0 * g->N + c0, g->N);
+    }
+    smp_fpu_set_mxcsr(saved);
+}
+
+/* Плитки: по строкам — блоком MC, как в самом ядре; по столбцам — так, чтобы
+ * плиток было хотя бы вдвое больше потоков и хвост не простаивал. При M=1,
+ * то есть умножении вектора на матрицу, делятся одни столбцы. */
+static bool par_gemm(float *C, size_t ldc, const float *A, size_t lda,
+                     const float *B, size_t ldb, size_t M, size_t N, size_t K,
+                     const SmpKScratch *sc, const SmpFuseStep *steps, uint32_t nsteps)
+{
+    if (sc->sets < 2 || (uint64_t)M * N * K < g_par_min) return false;
+
+    uint32_t mc, kc, nc;
+    smp_k_gemm_block(&mc, &kc, &nc);
+
+    const size_t   tile_m  = SMP_MIN((size_t)mc, M);
+    const uint32_t tiles_m = (uint32_t)((M + tile_m - 1) / tile_m);
+    const uint32_t want    = 2u * sc->sets;
+    const uint32_t cols    = (want + tiles_m - 1) / tiles_m;
+
+    size_t tile_n = (N + cols - 1) / cols;
+    tile_n = SMP_ALIGN_UP(tile_n, 16u);           /* ширина микроядра, NR */
+    if (tile_n > N) tile_n = N;
+
+    ParGemm g;
+    g.C = C; g.A = A; g.B = B;
+    g.ldc = ldc; g.lda = lda; g.ldb = ldb;
+    g.M = M; g.N = N; g.K = K;
+    g.tile_m  = tile_m;
+    g.tile_n  = tile_n;
+    g.tiles_n = (uint32_t)((N + tile_n - 1) / tile_n);
+    g.tiles   = tiles_m * g.tiles_n;
+    g.steps   = steps;
+    g.nsteps  = nsteps;
+    g.sc      = sc;
+    g.mxcsr   = smp_fpu_get_mxcsr();
+    g.next    = 0;
+
+    if (g.tiles < 2) return false;
+
+    const uint32_t threads = SMP_MIN(sc->sets, g.tiles);
+    smp_threads_run(par_worker, &g, threads);
+    return true;
+}
+
 void smp_k_gemm_ep(const SmpBuf *c, const SmpBuf *a, const SmpBuf *b,
                    SmpKScratch *scratch, const SmpFuseStep *steps, uint32_t nsteps)
 {
@@ -213,11 +307,16 @@ void smp_k_gemm_ep(const SmpBuf *c, const SmpBuf *a, const SmpBuf *b,
     if (g_use_avx2 && scratch && scratch->bytes &&
         rowmajor_f32(c->t) && rowmajor_f32(a->t) && rowmajor_f32(b->t) &&
         ep_dense(c, steps, nsteps)) {
-        smp_ka_gemm_ep((float *)c->p, c->t->stride[0],
-                       (const float *)a->p, a->t->stride[0],
-                       (const float *)b->p, b->t->stride[0],
-                       a->t->shape[0], b->t->shape[1], a->t->shape[1],
-                       scratch->apack, scratch->bpack, steps, nsteps);
+        float       *C = (float *)c->p;
+        const float *A = (const float *)a->p, *B = (const float *)b->p;
+        const size_t M = a->t->shape[0], N = b->t->shape[1], K = a->t->shape[1];
+
+        if (par_gemm(C, c->t->stride[0], A, a->t->stride[0], B, b->t->stride[0],
+                     M, N, K, scratch, steps, nsteps))
+            return;
+
+        smp_ka_gemm_ep(C, c->t->stride[0], A, a->t->stride[0], B, b->t->stride[0],
+                       M, N, K, scratch->apack, scratch->bpack, steps, nsteps, 0u, N);
         return;
     }
 

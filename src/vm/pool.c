@@ -53,7 +53,7 @@ SmpStatus smp_vm_pool_init(SmpVMPool *p, const SmpModule *mod,
         smp_diag_init(&p->diag[i], NULL, NULL);
         smp_diag_set_log(&p->diag[i], &p->log[i]);
 
-        if (smp_vm_init(&p->inst[i], mod, &p->diag[i]) != SMP_OK) {
+        if (smp_vm_init_ex(&p->inst[i], mod, &p->diag[i], 1) != SMP_OK) {
             smp_vm_pool_release(p);
             return SMP_ERR_OOM;
         }

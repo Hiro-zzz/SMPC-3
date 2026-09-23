@@ -3,6 +3,7 @@
 #include "smpc3/cpu.h"
 #include "smpc3/kernels.h"
 #include "smpc3/plat.h"
+#include "smpc3/thread.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -14,6 +15,12 @@
 /* ========================================================================== */
 
 SmpStatus smp_vm_init(SmpVM *vm, const SmpModule *mod, SmpDiagCtx *diag)
+{
+    return smp_vm_init_ex(vm, mod, diag, smp_threads_default());
+}
+
+SmpStatus smp_vm_init_ex(SmpVM *vm, const SmpModule *mod, SmpDiagCtx *diag,
+                         uint32_t par)
 {
     memset(vm, 0, sizeof *vm);
     vm->mod  = mod;
@@ -38,8 +45,8 @@ SmpStatus smp_vm_init(SmpVM *vm, const SmpModule *mod, SmpDiagCtx *diag)
 
     /* Рабочая память ядер выделяется здесь, на подъёме, и больше не растёт.
      * У каждого инстанса она своя — без этого два потока в GEMM затёрли бы
-     * панели друг друга. */
-    vm->scratch_bytes = smp_k_scratch_bytes();
+     * панели друг друга. Комплектов — по одному на поток крупного GEMM. */
+    vm->scratch_bytes = smp_k_scratch_bytes_for(par ? par : 1u);
     vm->scratch_mem   = smp_plat_pages(vm->scratch_bytes);
     if (!vm->scratch_mem) {
         for (uint32_t j = 0; j < vm->n_arenas; j++) smp_arena_release(&vm->arenas[j]);
