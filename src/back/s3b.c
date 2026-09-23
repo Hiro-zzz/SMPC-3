@@ -5,6 +5,7 @@
  * диске мог править кто угодно, а рантайм тут без страховки. */
 #include "smpc3/emit.h"
 #include "smpc3/cpu.h"
+#include "smpc3/plat.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -94,7 +95,7 @@ SmpStatus smp_s3b_write(const SmpModule *m, const char *path)
 
     /* Собираем образ целиком: писать по кускам и потом досчитывать сумму —
      * лишний повод разъехаться. */
-    uint8_t *img = (uint8_t *)calloc(1, total);
+    uint8_t *img = (uint8_t *)smp_plat_pages(total);
     if (!img) return SMP_ERR_OOM;
 
     SmpS3bHeader *h = (SmpS3bHeader *)img;
@@ -115,10 +116,10 @@ SmpStatus smp_s3b_write(const SmpModule *m, const char *path)
     h->checksum = fnv1a(img + hdr_size, total - hdr_size);
 
     FILE *f = fopen(path, "wb");
-    if (!f) { free(img); return SMP_ERR_IO; }
+    if (!f) { smp_plat_pages_free(img, total); return SMP_ERR_IO; }
     const size_t wrote = fwrite(img, 1, total, f);
     fclose(f);
-    free(img);
+    smp_plat_pages_free(img, total);
 
     return wrote == total ? SMP_OK : SMP_ERR_IO;
 }

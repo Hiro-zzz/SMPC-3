@@ -1,6 +1,7 @@
 /* SMPC3 :: sema.c */
 #include "smpc3/sema.h"
 #include "smpc3/cpu.h"
+#include "smpc3/plat.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -1175,7 +1176,7 @@ void smp_sema_init(SmpSema *sm, SmpArena *arena, SmpDiagCtx *diag,
      * любой машине, и чужой отчёт об ошибке должно быть можно воспроизвести
      * у себя, не имея того же процессора. На кодогенерацию не влияет —
      * ветку ядер по-прежнему выбирает CPUID. */
-    const char *env = getenv("SMPC3_VEC_BITS");
+    const char *env = smp_plat_env("SMPC3_VEC_BITS");
     if (env) {
         const unsigned long v = strtoul(env, NULL, 10);
         if (v == 128u || v == 256u || v == 512u) sm->host_vec_bits = (uint32_t)v;

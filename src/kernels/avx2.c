@@ -12,6 +12,7 @@
 #include "impl.h"
 
 #include "smpc3/cpu.h"
+#include "smpc3/plat.h"
 
 #include <immintrin.h>
 #include <string.h>
@@ -369,7 +370,7 @@ static void blk_resolve(void)
 
     /* Подмена руками — чтобы воспроизвести чужой замер, не имея того же
      * процессора. Ровно та же роль, что у SMPC3_VEC_BITS. */
-    const char *env = getenv("SMPC3_GEMM_BLOCK");
+    const char *env = smp_plat_env("SMPC3_GEMM_BLOCK");
     unsigned    em = 0, ek = 0, en = 0;
     if (env && sscanf(env, "%u,%u,%u", &em, &ek, &en) == 3 && em && ek && en) {
         g_mc = (uint32_t)(em - em % MR); if (g_mc < MR) g_mc = MR;

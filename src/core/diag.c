@@ -1,19 +1,9 @@
 /* SMPC3 :: diag.c -- рендер диагностики. */
 #include "smpc3/diag.h"
+#include "smpc3/plat.h"
 
 #include <string.h>
 #include <stdlib.h>
-
-#if defined(_WIN32)
-#  define WIN32_LEAN_AND_MEAN
-#  include <windows.h>
-#  include <io.h>
-#  include <fcntl.h>
-#  define smp__isatty(f) _isatty(_fileno(f))
-#else
-#  include <unistd.h>
-#  define smp__isatty(f) isatty(fileno(f))
-#endif
 
 /* ========================================================================== */
 /*  Реестр                                                                    */
@@ -312,32 +302,12 @@ void smp_diag_init(SmpDiagCtx *d, const SmpSource *src, FILE *out)
     memset(d, 0, sizeof(*d));
     d->src           = src;
     d->out           = out ? out : stderr;
-    d->color         = smp__isatty(d->out) ? true : false;
+    d->color         = smp_plat_isatty(d->out);
     d->deterministic = true;
     d->rng           = 0x123456789ABCDEFull;
 }
 
-void smp_console_setup(void)
-{
-#if defined(_WIN32)
-    /* Текстовый режим Windows подменяет каждый \n на \r\n. Для @emit.text это
-     * недопустимо: язык обещает вывести ровно те кодовые точки, которые
-     * посчитаны, а не «примерно те же плюс возврат каретки». Переводим stdout
-     * в двоичный режим — терминалы одиночный \n понимают прекрасно. */
-    _setmode(_fileno(stdout), _O_BINARY);
-
-    SetConsoleOutputCP(CP_UTF8);
-    DWORD mode;
-    HANDLE h[2] = { GetStdHandle(STD_OUTPUT_HANDLE), GetStdHandle(STD_ERROR_HANDLE) };
-    for (int i = 0; i < 2; i++) {
-        if (h[i] && h[i] != INVALID_HANDLE_VALUE && GetConsoleMode(h[i], &mode))
-            SetConsoleMode(h[i], mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-    }
-#endif
-    /* Диагностика должна доходить до пользователя целиком даже если процесс
-     * умирает следующей инструкцией. */
-    setvbuf(stderr, NULL, _IONBF, 0);
-}
+void smp_console_setup(void) { smp_plat_console_setup(); }
 
 const char *smp_fmt(SmpDiagCtx *d, const char *fmt, ...)
 {
@@ -606,12 +576,6 @@ static void smp__emit(SmpDiagCtx *d, const SmpDiagMsg *m)
 void smp_diag_emit(SmpDiagCtx *d, const SmpDiagMsg *m)
 {
     smp__emit(d, m);
-}
-
-void smp_diag_die(SmpDiagCtx *d, const SmpDiagMsg *m)
-{
-    smp__emit(d, m);
-    exit(70);   /* EX_SOFTWARE */
 }
 
 /* ========================================================================== */

@@ -2,6 +2,7 @@
 #include "smpc3/vm.h"
 #include "smpc3/cpu.h"
 #include "smpc3/kernels.h"
+#include "smpc3/plat.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -39,7 +40,7 @@ SmpStatus smp_vm_init(SmpVM *vm, const SmpModule *mod, SmpDiagCtx *diag)
      * У каждого инстанса она своя — без этого два потока в GEMM затёрли бы
      * панели друг друга. */
     vm->scratch_bytes = smp_k_scratch_bytes();
-    vm->scratch_mem   = malloc(vm->scratch_bytes);
+    vm->scratch_mem   = smp_plat_pages(vm->scratch_bytes);
     if (!vm->scratch_mem) {
         for (uint32_t j = 0; j < vm->n_arenas; j++) smp_arena_release(&vm->arenas[j]);
         return SMP_ERR_OOM;
@@ -63,7 +64,7 @@ void smp_vm_release(SmpVM *vm)
     for (uint32_t i = 0; i < vm->n_arenas; i++) smp_arena_release(&vm->arenas[i]);
     vm->n_arenas = 0;
 
-    free(vm->scratch_mem);
+    smp_plat_pages_free(vm->scratch_mem, vm->scratch_bytes);
     vm->scratch_mem   = NULL;
     vm->scratch_bytes = 0;
     memset(&vm->scratch, 0, sizeof vm->scratch);

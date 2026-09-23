@@ -1,19 +1,14 @@
 /* SMPC3 :: cpu.c */
 #include "smpc3/cpu.h"
+#include "smpc3/plat.h"
 #include <string.h>
 #include <stdio.h>
+#include <immintrin.h>
 
-#if defined(_MSC_VER) || defined(__clang__)
+/* Интринсики __cpuidex и _xgetbv есть только там, где есть MSVC-совместимый
+ * <intrin.h>. На голом таргете (ядро NablaOS) его нет, и работает ассемблер. */
+#if defined(_MSC_VER)
 #  include <intrin.h>
-#  include <immintrin.h>
-#endif
-
-#if defined(_WIN32)
-#  define WIN32_LEAN_AND_MEAN
-#  include <windows.h>
-#else
-#  include <unistd.h>
-#  include <time.h>
 #endif
 
 static SmpCpu  g_cpu;
@@ -21,7 +16,7 @@ static bool    g_cpu_ready = false;
 
 static void smp__cpuidex(int out[4], int leaf, int sub)
 {
-#if defined(_MSC_VER) || defined(__clang__)
+#if defined(_MSC_VER)
     __cpuidex(out, leaf, sub);
 #else
     __asm__ __volatile__("cpuid"
@@ -32,24 +27,12 @@ static void smp__cpuidex(int out[4], int leaf, int sub)
 
 static uint64_t smp__xgetbv0(void)
 {
-#if defined(_MSC_VER) || defined(__clang__)
+#if defined(_MSC_VER)
     return _xgetbv(0);
 #else
     uint32_t lo, hi;
     __asm__ __volatile__(".byte 0x0f,0x01,0xd0" : "=a"(lo), "=d"(hi) : "c"(0));
     return ((uint64_t)hi << 32) | lo;
-#endif
-}
-
-static uint32_t smp__n_logical(void)
-{
-#if defined(_WIN32)
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    return (uint32_t)si.dwNumberOfProcessors;
-#else
-    long n = sysconf(_SC_NPROCESSORS_ONLN);
-    return n > 0 ? (uint32_t)n : 1u;
 #endif
 }
 
@@ -99,7 +82,7 @@ static void smp__detect(void)
 
     memset(&g_cpu, 0, sizeof(g_cpu));
     g_cpu.cacheline = SMP_CACHELINE;
-    g_cpu.n_logical = smp__n_logical();
+    g_cpu.n_logical = smp_plat_cpus();
 
     smp__cpuidex(r, 0, 0);
     const int max_leaf = r[0];
@@ -170,19 +153,7 @@ const SmpCpu *smp_cpu(void)
     return &g_cpu;
 }
 
-double smp_now_sec(void)
-{
-#if defined(_WIN32)
-    LARGE_INTEGER f, c;
-    QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&c);
-    return (double)c.QuadPart / (double)f.QuadPart;
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-#endif
-}
+double smp_now_sec(void) { return smp_plat_seconds(); }
 
 const char *smp_vec_name(uint32_t vec_bits)
 {

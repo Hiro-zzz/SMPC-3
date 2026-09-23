@@ -152,9 +152,6 @@ typedef struct SmpDiagMsg {
  * принимает вызывающий, чтобы успеть собрать несколько ошибок за проход. */
 void smp_diag_emit(SmpDiagCtx *d, const SmpDiagMsg *m);
 
-/* Печатает и немедленно убивает процесс с кодом 70 (EX_SOFTWARE). */
-SMP_NORETURN void smp_diag_die(SmpDiagCtx *d, const SmpDiagMsg *m);
-
 /* Форматирование во временный слот кольца. Указатель живёт до тех пор, пока
  * не будет израсходовано SMP_FMT_SLOTS новых слотов. Достаточно, чтобы
  * собрать одно сообщение целиком. */

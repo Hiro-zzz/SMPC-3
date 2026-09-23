@@ -1,15 +1,8 @@
 /* SMPC3 :: arena.c */
 #include "smpc3/arena.h"
+#include "smpc3/plat.h"
 #include <string.h>
 #include <stdio.h>
-
-#if defined(_WIN32)
-#  define WIN32_LEAN_AND_MEAN
-#  include <windows.h>
-#else
-#  include <sys/mman.h>
-#  include <stdlib.h>
-#endif
 
 /* В debug-сборке свежая и откатанная память забивается ядовитым паттерном:
  * чтение неинициализированного тензора должно ломаться громко, а не «почти
@@ -21,28 +14,6 @@
 #endif
 #define SMP_POISON_BYTE 0xCD
 
-static void *smp__os_reserve(size_t bytes)
-{
-#if defined(_WIN32)
-    /* VirtualAlloc отдаёт страницы, выровненные на 64 KiB — с запасом. */
-    return VirtualAlloc(NULL, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-#else
-    void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    return (p == MAP_FAILED) ? NULL : p;
-#endif
-}
-
-static void smp__os_free(void *p, size_t bytes)
-{
-#if defined(_WIN32)
-    SMP_UNUSED(bytes);
-    VirtualFree(p, 0, MEM_RELEASE);
-#else
-    munmap(p, bytes);
-#endif
-}
-
 SmpStatus smp_arena_init(SmpArena *a, size_t cap, uint32_t id, const char *label)
 {
     if (!a || cap == 0) return SMP_ERR_INTERNAL;
@@ -50,13 +21,13 @@ SmpStatus smp_arena_init(SmpArena *a, size_t cap, uint32_t id, const char *label
     memset(a, 0, sizeof(*a));
     cap = SMP_ALIGN_UP(cap, SMP_ARENA_ALIGN);
 
-    uint8_t *mem = (uint8_t *)smp__os_reserve(cap);
+    uint8_t *mem = (uint8_t *)smp_plat_pages(cap);
     if (!mem) return SMP_ERR_OOM;
 
-    /* Страничные аллокаторы обеих ОС дают ≥4096, но проверяем инвариант явно:
+    /* Слой платформы обещает ≥4096, но проверяем инвариант явно:
      * вся SIMD-часть рантайма опирается на него без дальнейших сомнений. */
     if (!SMP_IS_ALIGNED(mem, SMP_ARENA_ALIGN)) {
-        smp__os_free(mem, cap);
+        smp_plat_pages_free(mem, cap);
         return SMP_ERR_ALIGN;
     }
 
@@ -92,7 +63,7 @@ SmpStatus smp_arena_wrap(SmpArena *a, void *mem, size_t cap, uint32_t id, const 
 void smp_arena_release(SmpArena *a)
 {
     if (!a || !a->base) return;
-    if (a->owns_pages) smp__os_free(a->base, a->cap);
+    if (a->owns_pages) smp_plat_pages_free(a->base, a->cap);
     memset(a, 0, sizeof(*a));
 }
 

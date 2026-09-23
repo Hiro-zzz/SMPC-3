@@ -1,5 +1,6 @@
 /* SMPC3 :: main.c -- CLI. */
 #include "smpc3/common.h"
+#include "smpc3/compile.h"
 #include "smpc3/arena.h"
 #include "smpc3/cpu.h"
 #include "smpc3/diag.h"
@@ -256,11 +257,8 @@ static int cmd_parse(const char *path)
 
 /* ========================================================================== */
 
-/* Общий фронтенд: загрузка, лексер, парсер, семантика. Возвращает код выхода
- * или -1, если дошли до конца без фатальных ошибок. */
-static int frontend(const char *path, SmpArena *arena, SmpDiagCtx *D,
-                    SmpSource *src, SmpAstProgram *prog, SmpSemaResult *res,
-                    SmpSema *sm)
+/* Прочитать исходник и настроить на него диагностику. 0 или код выхода. */
+static int load_source(const char *path, SmpArena *arena, SmpDiagCtx *D, SmpSource *src)
 {
     /* Контекст инициализируется ПЕРВЫМ. Если сделать это после загрузки, то
      * на неоткрывшемся файле вызывающий получит счётчики из мусора на стеке. */
@@ -273,28 +271,18 @@ static int frontend(const char *path, SmpArena *arena, SmpDiagCtx *D,
         return 66;
     }
     smp_diag_init(D, src, stderr);   /* теперь с настоящим текстом */
+    return 0;
+}
 
-    SmpLexer lx;
-    smp_lex_init(&lx, src, D);
-    SmpToken *toks = NULL;
-    uint32_t  ntok = 0;
-    smp_lex_all(&lx, arena, &toks, &ntok);
-    if (lx.n_errors) return 65;
-
-    SmpParser P;
-    smp_parse_init(&P, arena, D, src, toks, ntok);
-    smp_parse(&P, prog);
-    if (P.n_errors) return 65;
-
-    /* Развёртка [#repeat:N] идёт до семантики: каждая копия обязана
-     * проверяться со своим индексом, иначе смысл развёртки теряется. */
-    uint32_t n_exp = 0;
-    smp_ast_expand(prog, arena, D, &n_exp);
-    if (n_exp) return 65;
-
-    smp_sema_init(sm, arena, D, src);
-    smp_sema_run(sm, prog, res);
-    return sm->n_errors ? 65 : -1;
+/* Общий фронтенд: загрузка, лексер, парсер, семантика. Возвращает код выхода
+ * или -1, если дошли до конца без фатальных ошибок. */
+static int frontend(const char *path, SmpArena *arena, SmpDiagCtx *D,
+                    SmpSource *src, SmpAstProgram *prog, SmpSemaResult *res,
+                    SmpSema *sm)
+{
+    const int rc = load_source(path, arena, D, src);
+    if (rc) return rc;
+    return smp_frontend(src, arena, D, prog, res, sm) ? -1 : 65;
 }
 
 static int cmd_check(const char *path, bool dump)
@@ -498,12 +486,7 @@ static int cmd_run(const char *path, bool verbose,
     if (smp_arena_init(&arena, 128u << 20, 1, "compile") != SMP_OK) return 70;
 
     SmpSource     src;
-    SmpAstProgram prog;
-    SmpSemaResult res;
-    SmpSema       sm;
     SmpDiagCtx    D;
-    memset(&res, 0, sizeof res);
-    memset(&sm,  0, sizeof sm);
 
     const size_t n = strlen(path);
     SmpModule mod;
@@ -517,18 +500,21 @@ static int cmd_run(const char *path, bool verbose,
             return 65;
         }
     } else {
-        const int rc = frontend(path, &arena, &D, &src, &prog, &res, &sm);
-        if (rc >= 0) {
+        int rc = load_source(path, &arena, &D, &src);
+        SmpStatus st = SMP_ERR_IO;
+        if (rc == 0) {
+            st = smp_compile(&src, &arena, &D, &mod);
+            rc = (st == SMP_OK) ? 0 : (st == SMP_ERR_SYNTAX) ? 65 : 70;
+        }
+        if (rc == 70) {                     /* отказ эмиттера: он уже сказал сам */
+            smp_arena_release(&arena);
+            return 70;
+        }
+        if (rc) {
             char sum[128];
             fprintf(stderr, "\nзапуск отменён: %s\n", smp_diag_summary(&D, sum, sizeof sum));
             smp_arena_release(&arena);
             return rc;
-        }
-        SmpEmitter em;
-        smp_emit_init(&em, &arena, &D, &src);
-        if (smp_emit(&em, &prog, &res, &mod) != SMP_OK) {
-            smp_arena_release(&arena);
-            return 70;
         }
     }
 

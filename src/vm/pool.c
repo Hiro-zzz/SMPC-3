@@ -3,6 +3,7 @@
 #include "smpc3/thread.h"
 #include "smpc3/cpu.h"
 #include "smpc3/kernels.h"
+#include "smpc3/plat.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -29,14 +30,14 @@ SmpStatus smp_vm_pool_init(SmpVMPool *p, const SmpModule *mod,
     p->n_threads = n_threads ? n_threads : smp_threads_default();
     if (p->n_threads > n_inst) p->n_threads = n_inst;
 
-    p->inst   = (SmpVM      *)calloc(n_inst, sizeof(SmpVM));
-    p->diag   = (SmpDiagCtx *)calloc(n_inst, sizeof(SmpDiagCtx));
-    p->log    = (SmpLog     *)calloc(n_inst, sizeof(SmpLog));
-    p->status = (SmpStatus  *)calloc(n_inst, sizeof(SmpStatus));
+    p->inst   = (SmpVM      *)smp_plat_pages(n_inst * sizeof(SmpVM));
+    p->diag   = (SmpDiagCtx *)smp_plat_pages(n_inst * sizeof(SmpDiagCtx));
+    p->log    = (SmpLog     *)smp_plat_pages(n_inst * sizeof(SmpLog));
+    p->status = (SmpStatus  *)smp_plat_pages(n_inst * sizeof(SmpStatus));
 
     /* Журналы одним блоком: тысяча отдельных выделений здесь не нужна, а
      * освобождать проще один указатель. */
-    p->logmem = (char *)calloc(n_inst, SMP_POOL_LOG_BYTES);
+    p->logmem = (char *)smp_plat_pages((size_t)n_inst * SMP_POOL_LOG_BYTES);
 
     if (!p->inst || !p->diag || !p->log || !p->status || !p->logmem) {
         smp_vm_pool_release(p);
@@ -69,12 +70,12 @@ void smp_vm_pool_release(SmpVMPool *p)
 {
     if (p->inst) {
         for (uint32_t i = 0; i < p->n_inst; i++) smp_vm_release(&p->inst[i]);
-        free(p->inst);
+        smp_plat_pages_free(p->inst, p->n_inst * sizeof(SmpVM));
     }
-    free(p->log);
-    free(p->logmem);
-    free(p->diag);
-    free(p->status);
+    smp_plat_pages_free(p->log,    p->n_inst * sizeof(SmpLog));
+    smp_plat_pages_free(p->logmem, (size_t)p->n_inst * SMP_POOL_LOG_BYTES);
+    smp_plat_pages_free(p->diag,   p->n_inst * sizeof(SmpDiagCtx));
+    smp_plat_pages_free(p->status, p->n_inst * sizeof(SmpStatus));
     memset(p, 0, sizeof *p);
 }
 
