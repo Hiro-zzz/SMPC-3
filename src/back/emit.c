@@ -321,6 +321,8 @@ static SmpOpcode op_to_bc(SmpOpKind k)
         case SMP_OP_ALLOC:      return SMP_BC_ALLOC;
         case SMP_OP_FILL:       return SMP_BC_FILL;
         case SMP_OP_FILL_INST:  return SMP_BC_FILLI;
+        case SMP_OP_LOAD:       return SMP_BC_LOAD;
+        case SMP_OP_STORE:      return SMP_BC_STORE;
         case SMP_OP_MMUL:       return SMP_BC_MMUL;
         case SMP_OP_TRANSPOSE:  return SMP_BC_TRANS;
         case SMP_OP_PACK:       return SMP_BC_PACK;
@@ -563,6 +565,7 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
                 d = a;
             }
         } else if (k == SMP_OP_REDUCE_ADD || k == SMP_OP_REDUCE_MAX ||
+                   k == SMP_OP_STORE ||
                    (k >= SMP_OP_EMIT_TEXT && k <= SMP_OP_EMIT_NUM)) {
             d = alloc_temp(m);
             m->reg_scratch[d] = false;

@@ -94,6 +94,7 @@ check parse_bad     parse examples/bad_syntax.smpc
 check check_kernel  check examples/kernel.smpc -v
 check check_bad     check examples/bad_sema.smpc
 check check_bad_rep check examples/bad_repeat.smpc
+check check_rank    check examples/rank.smpc
 
 # --- бэкенд и рантайм -------------------------------------------------------
 check build_kernel  build examples/kernel.smpc -o "$TMP/kernel.s3b" -S
@@ -111,6 +112,7 @@ check run_gemm      run   examples/gemm.smpc
 check run_forward   run   examples/forward.smpc
 check check_forward check examples/forward.smpc -v
 check run_repeat    run   examples/repeat.smpc
+check run_io        run   examples/io.smpc --out V="$TMP/io.bin" --in W="$TMP/io.bin"
 check build_repeat  build examples/repeat.smpc -o "$TMP/repeat.s3b" -S
 check run_trap      run   examples/trap.smpc
 check run_s3b       run   "$TMP/kernel.s3b"

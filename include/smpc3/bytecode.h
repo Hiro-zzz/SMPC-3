@@ -60,7 +60,9 @@ typedef enum SmpOpFmt {
     X(CVTF64, "cvt.f64", SMP_FMT_D_A,     "rD <- (f64)rA")                     \
     X(CVTI32, "cvt.i32", SMP_FMT_D_A,     "rD <- (i32)rA")                     \
     X(CVTU64, "cvt.u64", SMP_FMT_D_A,     "rD <- (u64)rA")                     \
-    X(EMIT,   "emit",    SMP_FMT_D_A_X,   "вывести rA; rD <- сколько выведено")
+    X(EMIT,   "emit",    SMP_FMT_D_A_X,   "вывести rA; rD <- сколько выведено")\
+    X(LOAD,   "load",    SMP_FMT_D,       "rD <- содержимое привязанного файла") \
+    X(STORE,  "store",   SMP_FMT_D_A,     "rA -> привязанный файл; rD <- байт")
 
 #define SMP_BC_ENUM(id, mn, fmt, desc) SMP_BC_##id,
 typedef enum SmpOpcode {

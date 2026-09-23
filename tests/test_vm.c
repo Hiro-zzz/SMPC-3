@@ -31,6 +31,11 @@ static SmpVM      g_vm;
 static SmpModule  g_mod;
 
 /* Компилирует и исполняет. Возвращает true, если дошли до halt. */
+/* Привязки тензоров к файлам для текущего прогона. Проставляются тестом до
+ * run_str; по умолчанию их нет, и @load с @store честно падают. */
+static SmpBind  g_binds[4];
+static uint32_t g_n_binds;
+
 static bool run_str(const char *text)
 {
     smp_vm_release(&g_vm);
@@ -54,6 +59,12 @@ static bool run_str(const char *text)
     smp_parse(&P, &prog);
     if (P.n_errors) { CHECK(0, "парсер: %s", text); return false; }
 
+    /* Развёртка [#repeat:N] идёт до семантики — как в настоящем конвейере.
+     * Без этого тест с [#repeat] проверял бы не тот компилятор. */
+    uint32_t n_exp = 0;
+    smp_ast_expand(&prog, &g_arena, &g_diag, &n_exp);
+    if (n_exp) { CHECK(0, "развёртка: %s", text); return false; }
+
     SmpSema sm;
     smp_sema_init(&sm, &g_arena, &g_diag, &g_src);
     sm.host_vec_bits = 256;
@@ -72,6 +83,7 @@ static bool run_str(const char *text)
         CHECK(0, "VM не поднялась");
         return false;
     }
+    smp_vm_bind(&g_vm, g_binds, g_n_binds);
     if (g_emit) { rewind(g_emit); g_vm.out = g_emit; }
     g_diag.regdump      = smp_vm_regdump;
     g_diag.regdump_user = &g_vm;
@@ -830,6 +842,108 @@ static void test_gemm_epilogue(void)
     }
 }
 
+/* ========================================================================== */
+/*  Обмен с файлами                                                           */
+/* ========================================================================== */
+
+/* Ровно то, что делает Python через array.tofile: сырые байты, без заголовка. */
+static bool write_f32(const char *path, const float *v, size_t n)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    const size_t put = fwrite(v, sizeof(float), n, f);
+    return fclose(f) == 0 && put == n;
+}
+
+static bool read_f32(const char *path, float *v, size_t n)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    const size_t got = fread(v, sizeof(float), n, f);
+    fclose(f);
+    return got == n;
+}
+
+static bool saw_code(const char *code) { return strstr(g_out, code) != NULL; }
+
+static void test_fileio(void)
+{
+    SECTION("обмен с файлами");
+
+    const char *in  = "build/test_io_in.bin";
+    const char *out = "build/test_io_out.bin";
+
+    float src[16], got[16];
+    for (uint32_t i = 0; i < 16; i++) src[i] = (float)i - 8.0f;   /* со знаком */
+    if (!write_f32(in, src, 16)) { CHECK(0, "не записался входной файл"); return; }
+
+    /* --- туда и обратно --- */
+    g_binds[0].name = "A"; g_binds[0].path = in;  g_binds[0].write = false;
+    g_binds[1].name = "C"; g_binds[1].path = out; g_binds[1].write = true;
+    g_n_binds = 2;
+
+    const char *roundtrip =
+        "[#arena:0] *&A<f32:16> -> @load  => *&A;\n"
+        "[#arena:0] *&C<f32:16> -> @alloc => *&C;\n"
+        "[#simd:v256] *&A -> @relu -> @scale(2.0) => *&C [!no-alias];\n"
+        "*&C -> @store => $put;\n";
+    if (run_str(roundtrip)) {
+        CHECK(read_f32(out, got, 16), "выходной файл не прочитался");
+
+        bool ok = true;
+        for (uint32_t i = 0; i < 16; i++) {
+            const float want = (src[i] > 0.0f ? src[i] : 0.0f) * 2.0f;
+            if (!near(got[i], want)) ok = false;
+        }
+        CHECK(ok, "через файлы посчиталось не то");
+
+        bool found = false;
+        const double put = regval("put", &found);
+        CHECK(found && near(put, 64.0),
+              "@store вернул %g байт, ждали 64", put);
+    }
+
+    /* --- вход обязан долетать до арены, а не просто не падать --- */
+    g_n_binds = 1;   /* только A на чтение */
+    if (run_str("[#arena:0] *&A<f32:16> -> @load => *&A;\n"
+                "*&A -> @reduce.add => $s;\n")) {
+        double want = 0.0;
+        for (uint32_t i = 0; i < 16; i++) want += (double)src[i];
+        bool found = false;
+        const double s = regval("s", &found);
+        CHECK(found && near(s, want), "сумма прочитанного %g, ждали %g", s, want);
+    }
+
+    /* --- привязки нет --- */
+    g_n_binds = 0;
+    CHECK(!run_str("[#arena:0] *&A<f32:16> -> @load => *&A;\n"
+                   "*&A -> @reduce.add => $s;\n"),
+          "прогон без привязки обязан упасть");
+    CHECK(saw_code("E0606"), "нет E0606 при отсутствующей привязке");
+
+    /* --- размер не сошёлся ---
+     * Заголовка у файла нет намеренно, поэтому единственная защита от
+     * подсунутого не того файла — точное совпадение размера. */
+    g_binds[0].name = "A"; g_binds[0].path = in; g_binds[0].write = false;
+    g_n_binds = 1;
+    CHECK(!run_str("[#arena:0] *&A<f32:9> -> @load => *&A;\n"
+                   "*&A -> @reduce.add => $s;\n"),
+          "файл на 64 байта в тензор на 36 обязан быть отказом");
+    CHECK(saw_code("E0607"), "нет E0607 при несовпадении размера");
+
+    /* --- направление привязки различается ---
+     * Тот же файл, привязанный на запись, не годится для @load: иначе
+     * опечатка в --in/--out молча читала бы не то. */
+    g_binds[0].name = "A"; g_binds[0].path = in; g_binds[0].write = true;
+    g_n_binds = 1;
+    CHECK(!run_str("[#arena:0] *&A<f32:16> -> @load => *&A;\n"
+                   "*&A -> @reduce.add => $s;\n"),
+          "@load не должен брать привязку, объявленную на запись");
+
+    remove(in);
+    remove(out);
+}
+
 int main(void)
 {
     smp_console_setup();
@@ -856,6 +970,7 @@ int main(void)
     test_roundtrip();
     test_fusion();
     test_gemm_epilogue();
+    test_fileio();
 
     smp_vm_release(&g_vm);
     fclose(g_sink);

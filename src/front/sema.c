@@ -741,6 +741,63 @@ static bool apply_stage(Ctx *c, const SmpAstStage *st, SmpOpKind k, SmpValue *v)
             if (v->sym != SMP_SYM_NONE) c->res->syms[v->sym].initialized = true;
             return true;
 
+        case SMP_OP_LOAD:
+        case SMP_OP_STORE: {
+            /* Обмен с внешним миром идёт сырыми байтами арены, поэтому
+             * тензор обязан лежать плотно: у среза с шагом «содержимое» и
+             * «занятый диапазон» — разные вещи, и записать его одним куском
+             * нельзя. */
+            const bool wr = (k == SMP_OP_STORE);
+            const char *nm = wr ? "store" : "load";
+
+            if (!require_tensor(c, v, st->span, nm)) return false;
+
+            /* Только первой стадией. Привязка идёт по имени тензора, а любая
+             * считающая стадия до неё оставляет после себя безымянный
+             * временный буфер — имени, по которому искать файл, уже нет.
+             * Ловится здесь, а не в рантайме: иначе человек получал бы
+             * «тензор '%t1' не привязан» и внутреннее имя вместо объяснения. */
+            if (c->cur_stage != 0) {
+                serr(c, SMP_E0309, st->span,
+                     sfmt(c, "@%s стоит %u-й стадией, а привязывается по имени "
+                             "тензора — после вычислений имени уже нет.",
+                          nm, c->cur_stage + 1u),
+                     "Заведи именованный тензор отдельной инструкцией и работай с ним.");
+                return false;
+            }
+
+            if (!(v->flags & SMP_TF_CONTIG)) {
+                serr(c, SMP_E0309, st->span,
+                     sfmt(c, "@%s работает с плотным тензором, а этот срез идёт с шагом.",
+                          nm),
+                     "Материализуй срез через @pack либо бери ось, идущую подряд.");
+                return false;
+            }
+            /* Привязка ищется по имени тензора: у временного буфера имени нет,
+             * и привязывать к файлу нечего. */
+            if (v->sym == SMP_SYM_NONE) {
+                serr(c, SMP_E0309, st->span,
+                     sfmt(c, "@%s привязывается по имени тензора, а здесь безымянное "
+                             "промежуточное значение.", nm),
+                     "Заведи именованный тензор и работай с ним.");
+                return false;
+            }
+
+            if (wr) {
+                /* Запись — такая же свёртка, как @emit: съедает тензор, отдаёт
+                 * число записанных байт. Конвейер остаётся однородным. */
+                v->is_scalar = true;
+                v->rank      = 0;
+                v->dtype     = SMP_DT_U64;
+                v->sym       = SMP_SYM_NONE;
+                v->flags     = SMP_TF_CONTIG;
+                v->byte_off  = 0;
+            } else {
+                c->res->syms[v->sym].initialized = true;
+            }
+            return true;
+        }
+
         case SMP_OP_FILL:
             if (!require_tensor(c, v, st->span, "fill")) return false;
             if (!a0.is_scalar) {

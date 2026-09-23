@@ -36,6 +36,8 @@ static void cmd_help(void)
         "  smpc3 dis <файл.s3b>    дизассемблировать модуль\n"
         "  smpc3 run <файл>        исполнить .smpc или .s3b\n"
         "                          -v статистика, -n N инстансов, -j N потоков\n"
+        "                          --in ИМЯ=путь   файл в тензор (@load)\n"
+        "                          --out ИМЯ=путь  тензор в файл (@store)\n"
         "\n"
         "  smpc3 ops               реестр операций\n"
         "  smpc3 attrs             реестр директив, режимов и атрибутов\n"
@@ -426,7 +428,8 @@ static int cmd_dis(const char *path)
 /* ========================================================================== */
 
 /* Общий хвост для run: поднять VM, исполнить, показать что вышло. */
-static int execute(SmpModule *mod, SmpDiagCtx *D, SmpArena *arena, bool verbose)
+static int execute(SmpModule *mod, SmpDiagCtx *D, SmpArena *arena, bool verbose,
+                   const SmpBind *binds, uint32_t n_binds)
 {
     SmpVM vm;
     if (smp_vm_init(&vm, mod, D) != SMP_OK) {
@@ -434,8 +437,7 @@ static int execute(SmpModule *mod, SmpDiagCtx *D, SmpArena *arena, bool verbose)
         return 70;
     }
     vm.out = stdout;
-
-    vm.out = stdout;
+    smp_vm_bind(&vm, binds, n_binds);
 
     /* С этого момента фатальная диагностика печатает дамп регистров. */
     D->regdump      = smp_vm_regdump;
@@ -489,7 +491,8 @@ static int run_pool(SmpModule *mod, uint32_t n_inst, uint32_t n_threads)
 }
 
 static int cmd_run(const char *path, bool verbose,
-                   uint32_t n_inst, uint32_t n_threads)
+                   uint32_t n_inst, uint32_t n_threads,
+                   const SmpBind *binds, uint32_t n_binds)
 {
     SmpArena arena;
     if (smp_arena_init(&arena, 128u << 20, 1, "compile") != SMP_OK) return 70;
@@ -531,7 +534,7 @@ static int cmd_run(const char *path, bool verbose,
 
     const int rc = (n_inst > 1)
         ? run_pool(&mod, n_inst, n_threads)
-        : execute(&mod, &D, &arena, verbose);
+        : execute(&mod, &D, &arena, verbose, binds, n_binds);
     smp_arena_release(&arena);
     return rc;
 }
@@ -816,15 +819,54 @@ int main(int argc, char **argv)
         if (argc < 3) { fprintf(stderr, "нужен путь к .smpc или .s3b\n"); return 1; }
         bool     verbose = false;
         uint32_t n_inst = 1, n_threads = 0;
+
+        SmpBind  binds[SMP_MAX_BINDS];
+        uint32_t n_binds = 0;
+
         for (int i = 3; i < argc; i++) {
             if (strcmp(argv[i], "-v") == 0) verbose = true;
             else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc)
                 n_inst = (uint32_t)strtoul(argv[++i], NULL, 10);
             else if (strcmp(argv[i], "-j") == 0 && i + 1 < argc)
                 n_threads = (uint32_t)strtoul(argv[++i], NULL, 10);
+            else if ((strcmp(argv[i], "--in") == 0 || strcmp(argv[i], "--out") == 0)
+                     && i + 1 < argc) {
+                const bool wr = (argv[i][2] == 'o');
+                if (n_binds >= SMP_MAX_BINDS) {
+                    fprintf(stderr, "привязок больше %u\n", SMP_MAX_BINDS);
+                    return 1;
+                }
+                /* Аргумент вида ИМЯ=путь режется на месте: argv изменяем, а
+                 * копировать строку ради одного нуля незачем. */
+                char *arg = argv[i + 1];
+                char *eq  = strchr(arg, '=');
+                if (!eq || eq == arg || eq[1] == '\0') {
+                    fprintf(stderr, "привязка пишется как ИМЯ=путь, а не '%s'\n", arg);
+                    return 1;
+                }
+                *eq = '\0';
+                binds[n_binds].name  = arg;
+                binds[n_binds].path  = eq + 1;
+                binds[n_binds].write = wr;
+                n_binds++;
+                i++;
+            }
         }
         if (n_inst == 0) n_inst = 1;
-        return cmd_run(argv[2], verbose, n_inst, n_threads);
+
+        /* Пул и запись в файл несовместимы: N инстансов писали бы в один путь
+         * одновременно, и содержимое зависело бы от того, кто закончил
+         * последним. Молча отдать такой файл хуже, чем отказаться. */
+        if (n_inst > 1) {
+            for (uint32_t i = 0; i < n_binds; i++)
+                if (binds[i].write) {
+                    fprintf(stderr,
+                            "--out '%s' и -n %u вместе не работают: инстансы писали бы "
+                            "в один файл наперегонки\n", binds[i].name, n_inst);
+                    return 1;
+                }
+        }
+        return cmd_run(argv[2], verbose, n_inst, n_threads, binds, n_binds);
     }
     if (strcmp(argv[1], "dis") == 0) {
         if (argc < 3) { fprintf(stderr, "нужен путь к .s3b\n"); return 1; }

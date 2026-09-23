@@ -232,6 +232,115 @@ static bool strict_check(SmpVM *vm, uint8_t flags, double v, const char *what)
 }
 
 /* ========================================================================== */
+/*  Обмен с файлами                                                           */
+/* ========================================================================== */
+
+void smp_vm_bind(SmpVM *vm, const SmpBind *binds, uint32_t n)
+{
+    vm->binds   = binds;
+    vm->n_binds = n;
+}
+
+/* Привязка ищется по имени тензора и направлению. Вход и выход разведены
+ * намеренно: одно и то же имя может быть привязано и на чтение, и на запись —
+ * прочитать вектор, посчитать, положить обратно рядом. */
+static const SmpBind *bind_find(const SmpVM *vm, const char *name, bool write)
+{
+    for (uint32_t i = 0; i < vm->n_binds; i++)
+        if (vm->binds[i].write == write && vm->binds[i].name &&
+            strcmp(vm->binds[i].name, name) == 0)
+            return &vm->binds[i];
+    return NULL;
+}
+
+/* Общая часть @load и @store: найти привязку либо объяснить, чего не хватает. */
+static const SmpBind *bind_or_fatal(SmpVM *vm, const SmpTensor *t, bool write)
+{
+    const char    *name = smp_module_str(vm->mod, t->name_id);
+    const SmpBind *b    = bind_find(vm, name, write);
+    if (b) return b;
+
+    vm_fatal(vm, SMP_E0606,
+             vfmt(vm, "Тензор '%s' участвует в @%s, но к файлу не привязан.",
+                  name, write ? "store" : "load"),
+             vfmt(vm, "Добавь к запуску: --%s %s=путь",
+                  write ? "out" : "in", name));
+    return NULL;
+}
+
+/* Чтение файла прямо в арену: промежуточного буфера нет, и обещание про
+ * отсутствие аллокаций на исполнении остаётся в силе — место уже выделено
+ * компилятором, мы лишь заполняем его байтами. */
+static bool file_load(SmpVM *vm, const SmpTensor *t, const SmpBuf *buf)
+{
+    const SmpBind *b = bind_or_fatal(vm, t, false);
+    if (!b) return false;
+
+    const uint64_t want = smp_tensor_bytes(t);
+
+    FILE *f = fopen(b->path, "rb");
+    if (!f) {
+        vm_fatal(vm, SMP_E0607,
+                 vfmt(vm, "Файл '%s' не открывается на чтение.", b->path), NULL);
+        return false;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); goto bad_size; }
+    {
+        const long sz = ftell(f);
+        rewind(f);
+        if (sz < 0 || (uint64_t)sz != want) {
+            char sig[80];
+            vm_fatal(vm, SMP_E0607,
+                     vfmt(vm, "Файл '%s' занимает %lld байт, а тензор %s просит %llu.",
+                          b->path, (long long)sz, smp_tensor_sig(t, sig, sizeof sig),
+                          (unsigned long long)want),
+                     "Размер обязан совпасть байт в байт: заголовка у файла нет, "
+                     "и подогнать его не по чему.");
+            fclose(f);
+            return false;
+        }
+    }
+    {
+        const size_t got = want ? fread(buf->p, 1, (size_t)want, f) : 0u;
+        fclose(f);
+        if (got != (size_t)want) goto bad_size;
+    }
+    return true;
+
+bad_size:
+    vm_fatal(vm, SMP_E0607,
+             vfmt(vm, "Файл '%s' не дочитался до конца.", b->path), NULL);
+    return false;
+}
+
+static bool file_store(SmpVM *vm, const SmpTensor *t, const SmpBuf *buf,
+                       uint64_t *written)
+{
+    const SmpBind *b = bind_or_fatal(vm, t, true);
+    if (!b) return false;
+
+    const uint64_t want = smp_tensor_bytes(t);
+
+    FILE *f = fopen(b->path, "wb");
+    if (!f) {
+        vm_fatal(vm, SMP_E0607,
+                 vfmt(vm, "Файл '%s' не открывается на запись.", b->path), NULL);
+        return false;
+    }
+    const size_t put = want ? fwrite(buf->p, 1, (size_t)want, f) : 0u;
+    const int    err = fclose(f);
+    if (put != (size_t)want || err != 0) {
+        vm_fatal(vm, SMP_E0607,
+                 vfmt(vm, "В файл '%s' записано %llu байт из %llu.",
+                      b->path, (unsigned long long)put, (unsigned long long)want),
+                 "Проверь права и свободное место.");
+        return false;
+    }
+    *written = want;
+    return true;
+}
+
+/* ========================================================================== */
 /*  Слияние поэлементных стадий                                               */
 /* ========================================================================== */
 
@@ -640,6 +749,35 @@ dispatch_switch:
         if (!make_buf(vm, &bd, &R[in->d].t)) return SMP_ERR_INTERNAL;
         smp_k_fill(&bd, (double)vm->instance);
         VM_NEXT();
+
+    VM_CASE(LOAD)
+        if (!R[in->d].is_tensor) {
+            vm_fatal(vm, SMP_E0606, "@load ждёт тензор, а в регистре скаляр.", NULL);
+            return SMP_ERR_INTERNAL;
+        }
+        if (!make_buf(vm, &bd, &R[in->d].t)) return SMP_ERR_INTERNAL;
+        if (!file_load(vm, &R[in->d].t, &bd)) return SMP_ERR_INTERNAL;
+        VM_NEXT();
+
+    VM_CASE(STORE) {
+        if (!R[in->a].is_tensor) {
+            vm_fatal(vm, SMP_E0606, "@store ждёт тензор, а в регистре скаляр.", NULL);
+            return SMP_ERR_INTERNAL;
+        }
+        if (!make_buf(vm, &ba, &R[in->a].t)) return SMP_ERR_INTERNAL;
+        uint64_t put = 0;
+        if (!file_store(vm, &R[in->a].t, &ba, &put)) return SMP_ERR_INTERNAL;
+
+        /* Отдаём число записанных байт — ровно так же, как @emit отдаёт число
+         * выведенных элементов. Отдельной операции без результата в языке нет. */
+        /* Скалярный регистр держит double в .f, а dtype — логический тип
+         * значения. Договорённость единая на весь рантайм; записать сюда
+         * .u значило бы отдать дампу и @emit битовый мусор. */
+        R[in->d].is_tensor = false;
+        R[in->d].s.f       = (double)put;
+        R[in->d].dtype     = (uint8_t)SMP_DT_U64;
+        VM_NEXT();
+    }
 
     VM_CASE(MMUL)
         /* Эпилог: @mmul -> @relu -> @add считается в выгрузке тайла, пока тот
