@@ -520,9 +520,23 @@ static void smp__snippet(SmpDiagCtx *d, SmpSpan sp, SmpSeverity sev, uint32_t gu
     smp_diag_write(d, "%s\n", rst);
 }
 
+static bool smp__muted(const SmpDiagCtx *d, SmpDiagCode c)
+{
+    return (d->muted[c / 64u] >> (c % 64u)) & 1u;
+}
+
+bool smp_diag_mute(SmpDiagCtx *d, SmpDiagCode code)
+{
+    if ((unsigned)code >= SMP_DIAG__COUNT) return false;
+    if (smp_diag_info(code)->sev == SMP_SEV_FATAL) return false;
+    d->muted[code / 64u] |= 1ull << (code % 64u);
+    return true;
+}
+
 static void smp__emit(SmpDiagCtx *d, const SmpDiagMsg *m)
 {
     const SmpDiagInfo *inf = smp_diag_info(m->code);
+    if (smp__muted(d, m->code)) return;
 
     switch (inf->sev) {
         case SMP_SEV_FATAL: d->n_fatal++; break;

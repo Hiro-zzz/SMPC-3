@@ -393,6 +393,37 @@ static void test_diag_own(void)
 }
 
 
+static void test_diag_mute(void)
+{
+    SECTION("заглушённые коды");
+
+    SmpSource src = { "t.smpc", g_src, sizeof(g_src) - 1u };
+    FILE *f = tmpfile();
+    CHECK(f != NULL, "tmpfile недоступен");
+    if (!f) return;
+
+    SmpDiagCtx D;
+    smp_diag_init(&D, &src, f);
+    CHECK(smp_diag_mute(&D, SMP_W0301), "предупреждение заглушить можно");
+    CHECK(!smp_diag_mute(&D, SMP_E0419), "фатальную ошибку заглушить нельзя");
+
+    smp_diag_emit(&D, &(SmpDiagMsg){ .code = SMP_W0301, .span = (SmpSpan){ 1, 1, 1 } });
+    CHECK(D.n_warn == 0, "заглушённое предупреждение посчитано: %u", D.n_warn);
+    CHECK(ftell(f) == 0, "заглушённое предупреждение напечатано");
+
+    /* Соседний код не задет, а фатальная ошибка проходит как была. */
+    smp_diag_emit(&D, &(SmpDiagMsg){ .code = SMP_W0512, .span = (SmpSpan){ 1, 1, 1 } });
+    smp_diag_emit(&D, &(SmpDiagMsg){ .code = SMP_E0419, .span = (SmpSpan){ 1, 1, 1 } });
+    CHECK(D.n_warn == 1 && D.n_fatal == 1, "warn=%u fatal=%u", D.n_warn, D.n_fatal);
+    CHECK(ftell(f) > 0, "незаглушённое не напечатано");
+
+    /* Новый контекст ничего не помнит. */
+    smp_diag_init(&D, &src, f);
+    smp_diag_emit(&D, &(SmpDiagMsg){ .code = SMP_W0301, .span = (SmpSpan){ 1, 1, 1 } });
+    CHECK(D.n_warn == 1, "после init W0301 всё ещё заглушён");
+    fclose(f);
+}
+
 int main(void)
 {
     smp_console_setup();
@@ -404,6 +435,7 @@ int main(void)
     test_diag();
     test_diag_pools();
     test_diag_own();
+    test_diag_mute();
 
     return REPORT();
 }
