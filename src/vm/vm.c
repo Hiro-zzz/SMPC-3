@@ -762,8 +762,11 @@ dispatch_switch:
         R[in->d] = R[in->a];
         VM_NEXT();
 
+    /* То же, что storet, но приёмник — вид в регистре: срез, смещение
+     * которого стало известно только на исполнении (sliced). */
+    VM_CASE(STORER)
     VM_CASE(STORET) {
-        const SmpTensor dt = mod->tens[in->k];
+        const SmpTensor dt = in->op == SMP_BC_STORER ? R[in->d].t : mod->tens[in->k];
         if (!R[in->a].is_tensor) {
             /* Скаляр в тензор: заполняем целиком. */
             if (!make_buf(vm, &bd, &dt)) return SMP_ERR_INTERNAL;

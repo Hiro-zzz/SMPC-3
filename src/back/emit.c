@@ -492,6 +492,13 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
     for (uint32_t i = 0; i < n_reads; i++)
         if (reads[i] == dest_sym) dest_is_read = true;
 
+    /* Приёмник со срезом по регистру: его дескриптор в таблице знает только
+     * статическую часть смещения, а вклад регистра добавляет sliced. */
+    bool dest_dyn = false;
+    if (in->dest_is_tensor && s->dest.tensor && s->dest.tensor->has_index)
+        for (uint32_t ax = 0; ax < s->dest.tensor->nidx; ax++)
+            if (s->dest.tensor->idx[ax].kind == SMP_IDX_REG) dest_dyn = true;
+
     /* --- источник --- */
     uint32_t r = load_value(m, &s->source, &in->src_val, flags, in->arena_id);
 
@@ -542,6 +549,13 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
             uint32_t t;
 
             if (last && in->dest_is_tensor && !dest_is_read &&
+                (in->dest_val.flags & SMP_TF_CONTIG) && dest_dyn) {
+                /* Пишем прямо в приёмник, но его смещение станет известно
+                 * только на исполнении: вид строит load_value. */
+                d = load_value(m, &s->dest, &in->dest_val, flags, in->arena_id);
+                m->reg_scratch[d] = true;
+                t = 0xFFFFFFFDu;
+            } else if (last && in->dest_is_tensor && !dest_is_read &&
                 (in->dest_val.flags & SMP_TF_CONTIG)) {
                 /* Пишем прямо в приёмник — копия в конце не понадобится. */
                 t = tens_for_value(m, &in->dest_val, in->arena_id);
@@ -553,7 +567,9 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
             }
 
             if (t == 0xFFFFFFFFu) return false;
-            if (t != 0xFFFFFFFEu) {
+            if (t == 0xFFFFFFFDu) {
+                /* вид приёмника уже в d */
+            } else if (t != 0xFFFFFFFEu) {
                 d = alloc_temp(m);
                 emit(m, SMP_BC_LOADT, flags, d, 0, 0, t);
                 m->reg_scratch[d] = true;
@@ -618,6 +634,12 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
     const bool wrote_direct = s->nstages && needs_buffer(lastk) &&
                               !dest_is_read && (in->dest_val.flags & SMP_TF_CONTIG);
     if (wrote_direct) return false;
+
+    if (dest_dyn) {
+        const uint32_t dr = load_value(m, &s->dest, &in->dest_val, flags, in->arena_id);
+        emit(m, SMP_BC_STORER, flags, dr, r, 0, 0);
+        return false;
+    }
 
     const uint32_t dt = tens_for_value(m, &in->dest_val, in->arena_id);
     if (dt == 0xFFFFFFFFu) return false;
