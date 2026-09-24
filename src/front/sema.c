@@ -1383,6 +1383,80 @@ void smp_sema_init(SmpSema *sm, SmpArena *arena, SmpDiagCtx *diag,
     }
 }
 
+/* ========================================================================== */
+/*  Виды                                                                      */
+/* ========================================================================== */
+
+/* Значение — тензор-символ целиком: не срез, не транспозиция. */
+static bool whole_sym(const SmpSemaResult *res, const SmpValue *v)
+{
+    if (v->is_scalar || v->sym == SMP_SYM_NONE) return false;
+    const SmpSym *s = &res->syms[v->sym];
+    return s->kind == SMP_SYM_TENSOR && v->byte_off == 0 &&
+           (v->flags & SMP_TF_CONTIG) && !(v->flags & SMP_TF_TRANSPOSED) &&
+           v->rank == s->val.rank &&
+           memcmp(v->shape, s->val.shape, sizeof v->shape[0] * v->rank) == 0;
+}
+
+/* Стадии, чей приёмник — регистр источника: они пишут в тензор, из которого
+ * инструкция начинается, а не в свой буфер. */
+static bool writes_source(SmpOpKind k)
+{
+    return k == SMP_OP_ALLOC || k == SMP_OP_FILL || k == SMP_OP_FILL_INST ||
+           k == SMP_OP_LOAD;
+}
+
+/* Тензор, который программа только загружает, не обязан лежать в арене:
+ * хранилище может отдать объект по адресу, и копировать сотни мегабайт весов
+ * на каждом прогоне незачем. Вид — тот, кого хоть раз загрузили целиком
+ * (*&W -> @load => *&W) и больше ничем не писали: ни приёмником, ни
+ * источником стадии, которая пишет на месте. Правило осторожное: всё
+ * сомнительное остаётся в арене, как было. Для видов раскладка арен
+ * пересчитывается без них; offset вида — в отдельном пространстве. */
+static void find_views(SmpSemaResult *res, const SmpAstProgram *prog)
+{
+    bool loaded[SMP_MAX_SYMS], spoiled[SMP_MAX_SYMS];
+    memset(loaded, 0, sizeof loaded);
+    memset(spoiled, 0, sizeof spoiled);
+
+    for (uint32_t i = 0; i < res->ninfo; i++) {
+        const SmpStmtInfo *in = &res->info[i];
+        const SmpAstStmt  *s  = &prog->stmts[i];
+        if (!in->ok) continue;
+
+        const uint32_t src = in->src_val.sym;
+        const bool pure_load =
+            s->nstages == 1 && in->ops[0] == SMP_OP_LOAD && whole_sym(res, &in->src_val) &&
+            (!in->dest_is_tensor ||
+             (in->dest_val.sym == src && whole_sym(res, &in->dest_val)));
+        if (pure_load) {
+            loaded[src] = true;
+            continue;
+        }
+
+        if (src != SMP_SYM_NONE)
+            for (uint32_t k = 0; k < s->nstages; k++)
+                if (writes_source(in->ops[k])) spoiled[src] = true;
+        if (in->dest_is_tensor && in->dest_val.sym != SMP_SYM_NONE)
+            spoiled[in->dest_val.sym] = true;
+    }
+
+    memset(res->arena_bytes, 0, sizeof res->arena_bytes);
+    res->view_bytes = 0;
+    uint32_t n_views = 0;
+    for (uint32_t i = 0; i < res->nsyms; i++) {
+        SmpSym *s = &res->syms[i];
+        if (s->kind != SMP_SYM_TENSOR || s->arena_id >= SMP_MAX_ARENAS) continue;
+
+        s->view = loaded[i] && !spoiled[i] && n_views < SMP_MAX_VIEWS;
+        n_views += s->view;
+        uint64_t *cursor = s->view ? &res->view_bytes : &res->arena_bytes[s->arena_id];
+        *cursor   = SMP_ALIGN_UP(*cursor, SMP_CACHELINE);
+        s->offset = *cursor;
+        *cursor  += s->bytes;
+    }
+}
+
 SmpStatus smp_sema_run(SmpSema *sm, const SmpAstProgram *prog, SmpSemaResult *res)
 {
     memset(res, 0, sizeof *res);
@@ -1408,6 +1482,8 @@ SmpStatus smp_sema_run(SmpSema *sm, const SmpAstProgram *prog, SmpSemaResult *re
         c.info->dest_sym = SMP_SYM_NONE;
         check_stmt(&c);
     }
+
+    find_views(res, prog);
 
     /* Записали и не прочитали — почти всегда опечатка в имени регистра. */
     for (uint32_t i = 0; i < res->nsyms; i++) {
@@ -1439,7 +1515,13 @@ void smp_sema_dump(FILE *out, const SmpSemaResult *res)
     for (uint32_t i = 0; i < res->nsyms; i++) {
         const SmpSym *s = &res->syms[i];
         char sig[80];
-        if (s->kind == SMP_SYM_TENSOR) {
+        if (s->kind == SMP_SYM_TENSOR && s->view) {
+            fprintf(out, "  *&%-8.*s вид      off=0x%08llX  %10llu Б  <%s>  %s  чт=%u зп=%u\n",
+                    (int)s->name.len, s->name.p, (unsigned long long)s->offset,
+                    (unsigned long long)s->bytes, val_sig(&s->val, sig, sizeof sig),
+                    s->initialized ? "инициализирован" : "ПУСТ",
+                    s->n_reads, s->n_writes);
+        } else if (s->kind == SMP_SYM_TENSOR) {
             fprintf(out, "  *&%-8.*s арена#%u  off=0x%08llX  %10llu Б  <%s>  %s  чт=%u зп=%u\n",
                     (int)s->name.len, s->name.p, s->arena_id, (unsigned long long)s->offset,
                     (unsigned long long)s->bytes, val_sig(&s->val, sig, sizeof sig),
@@ -1472,4 +1554,8 @@ void smp_sema_dump(FILE *out, const SmpSemaResult *res)
         fprintf(out, "  #%u  %llu байт (%.2f МиБ)\n", i,
                 (unsigned long long)res->arena_bytes[i],
                 (double)res->arena_bytes[i] / (1024.0 * 1024.0));
+    if (res->view_bytes)
+        fprintf(out, "  виды  %llu байт (%.2f МиБ) — память даёт @load\n",
+                (unsigned long long)res->view_bytes,
+                (double)res->view_bytes / (1024.0 * 1024.0));
 }

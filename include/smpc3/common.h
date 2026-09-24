@@ -32,6 +32,10 @@
  * старших бита flags дескриптора (см. types.h). */
 #define SMP_MAX_ARENAS 8u
 
+/* Сколько тензоров программы могут быть видами (sema.c, find_views). Сверх
+ * этого загружаемое остаётся в арене и копируется, как раньше. */
+#define SMP_MAX_VIEWS 64u
+
 #define SMP_ARRLEN(a)  (sizeof(a) / sizeof((a)[0]))
 #define SMP_MIN(a, b)  ((a) < (b) ? (a) : (b))
 #define SMP_MAX(a, b)  ((a) > (b) ? (a) : (b))

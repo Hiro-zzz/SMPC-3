@@ -61,7 +61,7 @@ static uint32_t fnv1a(const void *p, size_t n)
 /*  Запись                                                                    */
 /* ========================================================================== */
 
-#define S3B_N_SECTIONS 7u
+#define S3B_N_SECTIONS 8u
 
 typedef struct { const char *tag; const void *data; uint32_t size, count; } SecSrc;
 
@@ -74,7 +74,8 @@ SmpStatus smp_s3b_write(const SmpModule *m, const char *path)
         { "CODE", m->code,        (uint32_t)(m->n_code   * sizeof(SmpInstr)),   m->n_code    },
         { "STRS", m->strs,        m->strs_size,                                 m->strs_size },
         { "DBGL", m->dbg,         (uint32_t)(m->n_dbg    * sizeof(SmpDbgLine)), m->n_dbg     },
-        { "RNAM", m->reg_names,   (uint32_t)(m->n_reg_names * sizeof(uint32_t)), m->n_reg_names }
+        { "RNAM", m->reg_names,   (uint32_t)(m->n_reg_names * sizeof(uint32_t)), m->n_reg_names },
+        { "VIEW", &m->view_bytes, (uint32_t)sizeof(uint64_t),                   1u           }
     };
 
     const uint32_t hdr_size = (uint32_t)sizeof(SmpS3bHeader);
@@ -247,6 +248,9 @@ SmpStatus smp_s3b_read(SmpModule *m, const char *path, SmpArena *arena,
         } else if (memcmp(s->tag, "RNAM", 4) == 0) {
             if (s->count * sizeof(uint32_t) != s->size) goto bad_count;
             m->reg_names = (const uint32_t *)p; m->n_reg_names = s->count;
+        } else if (memcmp(s->tag, "VIEW", 4) == 0) {
+            if (s->count != 1u || s->size != sizeof(uint64_t)) goto bad_count;
+            memcpy(&m->view_bytes, p, sizeof m->view_bytes);
         }
         continue;
 
@@ -338,7 +342,10 @@ static void print_tensor(FILE *o, const SmpModule *m, uint32_t idx, bool color)
     fprintf(o, "%s<%s", smp_module_str(m, t->name_id), smp_dtype_name((SmpDType)t->dtype));
     for (uint32_t i = 0; i < t->rank; i++)
         fprintf(o, "%s%u", i ? "," : ":", (unsigned)t->shape[i]);
-    fprintf(o, "> a%u:0x%llX", smp_tf_arena(t->flags), (unsigned long long)t->off);
+    if (t->flags & SMP_TF_EXTERN)
+        fprintf(o, "> вид:0x%llX", (unsigned long long)t->off);
+    else
+        fprintf(o, "> a%u:0x%llX", smp_tf_arena(t->flags), (unsigned long long)t->off);
 }
 
 void smp_disasm(FILE *out, const SmpModule *m, bool color)
@@ -351,6 +358,9 @@ void smp_disasm(FILE *out, const SmpModule *m, bool color)
     for (uint32_t i = 0; i < m->n_arenas; i++)
         fprintf(out, "%s; арена #%u: %llu байт%s\n", dc(color, D_DIM), i,
                 (unsigned long long)m->arena_bytes[i], dc(color, D_RESET));
+    if (m->view_bytes)
+        fprintf(out, "%s; виды: %llu байт, память даёт @load%s\n", dc(color, D_DIM),
+                (unsigned long long)m->view_bytes, dc(color, D_RESET));
     fputc('\n', out);
 
     uint32_t last_line = 0;

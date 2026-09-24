@@ -150,10 +150,9 @@ void *smp_vm_pool_tensor(const SmpVMPool *p, uint32_t inst,
         const SmpTensor *t = &p->mod->tens[i];
         if (strcmp(smp_module_str(p->mod, t->name_id), name) != 0) continue;
 
-        const uint32_t a = smp_tf_arena(t->flags);
-        if (a >= p->inst[inst].n_arenas) return NULL;
-        if (desc) *desc = t;
-        return p->inst[inst].arenas[a].base + t->off;
+        void *data = (void *)(uintptr_t)smp_vm_tensor_data(&p->inst[inst], t);
+        if (data && desc) *desc = t;
+        return data;
     }
     return NULL;
 }

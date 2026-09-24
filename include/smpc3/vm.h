@@ -61,7 +61,23 @@ typedef struct SmpStore {
      * false — хранилищу не хватило места. */
     bool (*write)(void *ctx, const char *name, const SmpTensor *desc,
                   const void *src, uint64_t bytes);
+
+    /* Объект по адресу, без копии — для @load в вид (sema.h, SmpSym.view).
+     * Тип и форма к этому моменту сверены. NULL вместо функции — хранилище
+     * так не умеет, и VM держит копию видов сама. Адрес живёт, пока объект
+     * не заменили и не удалили: VM забывает его в начале каждого прогона,
+     * берёт заново на каждом @load и отпускает после @store того же имени.
+     * Писать по нему VM не станет. */
+    const void *(*map)(void *ctx, const char *name);
 } SmpStore;
+
+/* Вид, загруженный по адресу: чем стал тензор name_id на этом прогоне. */
+typedef struct SmpView {
+    uint32_t       name_id;
+    uint64_t       off;         /* смещение самого тензора в пространстве видов */
+    uint64_t       bytes;
+    const uint8_t *p;
+} SmpView;
 
 /* Регистр держит либо дескриптор тензора, либо скаляр. */
 typedef struct SmpReg {
@@ -110,6 +126,13 @@ typedef struct SmpVM {
     /* Хранилище вместо файлов; NULL — работают привязки. */
     const SmpStore *store;
 
+    /* Виды. У хранилища с map — адреса объектов, живут один прогон. Иначе
+     * — своя копия всего пространства видов, заводится перед первым
+     * прогоном, а @load заполняет её, как арену. */
+    SmpView   views[SMP_MAX_VIEWS];
+    uint32_t  n_views;
+    uint8_t  *view_mem;
+
     /* Рабочая память ядер — своя у каждого инстанса. Именно она делает
      * несколько VM в разных потоках безопасными. */
     void        *scratch_mem;
@@ -139,6 +162,11 @@ void      smp_vm_release(SmpVM *vm);
 /* Дамп регистров — тот самый, который спецификация обещает при фатальной
  * ошибке. Подходит под SmpRegDumpFn и ставится в диагностический контекст. */
 void      smp_vm_regdump(SmpDiagCtx *d, void *vm, bool color);
+
+/* Где лежат байты тензора: в арене, по адресу вида или в копии видов. NULL —
+ * негде (вид, который на этом прогоне ещё не загружали). Без проверок границ
+ * и без диагностики: для дампа и для хозяина после прогона. */
+const void *smp_vm_tensor_data(const SmpVM *vm, const SmpTensor *t);
 
 /* Показать содержимое именованных тензоров после прогона. */
 void      smp_vm_dump_tensors(FILE *out, const SmpVM *vm, uint32_t max_elems);

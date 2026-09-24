@@ -107,6 +107,11 @@ typedef struct SmpSym {
     uint32_t   n_reads;
     uint32_t   n_writes;
     SmpSpan    last_write;
+
+    /* Вид: программа тензор только загружает, целиком, и ничем больше не
+     * пишет. Места в арене у него нет — offset тогда в пространстве видов,
+     * а память даёт @load: хранилище по адресу либо копия у VM. */
+    bool       view;
 } SmpSym;
 
 /* --- Разобранная инструкция для Ф4 ---------------------------------------- */
@@ -142,6 +147,7 @@ typedef struct SmpSemaResult {
     uint32_t     ninfo;
     uint64_t     arena_bytes[SMP_MAX_ARENAS]; /* сколько занять на старте     */
     uint32_t     max_arena_id;
+    uint64_t     view_bytes;                  /* пространство видов           */
 } SmpSemaResult;
 
 typedef struct SmpSema {

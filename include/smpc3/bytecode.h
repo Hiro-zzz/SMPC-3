@@ -195,7 +195,7 @@ SMP_INLINE double smp_const_as_double(SmpConst c, uint8_t dtype)
 #define SMP_S3B_MAGIC3 0x33u  /* '3' */
 
 #define SMP_S3B_VER_MAJOR 0u
-#define SMP_S3B_VER_MINOR 2u
+#define SMP_S3B_VER_MINOR 3u
 
 enum SmpS3bFlags {
     SMP_S3B_LITTLE_ENDIAN = 1u << 0,
@@ -216,7 +216,8 @@ typedef struct SmpS3bHeader {
 SMP_STATIC_ASSERT(sizeof(SmpS3bHeader) == 32, s3b_header_is_32_bytes);
 
 typedef struct SmpS3bSection {
-    uint8_t  tag[4];        /* "AREN", "TENS", "CONS", "CODE", "STRS", "DBGL" */
+    uint8_t  tag[4];        /* "AREN", "TENS", "CONS", "CODE", "STRS", "DBGL",
+                               "RNAM", "VIEW"                                 */
     uint32_t offset;        /* от начала файла                                */
     uint32_t size;          /* байт                                           */
     uint32_t count;         /* элементов                                      */
@@ -246,6 +247,11 @@ typedef struct SmpModule {
 
     const uint64_t   *arena_bytes;
     uint32_t          n_arenas;
+
+    /* Пространство видов: тензоры с SMP_TF_EXTERN лежат не в арене, а там,
+     * куда их положил @load. Размер нужен, когда хранилище отдать объект по
+     * адресу не может и VM держит копию сама. */
+    uint64_t          view_bytes;
 
     const char       *strs;
     uint32_t          strs_size;

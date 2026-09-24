@@ -108,10 +108,8 @@ static const void *tensor_data(const char *name, const SmpTensor **out)
         const SmpTensor *t = &g_mod.tens[i];
         if (strcmp(smp_module_str(&g_mod, t->name_id), name) != 0) continue;
         /* Первый встреченный — полный вид: срезы добавляются позже. */
-        const uint32_t a = smp_tf_arena(t->flags);
-        if (a >= g_vm.n_arenas) return NULL;
         if (out) *out = t;
-        return g_vm.arenas[a].base + t->off;
+        return smp_vm_tensor_data(&g_vm, t);
     }
     return NULL;
 }
@@ -1082,6 +1080,123 @@ static void test_store(void)
     g_store = NULL;
 }
 
+/* Хранилище, которое отдаёт объект по адресу. */
+static uint32_t g_mapped;
+
+static const void *fake_map(void *ctx, const char *name)
+{
+    (void)ctx;
+    FakeObj *o = fake_find_obj(name);
+    g_mapped++;
+    return o ? o->data : NULL;
+}
+
+/* Объект W<f32:3,4> со значениями 0..11 прямо в хранилище. */
+static void put_w(float base)
+{
+    FakeObj *o = &g_objs[0];
+    memset(o, 0, sizeof *o);
+    snprintf(o->name, sizeof o->name, "W");
+    const uint32_t shape[2] = { 3, 4 };
+    smp_tensor_dense(&o->desc, SMP_DT_F32, 2, shape);
+    for (int i = 0; i < 12; i++) ((float *)o->data)[i] = base + (float)i;
+    o->bytes = 48;
+    o->used  = true;
+}
+
+/* Тензор, который программа только загружает, — вид: лежит там, где его
+ * держит хранилище, и не копируется ни на одном прогоне. */
+static void test_store_views(void)
+{
+    SECTION("виды: @load без копии");
+
+    static const SmpStore store = { NULL, fake_find, fake_read, fake_write, fake_map };
+    memset(g_objs, 0, sizeof g_objs);
+    g_store_full = false;
+    g_store      = &store;
+    g_n_binds    = 0;
+    put_w(0.0f);
+
+    static const char prog[] =
+        "[#arena:0] *&W<f32:3,4> -> @load => *&W;\n"
+        "2 => $i;\n"
+        "*&W[$i, ..] -> @reduce.add => $row;\n"
+        "*&W -> @reduce.add => $all;\n";
+
+    g_mapped = 0;
+    if (run_str(prog)) {
+        const SmpTensor *t = NULL;
+        CHECK(tensor_data("W", &t) == g_objs[0].data, "W — не адрес объекта хранилища");
+        CHECK(t && (t->flags & SMP_TF_EXTERN) && (t->flags & SMP_TF_READONLY),
+              "у W нет флагов вида");
+        CHECK(g_mod.view_bytes == 64, "видам отведено %llu байт, ждали 64",
+              (unsigned long long)g_mod.view_bytes);
+        CHECK(g_mod.arena_bytes[0] < 48, "W всё равно занял место в арене (%llu байт)",
+              (unsigned long long)g_mod.arena_bytes[0]);
+        CHECK(near(regval("row", NULL), 38.0), "строка 2 даёт %g, ждали 38",
+              regval("row", NULL));
+        CHECK(near(regval("all", NULL), 66.0), "сумма %g, ждали 66", regval("all", NULL));
+        CHECK(g_mapped == 1, "адрес брали %u раз, ждали 1", g_mapped);
+
+        /* Второй прогон той же VM видит объект, каким он стал: копии,
+         * которая могла бы устареть, нет. */
+        put_w(100.0f);
+        CHECK(smp_vm_run(&g_vm) == SMP_OK, "второй прогон упал");
+        CHECK(near(regval("all", NULL), 1266.0), "после замены объекта сумма %g, ждали 1266",
+              regval("all", NULL));
+        CHECK(g_mapped == 2, "на втором прогоне адрес не взяли заново");
+    }
+
+    /* --- в тензор пишут: остаётся в арене, объект хранилища цел --- */
+    put_w(0.0f);
+    if (run_str("[#arena:0] *&W<f32:3,4> -> @load => *&W;\n"
+                "*&W -> @scale(2.0) => *&W;\n"
+                "*&W -> @reduce.add => $all;\n")) {
+        const SmpTensor *t = NULL;
+        CHECK(tensor_data("W", &t) != g_objs[0].data, "W с записью стал видом");
+        CHECK(t && !(t->flags & SMP_TF_EXTERN), "W с записью помечен видом");
+        CHECK(near(regval("all", NULL), 132.0), "сумма %g, ждали 132", regval("all", NULL));
+        CHECK(((const float *)g_objs[0].data)[11] == 11.0f, "запись дошла до хранилища");
+    }
+    /* @fill пишет в свой источник, хоть приёмник и другой. */
+    if (run_str("[#arena:0] *&W<f32:3,4> -> @load => *&W;\n"
+                "*&W -> @fill(1.0) => *&Z<f32:3,4>;\n"
+                "*&Z -> @reduce.add => $z;\n")) {
+        const SmpTensor *t = NULL;
+        CHECK(tensor_data("W", &t) != g_objs[0].data, "источник @fill стал видом");
+        CHECK(((const float *)g_objs[0].data)[0] == 0.0f, "@fill дошёл до хранилища");
+    }
+
+    /* --- положить вид обратно и читать дальше --- */
+    if (run_str("[#arena:0] *&W<f32:3,4> -> @load => *&W;\n"
+                "*&W -> @store => $n;\n"
+                "*&W -> @reduce.add => $all;\n")) {
+        CHECK(near(regval("all", NULL), 66.0), "после @store сумма %g, ждали 66",
+              regval("all", NULL));
+    } else {
+        CHECK(0, "load -> store -> чтение упало: %s", g_out);
+    }
+
+    /* --- читать до @load: адреса нет --- */
+    CHECK(!run_str("[#arena:0] *&W<f32:3,4> -> @reduce.add => $a;\n"
+                   "*&W -> @load => *&W;\n"),
+          "чтение вида до @load обязано упасть");
+    CHECK(saw_code("E0611"), "нет E0611 при чтении вида до @load");
+
+    /* --- то же без адресов: копия у VM, ответы те же --- */
+    static const SmpStore copy = { NULL, fake_find, fake_read, fake_write, NULL };
+    g_store = &copy;
+    if (run_str(prog)) {
+        const SmpTensor *t = NULL;
+        const void *p = tensor_data("W", &t);
+        CHECK(p && p != g_objs[0].data, "без map вид обязан быть копией");
+        CHECK(near(regval("row", NULL), 38.0) && near(regval("all", NULL), 66.0),
+              "копия даёт %g и %g, ждали 38 и 66", regval("row", NULL), regval("all", NULL));
+    }
+
+    g_store = NULL;
+}
+
 /* Весь путь весов: квантовать, умножить @mmul.t, взять строку по номеру
  * из регистра и распаковать. Ожидания точные: распаковка q8_0 точна, а
  * суммы здесь — степени двойки на одно и то же число. */
@@ -1223,6 +1338,7 @@ int main(void)
     test_gemm_epilogue();
     test_fileio();
     test_store();
+    test_store_views();
     test_q8();
     test_nn_chain();
     test_attention();

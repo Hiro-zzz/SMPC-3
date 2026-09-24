@@ -153,6 +153,13 @@ static uint32_t tens_for_value(Em *m, const SmpValue *v, uint32_t fallback_arena
         base_off = s->offset;
         name_id  = intern_str_name(m, s->name);
         arena    = s->arena_id;
+        if (s->view) {
+            /* Вид и все его срезы: смещение — в пространстве видов, арена
+             * не при чём, писать нельзя. */
+            SmpValue vv = *v;
+            vv.flags |= SMP_TF_EXTERN | SMP_TF_READONLY;
+            return add_tens(m, &vv, base_off + v->byte_off, name_id, 0);
+        }
     }
     return add_tens(m, v, base_off + v->byte_off, name_id, arena);
 }
@@ -789,6 +796,7 @@ SmpStatus smp_emit(SmpEmitter *e, const SmpAstProgram *prog,
         ab[i] = SMP_ALIGN_UP(m.arena_peak[i], SMP_CACHELINE);
     out->arena_bytes = ab;
     out->n_arenas    = m.max_arena + 1u;
+    out->view_bytes  = SMP_ALIGN_UP(sema->view_bytes, SMP_CACHELINE);
 
     return e->n_errors ? SMP_ERR_INTERNAL : SMP_OK;
 }

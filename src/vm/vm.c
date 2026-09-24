@@ -76,6 +76,10 @@ void smp_vm_release(SmpVM *vm)
     vm->scratch_bytes = 0;
     memset(&vm->scratch, 0, sizeof vm->scratch);
 
+    if (vm->view_mem) smp_plat_pages_free(vm->view_mem, (size_t)vm->mod->view_bytes);
+    vm->view_mem = NULL;
+    vm->n_views  = 0;
+
     vm->live = false;
 }
 
@@ -177,10 +181,82 @@ void smp_vm_regdump(SmpDiagCtx *d, void *user, bool color)
 /*  Доступ к памяти                                                           */
 /* ========================================================================== */
 
+static SmpView *view_find(SmpVM *vm, uint32_t name_id)
+{
+    for (uint32_t i = 0; i < vm->n_views; i++)
+        if (vm->views[i].name_id == name_id) return &vm->views[i];
+    return NULL;
+}
+
+/* @store заменил объект под именем вида. Адрес берётся заново, если объект
+ * остался того же размера (*&W -> @load => *&W; *&W -> @store => $n;), а
+ * иначе забывается: читать вид дальше можно только после нового @load. */
+static void view_remap(SmpVM *vm, uint32_t name_id)
+{
+    SmpView *v = view_find(vm, name_id);
+    if (!v) return;
+
+    const SmpStore *st   = vm->store;
+    const char     *name = smp_module_str(vm->mod, name_id);
+    SmpTensor have;
+    memset(&have, 0, sizeof have);
+    const void *p = NULL;
+    if (st && st->map && st->find(st->ctx, name, &have)) {
+        uint64_t n = 1;
+        for (uint32_t i = 0; i < have.rank; i++) n *= have.shape[i];
+        if (smp_dtype_bytes((SmpDType)have.dtype, n) == v->bytes) p = st->map(st->ctx, name);
+    }
+    if (p) v->p = (const uint8_t *)p;
+    else   *v = vm->views[--vm->n_views];
+}
+
+/* Вид или его срез: по адресу, который отдало хранилище, либо в своей копии
+ * пространства видов. span — сколько байт от t->off занимает тензор. */
+static void *view_base(SmpVM *vm, const SmpTensor *t, uint64_t span)
+{
+    const char    *name = smp_module_str(vm->mod, t->name_id);
+    const SmpView *v    = view_find(vm, t->name_id);
+    if (v) {
+        if (t->off < v->off || t->off - v->off > v->bytes || span > v->bytes - (t->off - v->off)) {
+            vm_fatal(vm, SMP_E0410,
+                     vfmt(vm, "Срез вида '%s' требует байт до %llu, а объект занимает %llu.",
+                          name, (unsigned long long)(t->off - v->off + span),
+                          (unsigned long long)v->bytes), NULL);
+            return NULL;
+        }
+        return (void *)(uintptr_t)(v->p + (t->off - v->off));
+    }
+    if (vm->view_mem) {
+        if (t->off + span > vm->mod->view_bytes) {
+            vm_fatal(vm, SMP_E0410,
+                     vfmt(vm, "Вид '%s' требует байт до %llu, а видам отведено %llu.",
+                          name, (unsigned long long)(t->off + span),
+                          (unsigned long long)vm->mod->view_bytes), NULL);
+            return NULL;
+        }
+        return vm->view_mem + t->off;
+    }
+    vm_fatal(vm, SMP_E0611,
+             vfmt(vm, "Вид '%s' читают, а адреса у него на этом прогоне нет: @load "
+                      "его ещё не было, либо объект с тех пор заменили через @store.",
+                  name),
+             vfmt(vm, "Поставь *&%s -> @load => *&%s; до первого чтения.", name, name));
+    return NULL;
+}
+
 /* Указатель на первый элемент тензора с проверкой границ арены.
  * NULL означает, что диагностика уже выдана. */
 static void *tensor_base(SmpVM *vm, const SmpTensor *t)
 {
+    /* Самый дальний элемент по шагам — именно он, а не nelem*esz, задаёт
+     * реальный хвост у среза с шагом. */
+    uint64_t last = 0;
+    for (uint32_t i = 0; i < t->rank; i++)
+        last += (uint64_t)(t->shape[i] ? t->shape[i] - 1u : 0u) * t->stride[i];
+    const uint64_t span = smp_dtype_bytes((SmpDType)t->dtype, last + 1u);
+
+    if (t->flags & SMP_TF_EXTERN) return view_base(vm, t, span);
+
     const uint32_t a = smp_tf_arena(t->flags);
     if (a >= vm->n_arenas) {
         vm_fatal(vm, SMP_E0604,
@@ -189,13 +265,7 @@ static void *tensor_base(SmpVM *vm, const SmpTensor *t)
         return NULL;
     }
 
-    /* Самый дальний элемент по шагам — именно он, а не nelem*esz, задаёт
-     * реальный хвост у среза с шагом. */
-    uint64_t last = 0;
-    for (uint32_t i = 0; i < t->rank; i++)
-        last += (uint64_t)(t->shape[i] ? t->shape[i] - 1u : 0u) * t->stride[i];
-    const uint64_t need = t->off + smp_dtype_bytes((SmpDType)t->dtype, last + 1u);
-
+    const uint64_t need = t->off + span;
     if (need > vm->arenas[a].cap) {
         vm_fatal(vm, SMP_E0410,
                  vfmt(vm, "Тензор требует байт до %llu, а арена #%u занимает %zu.\n"
@@ -211,6 +281,21 @@ static bool make_buf(SmpVM *vm, SmpBuf *b, const SmpTensor *t)
     b->t = t;
     b->p = tensor_base(vm, t);
     return b->p != NULL;
+}
+
+/* Буфер, в который инструкция пишет. Вид смотрит в чужую память — в объект
+ * хранилища, — и компилятор видом делает только то, во что программа не
+ * пишет. Сюда доходит лишь собранный вручную или испорченный байткод. */
+static bool make_dst(SmpVM *vm, SmpBuf *b, const SmpTensor *t)
+{
+    if (t->flags & SMP_TF_EXTERN) {
+        const char *name = smp_module_str(vm->mod, t->name_id);
+        vm_fatal(vm, SMP_E0612,
+                 vfmt(vm, "Инструкция пишет в '%s', а это вид: он только для чтения.", name),
+                 NULL);
+        return false;
+    }
+    return make_buf(vm, b, t);
 }
 
 /* ========================================================================== */
@@ -365,9 +450,9 @@ static bool same_kind(const SmpTensor *a, const SmpTensor *b)
     return true;
 }
 
-/* Как у файла — прямо в арену. Но сверяется не размер, а тип и форма: объект
+/* Есть ли объект и тот ли он. Сверяется не размер, а тип и форма: объект
  * хранилища их помнит, и различать f32:8 и f64:4 здесь есть чем. */
-static bool store_load(SmpVM *vm, const SmpTensor *t, const SmpBuf *buf)
+static bool store_check(SmpVM *vm, const SmpTensor *t)
 {
     const SmpStore *st   = vm->store;
     const char     *name = smp_module_str(vm->mod, t->name_id);
@@ -389,7 +474,37 @@ static bool store_load(SmpVM *vm, const SmpTensor *t, const SmpBuf *buf)
                  NULL);
         return false;
     }
-    st->read(st->ctx, name, buf->p, smp_tensor_bytes(t));
+    return true;
+}
+
+/* Как у файла — прямо в арену. */
+static bool store_load(SmpVM *vm, const SmpTensor *t, const SmpBuf *buf)
+{
+    if (!store_check(vm, t)) return false;
+    vm->store->read(vm->store->ctx, smp_module_str(vm->mod, t->name_id),
+                    buf->p, smp_tensor_bytes(t));
+    return true;
+}
+
+/* Вид: адрес объекта вместо копии. Держится до конца прогона, до @store
+ * того же имени или до следующего @load. */
+static bool store_map(SmpVM *vm, const SmpTensor *t)
+{
+    if (!store_check(vm, t)) return false;
+
+    const char *name = smp_module_str(vm->mod, t->name_id);
+    const void *p    = vm->store->map(vm->store->ctx, name);
+    SmpView    *v    = view_find(vm, t->name_id);
+    if (!p || (!v && vm->n_views == SMP_MAX_VIEWS)) {
+        vm_fatal(vm, SMP_E0611,
+                 vfmt(vm, "Хранилище нашло '%s', но адреса не дало.", name), NULL);
+        return false;
+    }
+    if (!v) v = &vm->views[vm->n_views++];
+    v->name_id = t->name_id;
+    v->off     = t->off;
+    v->bytes   = smp_tensor_bytes(t);
+    v->p       = (const uint8_t *)p;
     return true;
 }
 
@@ -503,7 +618,7 @@ static bool vm_fuse(SmpVM *vm, const SmpInstr **ipp, const SmpInstr *first)
      * показывал бы первую инструкцию цепочки, а пользователь читал бы про
      * @reduce.add рядом с опкодом relu. */
     if (!make_buf(vm, &src, &R[first->a].t)) return true;
-    if (!tail && !make_buf(vm, &dst, &R[chain[n - 1u]->d].t)) return true;
+    if (!tail && !make_dst(vm, &dst, &R[chain[n - 1u]->d].t)) return true;
 
     for (uint32_t i = 0; i < n; i++) {
         const SmpInstr *c = chain[i];
@@ -634,7 +749,7 @@ static bool vm_fuse_gemm(SmpVM *vm, const SmpInstr **ipp, const SmpInstr *first)
 
     /* Дальше отказы фатальные: диагностика выдана, повторять работу обычным
      * путём не нужно — отсюда true, а не false. */
-    if (!make_buf(vm, &dst, tc) ||
+    if (!make_dst(vm, &dst, tc) ||
         !make_buf(vm, &ba,  ta) ||
         !make_buf(vm, &bb,  tb)) return true;
 
@@ -683,6 +798,15 @@ SmpStatus smp_vm_run(SmpVM *vm)
      * быть поднят на одном потоке, а исполняться на другом. */
     vm->entry_mxcsr = smp_fpu_get_mxcsr();
     vm->cur_fp_flags = 0;
+
+    /* Адреса видов живут один прогон: между прогонами хозяин мог заменить
+     * или удалить объект. Хранилищу без адресов — своя копия, заводится
+     * здесь, до первой инструкции, и остаётся до smp_vm_release. */
+    vm->n_views = 0;
+    if (vm->mod->view_bytes && !vm->view_mem && !(vm->store && vm->store->map)) {
+        vm->view_mem = (uint8_t *)smp_plat_pages((size_t)vm->mod->view_bytes);
+        if (!vm->view_mem) return SMP_ERR_OOM;
+    }
 
     const SmpModule *mod  = vm->mod;
     const SmpInstr  *code = mod->code;
@@ -767,11 +891,14 @@ dispatch_switch:
         const SmpTensor dt = in->op == SMP_BC_STORER ? R[in->d].t : mod->tens[in->k];
         if (!R[in->a].is_tensor) {
             /* Скаляр в тензор: заполняем целиком. */
-            if (!make_buf(vm, &bd, &dt)) return SMP_ERR_INTERNAL;
+            if (!make_dst(vm, &bd, &dt)) return SMP_ERR_INTERNAL;
             smp_k_fill(&bd, R[in->a].s.f);
             VM_NEXT();
         }
-        if (!make_buf(vm, &bd, &dt) || !make_buf(vm, &ba, &R[in->a].t))
+        /* Тензор в самого себя — так кончается *&W -> @load => *&W. Копировать
+         * нечего, а у вида и некуда. */
+        if (memcmp(&dt, &R[in->a].t, sizeof dt) == 0) VM_NEXT();
+        if (!make_dst(vm, &bd, &dt) || !make_buf(vm, &ba, &R[in->a].t))
             return SMP_ERR_INTERNAL;
         smp_k_copy(&bd, &ba);
         VM_NEXT();
@@ -814,18 +941,18 @@ dispatch_switch:
 
     VM_CASE(ALLOC)
         if (!R[in->d].is_tensor) VM_NEXT();
-        if (!make_buf(vm, &bd, &R[in->d].t)) return SMP_ERR_INTERNAL;
+        if (!make_dst(vm, &bd, &R[in->d].t)) return SMP_ERR_INTERNAL;
         smp_k_zero(&bd);
         VM_NEXT();
 
     VM_CASE(FILL)
         apply_fp(vm, in->flags);
-        if (!make_buf(vm, &bd, &R[in->d].t)) return SMP_ERR_INTERNAL;
+        if (!make_dst(vm, &bd, &R[in->d].t)) return SMP_ERR_INTERNAL;
         smp_k_fill(&bd, smp_const_as_double(mod->consts[in->k], in->aux));
         VM_NEXT();
 
     VM_CASE(FILLI)
-        if (!make_buf(vm, &bd, &R[in->d].t)) return SMP_ERR_INTERNAL;
+        if (!make_dst(vm, &bd, &R[in->d].t)) return SMP_ERR_INTERNAL;
         smp_k_fill(&bd, (double)vm->instance);
         VM_NEXT();
 
@@ -834,6 +961,13 @@ dispatch_switch:
             vm_fatal(vm, SMP_E0606, "@load ждёт тензор, а в регистре скаляр.", NULL);
             return SMP_ERR_INTERNAL;
         }
+        /* Вид у хранилища с адресами: не копия, а адрес объекта. */
+        if ((R[in->d].t.flags & SMP_TF_EXTERN) && vm->store && vm->store->map) {
+            if (!store_map(vm, &R[in->d].t)) return SMP_ERR_INTERNAL;
+            VM_NEXT();
+        }
+        /* Иначе — байты в арену либо в свою копию видов: единственное
+         * место, где вид пишется. */
         if (!make_buf(vm, &bd, &R[in->d].t)) return SMP_ERR_INTERNAL;
         if (!(vm->store ? store_load(vm, &R[in->d].t, &bd)
                         : file_load(vm, &R[in->d].t, &bd))) return SMP_ERR_INTERNAL;
@@ -848,6 +982,9 @@ dispatch_switch:
         uint64_t put = 0;
         if (!(vm->store ? store_store(vm, &R[in->a].t, &ba, &put)
                         : file_store(vm, &R[in->a].t, &ba, &put))) return SMP_ERR_INTERNAL;
+        /* Объект под этим именем хранилище только что заменило: прежний
+         * адрес вида больше не его. */
+        view_remap(vm, R[in->a].t.name_id);
 
         /* Отдаём число записанных байт — ровно так же, как @emit отдаёт число
          * выведенных элементов. Отдельной операции без результата в языке нет. */
@@ -866,7 +1003,7 @@ dispatch_switch:
         if (SMP_UNLIKELY(in->flags & SMP_IF_FUSE) && vm_fuse_gemm(vm, &ip, in))
             VM_NEXT();
         apply_fp(vm, in->flags);
-        if (!make_buf(vm, &bd, &R[in->d].t) ||
+        if (!make_dst(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t) ||
             !make_buf(vm, &bb, &R[in->b].t)) return SMP_ERR_INTERNAL;
         smp_k_gemm(&bd, &ba, &bb, &vm->scratch);
@@ -874,7 +1011,7 @@ dispatch_switch:
 
     VM_CASE(SUB)
         apply_fp(vm, in->flags);
-        if (!make_buf(vm, &bd, &R[in->d].t) ||
+        if (!make_dst(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t) ||
             !make_buf(vm, &bb, &R[in->b].t)) return SMP_ERR_INTERNAL;
         smp_k_sub(&bd, &ba, &bb);
@@ -882,14 +1019,14 @@ dispatch_switch:
 
     VM_CASE(SILU)
         apply_fp(vm, in->flags);
-        if (!make_buf(vm, &bd, &R[in->d].t) ||
+        if (!make_dst(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t)) return SMP_ERR_INTERNAL;
         smp_k_silu(&bd, &ba);
         VM_NEXT();
 
     VM_CASE(RMSN)
         apply_fp(vm, in->flags);
-        if (!make_buf(vm, &bd, &R[in->d].t) ||
+        if (!make_dst(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t)) return SMP_ERR_INTERNAL;
         smp_k_rmsnorm(&bd, &ba, smp_const_as_double(mod->consts[in->k], in->aux));
         VM_NEXT();
@@ -903,7 +1040,7 @@ dispatch_switch:
             len = n >= 1.8e19 ? UINT64_MAX : n >= 0.0 ? (uint64_t)n : 0u;
         }
         apply_fp(vm, in->flags);
-        if (!make_buf(vm, &bd, &R[in->d].t) ||
+        if (!make_dst(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t)) return SMP_ERR_INTERNAL;
         smp_k_softmax(&bd, &ba, len);
         VM_NEXT();
@@ -918,7 +1055,7 @@ dispatch_switch:
             return SMP_ERR_INTERNAL;
         }
         apply_fp(vm, in->flags);
-        if (!make_buf(vm, &bd, &R[in->d].t) ||
+        if (!make_dst(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t)) return SMP_ERR_INTERNAL;
         smp_k_rope(&bd, &ba, pos, smp_const_as_double(mod->consts[in->k], in->aux));
         VM_NEXT();
@@ -951,7 +1088,7 @@ dispatch_switch:
 
     VM_CASE(MMULT)
         apply_fp(vm, in->flags);
-        if (!make_buf(vm, &bd, &R[in->d].t) ||
+        if (!make_dst(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t) ||
             !make_buf(vm, &bb, &R[in->b].t)) return SMP_ERR_INTERNAL;
         smp_k_mmul_t(&bd, &ba, &bb, &vm->scratch);
@@ -969,7 +1106,7 @@ dispatch_switch:
     }
 
     VM_CASE(PACK)
-        if (!make_buf(vm, &bd, &R[in->d].t) ||
+        if (!make_dst(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t)) return SMP_ERR_INTERNAL;
         smp_k_copy(&bd, &ba);
         VM_NEXT();
@@ -978,7 +1115,7 @@ dispatch_switch:
         if (SMP_UNLIKELY(in->flags & SMP_IF_FUSE) && vm_fuse(vm, &ip, in))
             VM_NEXT();
         apply_fp(vm, in->flags);
-        if (!make_buf(vm, &bd, &R[in->d].t) ||
+        if (!make_dst(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t)) return SMP_ERR_INTERNAL;
         smp_k_relu(&bd, &ba);
         VM_NEXT();
@@ -987,7 +1124,7 @@ dispatch_switch:
         if (SMP_UNLIKELY(in->flags & SMP_IF_FUSE) && vm_fuse(vm, &ip, in))
             VM_NEXT();
         apply_fp(vm, in->flags);
-        if (!make_buf(vm, &bd, &R[in->d].t) ||
+        if (!make_dst(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t)) return SMP_ERR_INTERNAL;
         smp_k_abs(&bd, &ba);
         VM_NEXT();
@@ -996,7 +1133,7 @@ dispatch_switch:
         if (SMP_UNLIKELY(in->flags & SMP_IF_FUSE) && vm_fuse(vm, &ip, in))
             VM_NEXT();
         apply_fp(vm, in->flags);
-        if (!make_buf(vm, &bd, &R[in->d].t) ||
+        if (!make_dst(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t)) return SMP_ERR_INTERNAL;
         smp_k_scale(&bd, &ba, smp_const_as_double(mod->consts[in->k], in->aux));
         VM_NEXT();
@@ -1005,7 +1142,7 @@ dispatch_switch:
         if (SMP_UNLIKELY(in->flags & SMP_IF_FUSE) && vm_fuse(vm, &ip, in))
             VM_NEXT();
         apply_fp(vm, in->flags);
-        if (!make_buf(vm, &bd, &R[in->d].t) ||
+        if (!make_dst(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t) ||
             !make_buf(vm, &bb, &R[in->b].t)) return SMP_ERR_INTERNAL;
         smp_k_add(&bd, &ba, &bb);
@@ -1015,7 +1152,7 @@ dispatch_switch:
         if (SMP_UNLIKELY(in->flags & SMP_IF_FUSE) && vm_fuse(vm, &ip, in))
             VM_NEXT();
         apply_fp(vm, in->flags);
-        if (!make_buf(vm, &bd, &R[in->d].t) ||
+        if (!make_dst(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t) ||
             !make_buf(vm, &bb, &R[in->b].t)) return SMP_ERR_INTERNAL;
         smp_k_mul(&bd, &ba, &bb);
@@ -1117,7 +1254,7 @@ dispatch_switch:
             R[in->d].dtype     = (uint8_t)to;
             VM_NEXT();
         }
-        if (!make_buf(vm, &bd, &R[in->d].t) ||
+        if (!make_dst(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t)) return SMP_ERR_INTERNAL;
         smp_k_cast(&bd, &ba);
         VM_NEXT();
@@ -1138,6 +1275,20 @@ dispatch_switch:
 /* ========================================================================== */
 /*  Печать результатов                                                        */
 /* ========================================================================== */
+
+const void *smp_vm_tensor_data(const SmpVM *vm, const SmpTensor *t)
+{
+    if (t->flags & SMP_TF_EXTERN) {
+        for (uint32_t i = 0; i < vm->n_views; i++) {
+            const SmpView *v = &vm->views[i];
+            if (v->name_id == t->name_id && t->off >= v->off)
+                return v->p + (t->off - v->off);
+        }
+        return vm->view_mem ? vm->view_mem + t->off : NULL;
+    }
+    const uint32_t a = smp_tf_arena(t->flags);
+    return a < vm->n_arenas ? vm->arenas[a].base + t->off : NULL;
+}
 
 void smp_vm_dump_tensors(FILE *out, const SmpVM *vm, uint32_t max_elems)
 {
@@ -1166,13 +1317,12 @@ void smp_vm_dump_tensors(FILE *out, const SmpVM *vm, uint32_t max_elems)
                 is_view = true;
         if (is_view) continue;
 
-        const uint32_t a = smp_tf_arena(t->flags);
-        if (a >= vm->n_arenas) continue;
+        const uint8_t *base = (const uint8_t *)smp_vm_tensor_data(vm, t);
+        if (!base) continue;
 
         char sig[80];
         fprintf(out, "*&%-11s <%s>  ", name, smp_tensor_sig(t, sig, sizeof sig));
 
-        const uint8_t *base = vm->arenas[a].base + t->off;
         const uint32_t n    = t->nelem < max_elems ? t->nelem : max_elems;
         fputc('[', out);
         for (uint32_t e = 0; e < n; e++) {
