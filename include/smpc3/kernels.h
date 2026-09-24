@@ -128,6 +128,29 @@ void smp_k_gemm_ep(const SmpBuf *c, const SmpBuf *a, const SmpBuf *b,
                    SmpKScratch *scratch,
                    const SmpFuseStep *steps, uint32_t nsteps);
 
+/* --- Умножение на транспонированную и Q8_0 --------------------------------
+ *
+ * C[M,N] = A[M,K] x B[N,K]^T — линейный слой: веса лежат строками выхода.
+ * B в f32 или f64 умножается обычным GEMM по транспонированному виду. B в
+ * q8_0 распаковывается на лету, в регистрах; A и C тогда f32. Векторная
+ * ветка делит строки B между потоками рабочей памяти (scratch->sets): каждый
+ * выход считает ровно один поток в одном и том же порядке, так что результат
+ * бит в бит тот же, что на одном потоке. */
+void smp_k_mmul_t(const SmpBuf *c, const SmpBuf *a, const SmpBuf *b,
+                  SmpKScratch *scratch);
+
+/* Ниже этого M*N*K раздача строк q8_0 потокам не окупается. */
+void smp_k_gemm_q8_par_min(uint64_t work);
+
+/* Половинная точность: к ближайшему, при равенстве — к чётному. */
+float    smp_f16_to_f32(uint16_t h);
+uint16_t smp_f32_to_f16(float f);
+
+/* n кратно SMP_Q8_0_BLOCK. Квантование — как эталонное в GGUF. */
+void  smp_q8_0_quantize(void *dst, const float *src, size_t n);
+void  smp_q8_0_dequantize(float *dst, const void *src, size_t n);
+float smp_q8_0_get(const void *src, size_t i);
+
 /* --- Блокировка GEMM -------------------------------------------------------
  *
  * Упаковка панелей A и B имеет смысл ровно пока обе держатся в L2. Значения по

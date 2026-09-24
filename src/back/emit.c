@@ -165,7 +165,7 @@ static uint32_t tens_scratch(Em *m, const SmpValue *v, uint32_t arena_id)
     uint64_t nelem = 1;
     for (uint32_t i = 0; i < v->rank; i++) nelem *= v->shape[i];
     if (v->rank == 0) nelem = 1;
-    const uint64_t sz = nelem * smp_dtype_size(v->dtype);
+    const uint64_t sz = smp_dtype_bytes(v->dtype, nelem);
 
     uint64_t *cur = &m->arena_bytes[arena_id];
     *cur = SMP_ALIGN_UP(*cur, SMP_CACHELINE);
@@ -284,7 +284,6 @@ static uint32_t load_value(Em *m, const SmpAstOperand *o, const SmpValue *v,
     const SmpAstTensor *at = o->tensor;
     if (at && at->has_index && v->sym != SMP_SYM_NONE) {
         const SmpSym  *base = &m->sema->syms[v->sym];
-        const uint32_t esz  = smp_dtype_size(base->val.dtype);
         for (uint32_t ax = 0; ax < at->nidx; ax++) {
             if (at->idx[ax].kind != SMP_IDX_REG) continue;
 
@@ -298,7 +297,8 @@ static uint32_t load_value(Em *m, const SmpAstOperand *o, const SmpValue *v,
                 }
             }
             if (!found) continue;
-            const uint64_t stride_bytes = (uint64_t)base->val.stride[ax] * esz;
+            const uint64_t stride_bytes =
+                smp_dtype_bytes(base->val.dtype, base->val.stride[ax]);
             emit_aux(m, SMP_BC_SLICED, flags, r, r, ridx,
                      const_u64(m, stride_bytes), (uint8_t)SMP_DT_U64);
         }
@@ -320,6 +320,7 @@ static SmpOpcode op_to_bc(SmpOpKind k)
         case SMP_OP_LOAD:       return SMP_BC_LOAD;
         case SMP_OP_STORE:      return SMP_BC_STORE;
         case SMP_OP_MMUL:       return SMP_BC_MMUL;
+        case SMP_OP_MMUL_T:     return SMP_BC_MMULT;
         case SMP_OP_TRANSPOSE:  return SMP_BC_TRANS;
         case SMP_OP_PACK:       return SMP_BC_PACK;
         case SMP_OP_RELU:       return SMP_BC_RELU;
@@ -338,6 +339,7 @@ static SmpOpcode op_to_bc(SmpOpKind k)
         case SMP_OP_CAST_F32:   return SMP_BC_CVTF32;
         case SMP_OP_CAST_F64:   return SMP_BC_CVTF64;
         case SMP_OP_CAST_I32:   return SMP_BC_CVTI32;
+        case SMP_OP_CAST_Q8_0:  return SMP_BC_CVTQ80;
         default:                return SMP_BC_CVTU64;
     }
 }
@@ -346,14 +348,29 @@ static SmpOpcode op_to_bc(SmpOpKind k)
 static bool needs_buffer(SmpOpKind k)
 {
     switch (k) {
-        case SMP_OP_MMUL: case SMP_OP_PACK:
+        case SMP_OP_MMUL: case SMP_OP_MMUL_T: case SMP_OP_PACK:
         case SMP_OP_CAST_F32: case SMP_OP_CAST_F64:
-        case SMP_OP_CAST_I32: case SMP_OP_CAST_U64:
+        case SMP_OP_CAST_I32: case SMP_OP_CAST_U64: case SMP_OP_CAST_Q8_0:
         case SMP_OP_RELU: case SMP_OP_ABS: case SMP_OP_SCALE:
         case SMP_OP_ADD:  case SMP_OP_MUL:
             return true;
         default:
             return false;   /* alloc, fill, transpose, reduce — на месте */
+    }
+}
+
+/* Может ли стадия писать поверх своего входа. Умножение читает вход много
+ * раз, упаковка ради копии и заведена, а приведение меняет размер элемента:
+ * f32 в f64 не помещается в буфер f32, а q8_0 — вообще другая раскладка. */
+static bool in_place_ok(SmpOpKind k)
+{
+    switch (k) {
+        case SMP_OP_MMUL: case SMP_OP_MMUL_T: case SMP_OP_PACK:
+        case SMP_OP_CAST_F32: case SMP_OP_CAST_F64:
+        case SMP_OP_CAST_I32: case SMP_OP_CAST_U64: case SMP_OP_CAST_Q8_0:
+            return false;
+        default:
+            return true;
     }
 }
 
@@ -559,7 +576,7 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
                 (in->dest_val.flags & SMP_TF_CONTIG)) {
                 /* Пишем прямо в приёмник — копия в конце не понадобится. */
                 t = tens_for_value(m, &in->dest_val, in->arena_id);
-            } else if (m->reg_scratch[a] && k != SMP_OP_MMUL && k != SMP_OP_PACK) {
+            } else if (m->reg_scratch[a] && in_place_ok(k)) {
                 /* Вход уже наш временный буфер нужной формы — работаем на месте. */
                 t = 0xFFFFFFFEu;
             } else {

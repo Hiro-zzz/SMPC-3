@@ -631,3 +631,46 @@ void smp_ka_gemm(float *C, size_t ldc, const float *A, size_t lda,
 {
     smp_ka_gemm_ep(C, ldc, A, lda, B, ldb, M, N, K, apack, bpack, NULL, 0u, 0u, N);
 }
+
+/* ========================================================================== */
+/*  C = A x W^T, W в q8_0                                                     */
+/* ========================================================================== */
+
+/* Восемь весов i8 в восемь f32: расширение знаком и преобразование точны. */
+static __m256 q8_lo8(const int8_t *q)
+{
+    return _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)q)));
+}
+
+/* Строки W с n0 по n1. Каждый выход считается одним проходом по своей
+ * строке весов: внутри блока — сумма x*q в четыре FMA, затем она один раз
+ * умножается на масштаб. При генерации M = 1, и вся работа — один проход по
+ * весам, который упирается в память; распакованные веса никуда не пишутся. */
+void smp_ka_gemm_q8(float *C, size_t ldc, const float *A, size_t lda,
+                    const uint8_t *W, size_t M, size_t K, size_t n0, size_t n1)
+{
+    const size_t nb  = K / SMP_Q8_0_BLOCK;
+    const size_t row = nb * SMP_Q8_0_BYTES;
+
+    for (size_t n = n0; n < n1; n++) {
+        const uint8_t *w = W + n * row;
+        for (size_t m = 0; m < M; m++) {
+            const float *a   = A + m * lda;
+            __m256       acc = _mm256_setzero_ps();
+            for (size_t b = 0; b < nb; b++) {
+                const uint8_t *blk = w + b * SMP_Q8_0_BYTES;
+                const int8_t  *q   = (const int8_t *)(blk + 2);
+                const float   *x   = a + b * SMP_Q8_0_BLOCK;
+                uint16_t h;
+                memcpy(&h, blk, sizeof h);
+
+                __m256 s = _mm256_mul_ps(_mm256_loadu_ps(x), q8_lo8(q));
+                s = _mm256_fmadd_ps(_mm256_loadu_ps(x +  8), q8_lo8(q +  8), s);
+                s = _mm256_fmadd_ps(_mm256_loadu_ps(x + 16), q8_lo8(q + 16), s);
+                s = _mm256_fmadd_ps(_mm256_loadu_ps(x + 24), q8_lo8(q + 24), s);
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(smp_f16_to_f32(h)), s, acc);
+            }
+            C[m * ldc + n] = hsum256(acc);
+        }
+    }
+}

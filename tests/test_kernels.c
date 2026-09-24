@@ -610,6 +610,185 @@ static void test_gemm_parallel(void)
 }
 
 /* ========================================================================== */
+/*  Q8_0                                                                      */
+/* ========================================================================== */
+
+static uint8_t SMP_ALIGNED(64) g_q[MAXN / SMP_Q8_0_BLOCK * SMP_Q8_0_BYTES];
+
+static bool f16_nan(uint16_t h) { return (h & 0x7C00u) == 0x7C00u && (h & 0x3FFu); }
+
+/* Всякое f16 переживает круг f16 -> f32 -> f16, а f32 -> f16 даёт ближайшее
+ * представимое, при равенстве — с чётной мантиссой. */
+static void test_f16(void)
+{
+    SECTION("половинная точность");
+
+    uint32_t bad = 0;
+    for (uint32_t h = 0; h < 0x10000u; h++) {
+        const uint16_t back = smp_f32_to_f16(smp_f16_to_f32((uint16_t)h));
+        if (f16_nan((uint16_t)h) ? !f16_nan(back) : back != h) bad++;
+    }
+    CHECK(bad == 0, "круг f16 -> f32 -> f16 не сошёлся на %u значениях", bad);
+
+    /* Граничные: самое большое, переполнение, субнормальные, равенства. */
+    static const struct { float f; uint16_t h; } fixed[] = {
+        { 65504.0f,          0x7BFFu },   /* самое большое конечное        */
+        { 65519.99f,         0x7BFFu },
+        { 65520.0f,          0x7C00u },   /* ровно посередине — к чётному  */
+        { 5.9604645e-8f,     0x0001u },   /* 2^-24, самое малое            */
+        { 2.9802322e-8f,     0x0000u },   /* 2^-25: посередине, к нулю     */
+        { 4.4703484e-8f,     0x0001u },   /* 1.5 * 2^-25                   */
+        { 1.00048828125f,    0x3C00u },   /* 1 + 2^-11: к чётному вниз     */
+        { 1.00146484375f,    0x3C02u },   /* 1 + 3*2^-11: к чётному вверх  */
+        { -2.0f,             0xC000u },
+        { 6.1035156e-5f,     0x0400u },   /* 2^-14, самое малое нормальное */
+    };
+    for (size_t i = 0; i < SMP_ARRLEN(fixed); i++)
+        CHECK(smp_f32_to_f16(fixed[i].f) == fixed[i].h, "f16(%.9g) = 0x%04X, ждали 0x%04X",
+              (double)fixed[i].f, smp_f32_to_f16(fixed[i].f), fixed[i].h);
+
+    /* Ближайшее: ни один сосед по модулю не ближе, а при равенстве взят
+     * чётный. Порядки — от субнормальных до переполнения. */
+    bad = 0;
+    for (uint32_t i = 0; i < 400000u; i++) {
+        const int   e = (int)(i % 44u) - 27;
+        const float x = ldexpf(frand(), e);
+        const uint16_t h = smp_f32_to_f16(x);
+        if ((h & 0x7FFFu) == 0x7C00u) { if (fabsf(x) < 65520.0f) bad++; continue; }
+        const double dx = fabs((double)x - (double)smp_f16_to_f32(h));
+        for (int s = -1; s <= 1; s += 2) {
+            const int32_t mag = (int32_t)(h & 0x7FFFu) + s;
+            if (mag < 0 || mag >= 0x7C00) continue;
+            const uint16_t nb = (uint16_t)((h & 0x8000u) | (uint32_t)mag);
+            const double dn = fabs((double)x - (double)smp_f16_to_f32(nb));
+            if (dn < dx || (dn == dx && (h & 1u))) bad++;
+        }
+    }
+    CHECK(bad == 0, "f32 -> f16 не ближайшее на %u значениях", bad);
+}
+
+/* Квантование как в GGUF: у каждого непустого блока есть вес ±127, пустой
+ * блок — нули, и распакованное отличается от исходного не больше чем на
+ * полшага (плюс округление самого масштаба в f16). */
+static void test_q8_quant(void)
+{
+    SECTION("квантование q8_0");
+
+    const size_t n = 40u * SMP_Q8_0_BLOCK;
+    fill_rand(g_a, n);
+    for (uint32_t j = 0; j < SMP_Q8_0_BLOCK; j++) g_a[SMP_Q8_0_BLOCK + j] = 0.0f;
+
+    smp_q8_0_quantize(g_q, g_a, n);
+    smp_q8_0_dequantize(g_got, g_q, n);
+
+    uint32_t bad_err = 0, bad_max = 0, bad_get = 0;
+    for (size_t b = 0; b < n / SMP_Q8_0_BLOCK; b++) {
+        const uint8_t *blk = g_q + b * SMP_Q8_0_BYTES;
+        uint16_t h;
+        memcpy(&h, blk, sizeof h);
+        const float d = smp_f16_to_f32(h);
+
+        int qmax = 0;
+        for (uint32_t j = 0; j < SMP_Q8_0_BLOCK; j++) {
+            const size_t i = b * SMP_Q8_0_BLOCK + j;
+            const int    q = (int8_t)blk[2 + j];
+            if (abs(q) > qmax) qmax = abs(q);
+            if (fabs((double)g_a[i] - (double)g_got[i]) > 0.6 * (double)d) bad_err++;
+            if (smp_q8_0_get(g_q, i) != g_got[i]) bad_get++;
+        }
+        if (b == 1 ? (qmax != 0 || d != 0.0f) : qmax != 127) bad_max++;
+    }
+    CHECK(bad_err == 0, "%u весов дальше полшага от исходных", bad_err);
+    CHECK(bad_max == 0, "%u блоков без веса ±127 (или пустой блок не пуст)", bad_max);
+    CHECK(bad_get == 0, "smp_q8_0_get разошёлся с распаковкой на %u весах", bad_get);
+}
+
+static SmpTensor mk_q8(uint32_t n, uint32_t k)
+{
+    SmpTensor t;
+    memset(&t, 0, sizeof t);
+    t.dtype = SMP_DT_Q8_0;
+    t.rank  = 2;
+    t.shape[0] = n; t.shape[1] = k;
+    t.stride[0] = k; t.stride[1] = 1;
+    t.nelem = n * k;
+    t.flags = SMP_TF_CONTIG;
+    return t;
+}
+
+/* C = A x W^T: векторная ветка против эталона, эталон — против того же
+ * умножения по распакованным весам через f32-путь @mmul.t. */
+static void q8_case(uint32_t M, uint32_t N, uint32_t K)
+{
+    fill_rand(g_a, (size_t)M * K);
+    fill_rand(g_b, (size_t)N * K);
+    smp_q8_0_quantize(g_q, g_b, (size_t)N * K);
+    smp_q8_0_dequantize(g_e, g_q, (size_t)N * K);
+
+    SmpTensor ta = mk(M, K), tw = mk_q8(N, K), tf = mk(N, K), tc = mk(M, N);
+    SmpBuf a = { g_a, &ta }, w = { g_q, &tw }, wf = { g_e, &tf };
+    SmpBuf ref = { g_ref, &tc }, got = { g_got, &tc }, viaf = { g_b, &tc };
+
+    memset(g_ref, 0xCD, (size_t)M * N * sizeof(float));
+    memset(g_got, 0xCD, (size_t)M * N * sizeof(float));
+
+    smp_kernels_select(SMP_KB_SCALAR);
+    smp_k_mmul_t(&ref, &a, &w, &g_sc);
+    smp_k_mmul_t(&viaf, &a, &wf, &g_sc);      /* g_b уже не нужен */
+    smp_kernels_select(SMP_KB_AVX2);
+    smp_k_mmul_t(&got, &a, &w, &g_sc);
+
+    const double e1 = max_rel_err(g_ref, g_got, (size_t)M * N);
+    const double e2 = max_rel_err(g_ref, g_b, (size_t)M * N);
+    CHECK(e1 < 1e-4, "q8_0 %ux%ux%u: avx2 против эталона %g", M, N, K, e1);
+    CHECK(e2 < 1e-5, "q8_0 %ux%ux%u: эталон против f32 по распакованным %g", M, N, K, e2);
+}
+
+static void test_q8_gemm(void)
+{
+    SECTION("умножение на q8_0");
+
+    /* M=1 — генерация; дальше хвосты по N мимо порции потоков и K из одного
+     * блока. 896 и 4864 — ширины Qwen2.5-0.5B. */
+    static const uint32_t shapes[][3] = {
+        { 1, 1, 32 }, { 1, 65, 96 }, { 1, 130, 896 }, { 3, 17, 64 },
+        { 1, 300, 896 }, { 2, 64, 4864 / 8 },
+    };
+    if (smp_kernels_select(SMP_KB_AVX2))
+        for (size_t i = 0; i < SMP_ARRLEN(shapes); i++)
+            q8_case(shapes[i][0], shapes[i][1], shapes[i][2]);
+
+    /* Потоки: каждый выход считает ровно один, в том же порядке, — поэтому
+     * бит в бит как на одном потоке. */
+    if (!smp_kernels_select(SMP_KB_AVX2)) return;
+    const size_t bytes = smp_k_scratch_bytes_for(4);
+    void *mem = malloc(bytes);
+    if (!mem) { CHECK(0, "нет памяти под четыре комплекта"); return; }
+    SmpKScratch par;
+    smp_k_scratch_bind(&par, mem, bytes);
+    smp_k_gemm_q8_par_min(0);
+
+    static const uint32_t pshapes[][3] = { { 1, 600, 256 }, { 1, 65, 32 }, { 4, 300, 128 } };
+    for (size_t i = 0; i < SMP_ARRLEN(pshapes); i++) {
+        const uint32_t M = pshapes[i][0], N = pshapes[i][1], K = pshapes[i][2];
+        fill_rand(g_a, (size_t)M * K);
+        fill_rand(g_b, (size_t)N * K);
+        smp_q8_0_quantize(g_q, g_b, (size_t)N * K);
+        SmpTensor ta = mk(M, K), tw = mk_q8(N, K), tc = mk(M, N);
+        SmpBuf a = { g_a, &ta }, w = { g_q, &tw };
+        SmpBuf one = { g_ref, &tc }, many = { g_got, &tc };
+        memset(g_ref, 0xCD, (size_t)M * N * sizeof(float));
+        memset(g_got, 0xAB, (size_t)M * N * sizeof(float));
+        smp_k_mmul_t(&one, &a, &w, &g_sc);
+        smp_k_mmul_t(&many, &a, &w, &par);
+        CHECK(memcmp(g_ref, g_got, (size_t)M * N * sizeof(float)) == 0,
+              "q8_0 на потоках %ux%ux%u разошёлся с одним потоком", M, N, K);
+    }
+    smp_k_gemm_q8_par_min((uint64_t)1 << 18);
+    free(mem);
+}
+
+/* ========================================================================== */
 
 int main(void)
 {
@@ -629,6 +808,9 @@ int main(void)
     test_identity();
     test_gemm_block();
     test_gemm_parallel();
+    test_f16();
+    test_q8_quant();
+    test_q8_gemm();
 
     smp_kernels_select(SMP_KB_AUTO);
     free(g_scmem);

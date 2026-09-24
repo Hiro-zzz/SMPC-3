@@ -541,6 +541,50 @@ static void test_fileio_rules(void)
                SMP_E0309, "@store от скаляра");
 }
 
+/* ========================================================================== */
+
+/* q8_0 — формат весов: объявить, загрузить, взять строкой, распаковать,
+ * умножить @mmul.t. Всё прочее над ним — E0312. */
+#define Q8 "*&W<q8_0:64,32> -> @alloc => $w;\n"
+
+static void test_q8(void)
+{
+    SECTION("q8_0 и @mmul.t");
+
+    expect_clean(Q8 "*&x<f32:2,32> -> @alloc => $x;\n"
+                    "$x -> @mmul.t(*&W) => *&y<f32:2,64>;", "линейный слой на q8_0");
+    expect_clean(Q8 "*&W[5, ..] -> @cast.f32 => *&r<f32:32>;", "строка весов в f32");
+    expect_clean(Q8 "3 => $t;\n*&W[$t, ..] -> @cast.f32 => *&r<f32:32>;",
+                 "строка по номеру из регистра");
+    expect_clean("*&F<f32:64,32> -> @alloc => $f;\n"
+                 "$f -> @cast.q8_0 => *&Q<q8_0:64,32>;", "квантование");
+    expect_clean("*&x<f32:3,8> -> @alloc => $x;\n"
+                 "*&W<f32:5,8> -> @alloc => $w;\n"
+                 "$x -> @mmul.t($w) => *&y<f32:3,5>;", "@mmul.t на f32");
+
+    expect_err("*&W<q8_0:64,30> -> @alloc => $w;", SMP_E0312, "ось не кратна 32");
+    expect_err("*&W<q8_0> -> @alloc => $w;", SMP_E0312, "скаляр q8_0");
+    expect_err(Q8 "*&W -> @relu => *&V<q8_0:64,32>;", SMP_E0312, "@relu над q8_0");
+    expect_err(Q8 "*&W -> @reduce.add => $s;", SMP_E0312, "свёртка q8_0");
+    expect_err(Q8 "*&W[1, 3] -> @cast.f32 => $s;", SMP_E0312, "элемент q8_0");
+    expect_err(Q8 "*&W -> @cast.f64 => *&D<f64:64,32>;", SMP_E0312, "q8_0 в f64");
+    expect_err(Q8 "*&x<f32:32,64> -> @alloc => $x;\n"
+                  "*&W -> @transpose -> @cast.f32 => *&T<f32:32,64>;", SMP_E0312, "transpose q8_0");
+    expect_err(Q8 "*&x<f32:2,64> -> @alloc => $x;\n"
+                  "$x -> @mmul(*&W) => *&y<f32:2,32>;", SMP_E0312, "q8_0 в обычном @mmul");
+    expect_err(Q8 "*&x<f64:2,32> -> @alloc => $x;\n"
+                  "$x -> @mmul.t(*&W) => *&y<f64:2,64>;", SMP_E0303, "q8_0 на f64");
+    expect_err(Q8 "*&x<f32:2,64> -> @alloc => $x;\n"
+                  "$x -> @mmul.t(*&W) => *&y<f32:2,64>;", SMP_E0419, "@mmul.t: K не сходится");
+    expect_err("*&F<f64:64,32> -> @alloc => $f;\n"
+               "$f -> @cast.q8_0 => *&Q<q8_0:64,32>;", SMP_E0312, "квантовать f64");
+    expect_err("*&F<f32:64,32> -> @alloc => $f;\n"
+               "*&F -> @transpose -> @cast.q8_0 => *&Q<q8_0:32,64>;", SMP_E0312,
+               "квантовать вид с шагом");
+}
+
+/* ========================================================================== */
+
 int main(void)
 {
     smp_console_setup();
@@ -562,6 +606,7 @@ int main(void)
     test_warnings();
     test_registries();
     test_repeat();
+    test_q8();
     test_fileio_rules();
 
     fclose(g_sink);

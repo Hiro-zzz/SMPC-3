@@ -339,7 +339,7 @@ static uint32_t sym_index(const SmpSemaResult *r, const SmpSym *s)
  * на этом стоит вся SIMD-часть, обсуждать нечего. */
 static bool sym_alloc(Ctx *c, SmpSym *s)
 {
-    const uint64_t sz = val_nelem(&s->val) * smp_dtype_size(s->val.dtype);
+    const uint64_t sz = smp_dtype_bytes(s->val.dtype, val_nelem(&s->val));
     if (s->arena_id >= SMP_MAX_ARENAS) return false;
 
     uint64_t *cursor = &c->res->arena_bytes[s->arena_id];
@@ -514,7 +514,16 @@ static bool apply_index(Ctx *c, const SmpAstTensor *t, SmpValue *v)
     out.flags    = (uint16_t)(v->flags & (uint16_t)~SMP_TF_CONTIG);
     out.byte_off = v->byte_off;
 
-    const uint32_t esz = smp_dtype_size(v->dtype);
+    /* Блок q8_0 делится только целиком, поэтому и срез берёт строки
+     * целиком: последняя ось остаётся нетронутой. */
+    if (v->dtype == SMP_DT_Q8_0 && t->idx[t->nidx - 1u].kind != SMP_IDX_ALL) {
+        serr(c, SMP_E0312, t->idx[t->nidx - 1u].span,
+             "Срез q8_0 фиксирует последнюю ось, а элемент блочного типа "
+             "отдельно не адресуется.",
+             "Бери строку целиком: *&W[i, ..], и распаковывай её @cast.f32.");
+        return false;
+    }
+
     uint32_t rank = 0;
 
     for (uint32_t i = 0; i < t->nidx; i++) {
@@ -534,7 +543,7 @@ static bool apply_index(Ctx *c, const SmpAstTensor *t, SmpValue *v)
                               (unsigned long long)ix->ival), NULL);
                     return false;
                 }
-                out.byte_off += (uint64_t)ix->ival * v->stride[i] * esz;
+                out.byte_off += smp_dtype_bytes(v->dtype, (uint64_t)ix->ival * v->stride[i]);
                 break;
 
             case SMP_IDX_REG: {
@@ -592,6 +601,18 @@ static bool resolve_source_tensor(Ctx *c, const SmpAstTensor *t, SmpValue *out)
         val_dense(&s->val);
         s->val.sym       = sym_index(c->res, s);
         s->val.is_scalar = (t->rank == 0);
+
+        if (t->dtype == SMP_DT_Q8_0 &&
+            (t->rank == 0 || t->dims[t->rank - 1u] % SMP_Q8_0_BLOCK != 0)) {
+            serr(c, SMP_E0312, t->type_span,
+                 t->rank == 0
+                     ? "Скаляр q8_0 не бывает: масштаб один на блок из 32 весов."
+                     : sfmt(c, "Последняя ось q8_0 имеет размер %u, а строка обязана "
+                               "состоять из целых блоков по %u.",
+                            t->dims[t->rank - 1u], SMP_Q8_0_BLOCK),
+                 NULL);
+            return false;
+        }
 
         if (!sym_alloc(c, s)) return false;
     } else {
@@ -714,6 +735,12 @@ static bool apply_stage(Ctx *c, const SmpAstStage *st, SmpOpKind k, SmpValue *v)
             c->arg_syms[c->n_arg_syms++] = a0.sym;
         check_align(c, &a0, st->args[0].span, "Аргумент");
         if (c->bad) return false;
+
+        if (a0.dtype == SMP_DT_Q8_0 && k != SMP_OP_MMUL_T) {
+            serr(c, SMP_E0312, st->args[0].span,
+                 sfmt(c, "@%s не принимает q8_0 аргументом.", def->name), NULL);
+            return false;
+        }
     }
 
     switch (k) {
@@ -845,6 +872,55 @@ static bool apply_stage(Ctx *c, const SmpAstStage *st, SmpOpKind k, SmpValue *v)
             return true;
         }
 
+        case SMP_OP_MMUL_T: {
+            /* Линейный слой: веса лежат строками выхода, [N,K], как в HF и
+             * GGUF, и умножаются транспонированными. Отдельная операция, а не
+             * @mmul над @transpose: столбец q8_0 не адресуется, а строка —
+             * ровно то, что нужно. */
+            if (!require_rank(c, v, 2, st->span, "mmul.t")) return false;
+            if (a0.is_scalar || a0.rank != 2) {
+                char sig[80];
+                serr(c, SMP_E0309, st->args[0].span,
+                     sfmt(c, "Второй множитель обязан быть матрицей, а это %s.",
+                          val_sig(&a0, sig, sizeof sig)), NULL);
+                return false;
+            }
+            const bool q8 = (a0.dtype == SMP_DT_Q8_0);
+            if (q8 ? v->dtype != SMP_DT_F32 : v->dtype != a0.dtype) {
+                serr(c, SMP_E0303, st->args[0].span,
+                     q8 ? sfmt(c, "Веса q8_0 умножаются на f32, а слева %s.",
+                               smp_dtype_name(v->dtype))
+                        : sfmt(c, "Множители имеют разные типы: %s и %s.",
+                               smp_dtype_name(v->dtype), smp_dtype_name(a0.dtype)),
+                     NULL);
+                return false;
+            }
+
+            const uint32_t M = v->shape[0], K1 = v->shape[1];
+            const uint32_t N = a0.shape[0], K2 = a0.shape[1];
+            if (K1 != K2) {
+                char s1[80], s2[80];
+                serr(c, SMP_E0419, st->span,
+                     sfmt(c, "Левый множитель %s, правый %s.\n"
+                             "@mmul.t сводит последние оси, а они не сходятся (%u != %u).",
+                          val_sig(v, s1, sizeof s1), val_sig(&a0, s2, sizeof s2),
+                          K1, K2),
+                     "Правый множитель — [N,K]: строка на каждый выход.");
+                return false;
+            }
+
+            SmpValue out;
+            memset(&out, 0, sizeof out);
+            out.dtype    = v->dtype;
+            out.rank     = 2;
+            out.shape[0] = M;
+            out.shape[1] = N;
+            out.sym      = SMP_SYM_NONE;
+            val_dense(&out);
+            *v = out;
+            return true;
+        }
+
         case SMP_OP_TRANSPOSE: {
             if (!require_rank(c, v, 2, st->span, "transpose")) return false;
             const uint32_t s0 = v->shape[0], s1 = v->shape[1];
@@ -957,10 +1033,27 @@ static bool apply_stage(Ctx *c, const SmpAstStage *st, SmpOpKind k, SmpValue *v)
         case SMP_OP_CAST_F32:
         case SMP_OP_CAST_F64:
         case SMP_OP_CAST_I32:
-        case SMP_OP_CAST_U64: {
+        case SMP_OP_CAST_U64:
+        case SMP_OP_CAST_Q8_0: {
             const SmpDType to = k == SMP_OP_CAST_F32 ? SMP_DT_F32
                               : k == SMP_OP_CAST_F64 ? SMP_DT_F64
-                              : k == SMP_OP_CAST_I32 ? SMP_DT_I32 : SMP_DT_U64;
+                              : k == SMP_OP_CAST_I32 ? SMP_DT_I32
+                              : k == SMP_OP_CAST_U64 ? SMP_DT_U64 : SMP_DT_Q8_0;
+            if (to == SMP_DT_Q8_0) {
+                /* Квантуется строка целиком: масштаб — один на блок. */
+                if (v->is_scalar || v->dtype != SMP_DT_F32 ||
+                    v->shape[v->rank - 1u] % SMP_Q8_0_BLOCK != 0 ||
+                    !(v->flags & SMP_TF_CONTIG)) {
+                    char sig[80];
+                    serr(c, SMP_E0312, st->span,
+                         sfmt(c, "@cast.q8_0 квантует плотный f32 с последней осью, "
+                                 "кратной %u, а на входе %s%s.",
+                              SMP_Q8_0_BLOCK, val_sig(v, sig, sizeof sig),
+                              (v->flags & SMP_TF_CONTIG) ? "" : " с шагом"),
+                         NULL);
+                    return false;
+                }
+            }
             v->dtype = to;
             if (!v->is_scalar) {
                 v->sym      = SMP_SYM_NONE;   /* приведение создаёт копию */
@@ -987,6 +1080,7 @@ static void check_align(Ctx *c, const SmpValue *v, SmpSpan sp, const char *what)
     const uint32_t bits = c->info->req_vec_bits;
     if (bits < 256 || v->is_scalar) return;
     if (v->flags & SMP_TF_DYNOFF)   return;   /* смещение из регистра */
+    if (smp_dtype_is_block(v->dtype)) return; /* блоки по 34 байта     */
 
     const uint32_t req = bits / 8u;           /* 32 для v256, 64 для v512 */
     /* База тензора выровнена на 64 при выделении, поэтому весь вопрос —
@@ -1062,6 +1156,15 @@ static void check_stmt(Ctx *c)
         if (k != SMP_OP_PACK) {
             check_raw(c, &v, i == 0 ? s->source.span : st->span);
             if (c->bad) return;
+        }
+
+        /* q8_0 — формат весов, а не число: считать над ним поэлементно
+         * нечего, пока он не распакован. */
+        if (v.dtype == SMP_DT_Q8_0 && k != SMP_OP_LOAD && k != SMP_OP_STORE &&
+            k != SMP_OP_ALLOC && k != SMP_OP_CAST_F32) {
+            serr(c, SMP_E0312, st->name_span,
+                 sfmt(c, "@%s не определена над q8_0.", smp_op_def(k)->name), NULL);
+            return;
         }
 
         if (!apply_stage(c, st, k, &v)) return;

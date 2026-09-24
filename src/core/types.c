@@ -11,7 +11,8 @@ static const SmpDTypeInfo smp__dt[SMP_DT__COUNT] = {
     /* F64     */ { "f64",       8, true  },
     /* I32     */ { "i32",       4, false },
     /* U64     */ { "u64",       8, false },
-    /* RAW_PTR */ { "raw_ptr",   8, false }
+    /* RAW_PTR */ { "raw_ptr",   8, false },
+    /* Q8_0    */ { "q8_0",      0, false }
 };
 
 const char *smp_dtype_name(SmpDType dt)
@@ -24,6 +25,20 @@ uint32_t smp_dtype_size(SmpDType dt)
 {
     if ((unsigned)dt >= SMP_DT__COUNT) return 0;
     return smp__dt[dt].size;
+}
+
+bool smp_dtype_is_block(SmpDType dt)
+{
+    return dt == SMP_DT_Q8_0;
+}
+
+/* Блоки считаются целыми: хвост строки блочного типа всё равно занимает
+ * блок, и проверке границ нужен именно занятый размер. */
+uint64_t smp_dtype_bytes(SmpDType dt, uint64_t nelem)
+{
+    if (dt == SMP_DT_Q8_0)
+        return (nelem + SMP_Q8_0_BLOCK - 1u) / SMP_Q8_0_BLOCK * SMP_Q8_0_BYTES;
+    return nelem * smp_dtype_size(dt);
 }
 
 bool smp_dtype_is_float(SmpDType dt)
@@ -75,7 +90,7 @@ void smp_tensor_dense(SmpTensor *t, SmpDType dt, uint32_t rank, const uint32_t *
 
 uint64_t smp_tensor_bytes(const SmpTensor *t)
 {
-    return (uint64_t)t->nelem * (uint64_t)smp_dtype_size((SmpDType)t->dtype);
+    return smp_dtype_bytes((SmpDType)t->dtype, t->nelem);
 }
 
 bool smp_tensor_is_contiguous(const SmpTensor *t)

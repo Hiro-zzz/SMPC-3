@@ -1,7 +1,0 @@
-// Axis wider than 65535, like a vocabulary.
-[#arena:0] *&E<f32:70,8> -> @fill(1.0) => *&E;
-69 => $t;
-*&E[$t, ..] -> @fill(3.0) => *&E[$t, ..];
-*&E[$t, ..] -> @reduce.add => $row;
-*&E[68, ..] -> @reduce.add => $prev;
-*&E -> @reduce.add => $all;

@@ -194,8 +194,7 @@ static void *tensor_base(SmpVM *vm, const SmpTensor *t)
     uint64_t last = 0;
     for (uint32_t i = 0; i < t->rank; i++)
         last += (uint64_t)(t->shape[i] ? t->shape[i] - 1u : 0u) * t->stride[i];
-    const uint64_t esz  = smp_dtype_size((SmpDType)t->dtype);
-    const uint64_t need = (uint64_t)t->off + (last + 1u) * esz;
+    const uint64_t need = t->off + smp_dtype_bytes((SmpDType)t->dtype, last + 1u);
 
     if (need > vm->arenas[a].cap) {
         vm_fatal(vm, SMP_E0410,
@@ -564,12 +563,11 @@ static bool vm_fuse(SmpVM *vm, const SmpInstr **ipp, const SmpInstr *first)
 static size_t buf_span(const SmpBuf *b)
 {
     const SmpTensor *t   = b->t;
-    const size_t     esz = smp_dtype_size((SmpDType)t->dtype);
     size_t           far = 0;
 
     for (uint32_t i = 0; i < t->rank; i++)
         if (t->shape[i]) far += (size_t)(t->shape[i] - 1u) * (size_t)t->stride[i];
-    return (far + 1u) * esz;
+    return (size_t)smp_dtype_bytes((SmpDType)t->dtype, far + 1u);
 }
 
 static bool buf_overlap(const SmpBuf *x, const SmpBuf *y)
@@ -797,9 +795,12 @@ dispatch_switch:
         R[in->d].t.off = R[in->a].t.off + (uint64_t)n * step;
 
         /* Срез мог сбить выравнивание, которое компилятор проверить не мог:
-         * индекс стал известен только сейчас. */
+         * индекс стал известен только сейчас. У q8_0 строка — целые блоки по
+         * 34 байта, выровненной она не бывает, и ядра читают её без
+         * требований к выравниванию. */
         const uint32_t bits = smp_vec_bits(in->flags & SMP_IF_VEC_MASK);
-        if (bits >= 256 && (R[in->d].t.off % (bits / 8u)) != 0) {
+        if (bits >= 256 && !smp_dtype_is_block((SmpDType)R[in->d].t.dtype) &&
+            (R[in->d].t.off % (bits / 8u)) != 0) {
             vm_fatal(vm, SMP_E0402,
                      vfmt(vm, "Динамический индекс %lld дал смещение %llu байт, "
                               "а %s требует кратности %u.",
@@ -869,6 +870,14 @@ dispatch_switch:
             !make_buf(vm, &ba, &R[in->a].t) ||
             !make_buf(vm, &bb, &R[in->b].t)) return SMP_ERR_INTERNAL;
         smp_k_gemm(&bd, &ba, &bb, &vm->scratch);
+        VM_NEXT();
+
+    VM_CASE(MMULT)
+        apply_fp(vm, in->flags);
+        if (!make_buf(vm, &bd, &R[in->d].t) ||
+            !make_buf(vm, &ba, &R[in->a].t) ||
+            !make_buf(vm, &bb, &R[in->b].t)) return SMP_ERR_INTERNAL;
+        smp_k_mmul_t(&bd, &ba, &bb, &vm->scratch);
         VM_NEXT();
 
     VM_CASE(TRANS) {
@@ -1004,10 +1013,12 @@ dispatch_switch:
     VM_CASE(CVTF32)
     VM_CASE(CVTF64)
     VM_CASE(CVTI32)
-    VM_CASE(CVTU64) {
+    VM_CASE(CVTU64)
+    VM_CASE(CVTQ80) {
         const SmpDType to = in->op == SMP_BC_CVTF32 ? SMP_DT_F32
                           : in->op == SMP_BC_CVTF64 ? SMP_DT_F64
-                          : in->op == SMP_BC_CVTI32 ? SMP_DT_I32 : SMP_DT_U64;
+                          : in->op == SMP_BC_CVTI32 ? SMP_DT_I32
+                          : in->op == SMP_BC_CVTU64 ? SMP_DT_U64 : SMP_DT_Q8_0;
         if (!R[in->a].is_tensor) {
             /* Ярлыка мало: приведение к целому обязано отбросить дробную
              * часть, иначе @cast.i32 над 2.7 давал бы 2.7 с надписью i32. */
@@ -1094,6 +1105,7 @@ void smp_vm_dump_tensors(FILE *out, const SmpVM *vm, uint32_t max_elems)
                 case SMP_DT_F64: v = ((const double   *)base)[e]; break;
                 case SMP_DT_I32: v = ((const int32_t  *)base)[e]; break;
                 case SMP_DT_U64: v = (double)((const uint64_t *)base)[e]; break;
+                case SMP_DT_Q8_0: v = smp_q8_0_get(base, e); break;
                 default: break;
             }
             fprintf(out, "%s%.6g", e ? ", " : "", v);

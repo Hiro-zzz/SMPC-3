@@ -53,6 +53,7 @@ static double load_at(const void *p, SmpDType dt, size_t i)
         case SMP_DT_F64: return           ((const double  *)p)[i];
         case SMP_DT_I32: return (double)((const int32_t  *)p)[i];
         case SMP_DT_U64: return (double)((const uint64_t *)p)[i];
+        case SMP_DT_Q8_0: return (double)smp_q8_0_get(p, i);
         default:         return 0.0;
     }
 }
@@ -203,7 +204,7 @@ void smp_ks_copy(const SmpBuf *dst, const SmpBuf *src)
     if (dense_same(dst, src)) {
         if (dst->p != src->p)
             memcpy(dst->p, src->p,
-                   (size_t)dst->t->nelem * smp_dtype_size((SmpDType)dst->t->dtype));
+                   (size_t)smp_dtype_bytes((SmpDType)dst->t->dtype, dst->t->nelem));
         return;
     }
     unary(dst, src, f_id, 0.0);
@@ -214,6 +215,19 @@ void smp_ks_copy(const SmpBuf *dst, const SmpBuf *src)
 void smp_ks_cast(const SmpBuf *dst, const SmpBuf *src)
 {
     if (dense_same(dst, src)) { smp_ks_copy(dst, src); return; }
+
+    /* q8_0 квантуется и распаковывается строками целиком; компилятор
+     * пропускает сюда только плотные f32 и q8_0. */
+    if (src->t->dtype == SMP_DT_Q8_0 && dst->t->dtype == SMP_DT_F32 &&
+        dense(dst->t) && dense(src->t)) {
+        smp_q8_0_dequantize((float *)dst->p, src->p, src->t->nelem);
+        return;
+    }
+    if (dst->t->dtype == SMP_DT_Q8_0 && src->t->dtype == SMP_DT_F32 &&
+        dense(dst->t) && dense(src->t)) {
+        smp_q8_0_quantize(dst->p, (const float *)src->p, src->t->nelem);
+        return;
+    }
     unary(dst, src, f_id, 0.0);
 }
 
@@ -264,7 +278,7 @@ void smp_ks_zero(const SmpBuf *dst)
 {
     const SmpTensor *t = dst->t;
     if (dense(t)) {
-        memset(dst->p, 0, (size_t)t->nelem * smp_dtype_size((SmpDType)t->dtype));
+        memset(dst->p, 0, (size_t)smp_dtype_bytes((SmpDType)t->dtype, t->nelem));
         return;
     }
     smp_ks_fill(dst, 0.0);

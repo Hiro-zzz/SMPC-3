@@ -63,7 +63,9 @@ typedef enum SmpOpFmt {
     X(EMIT,   "emit",    SMP_FMT_D_A_X,   "вывести rA; rD <- сколько выведено")\
     X(LOAD,   "load",    SMP_FMT_D,       "rD <- содержимое привязанного файла") \
     X(STORE,  "store",   SMP_FMT_D_A,     "rA -> привязанный файл; rD <- байт") \
-    X(STORER, "storer",  SMP_FMT_D_A,     "rA -> вид в rD (срез с индексом-регистром)")
+    X(STORER, "storer",  SMP_FMT_D_A,     "rA -> вид в rD (срез с индексом-регистром)") \
+    X(MMULT,  "mmul.t",  SMP_FMT_D_A_B,   "rD <- rA x rB^T")                   \
+    X(CVTQ80, "cvt.q8_0", SMP_FMT_D_A,    "rD <- (q8_0)rA, блоками по 32")
 
 #define SMP_BC_ENUM(id, mn, fmt, desc) SMP_BC_##id,
 typedef enum SmpOpcode {

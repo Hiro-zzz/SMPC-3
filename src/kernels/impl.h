@@ -29,6 +29,7 @@ double smp_ks_fuse_reduce(const SmpBuf *src, const SmpFuseStep *steps,
 double smp_ks_reduce_add(const SmpBuf *src);
 double smp_ks_reduce_max(const SmpBuf *src);
 void   smp_ks_gemm (const SmpBuf *c, const SmpBuf *a, const SmpBuf *b);
+void   smp_ks_gemm_q8(const SmpBuf *c, const SmpBuf *a, const SmpBuf *w);
 
 /* --- AVX2 + FMA ----------------------------------------------------------- */
 /* Все принимают только f32 с плотной раскладкой; проверку делает диспетчер. */
@@ -60,5 +61,9 @@ void   smp_ka_gemm_ep(float *C, size_t ldc, const float *A, size_t lda,
                       float *apack, float *bpack,
                       const SmpFuseStep *steps, uint32_t nsteps,
                       size_t ep_base, size_t ep_ld);
+
+/* C = A x W^T по строкам W с n0 по n1; W — плотный q8_0 [N,K]. */
+void   smp_ka_gemm_q8(float *C, size_t ldc, const float *A, size_t lda,
+                      const uint8_t *W, size_t M, size_t K, size_t n0, size_t n1);
 
 #endif /* SMPC3_KERNELS_IMPL_H */

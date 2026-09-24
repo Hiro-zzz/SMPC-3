@@ -13,13 +13,24 @@ typedef enum SmpDType {
     SMP_DT_I32     = 3,
     SMP_DT_U64     = 4,
     SMP_DT_RAW_PTR = 5,
+    SMP_DT_Q8_0    = 6,
     SMP_DT__COUNT
 } SmpDType;
+
+/* Q8_0, как в GGUF: блок из 32 весов i8 со своим масштабом f16, 34 байта
+ * (сначала масштаб, потом веса); значение — масштаб × вес. Отдельный
+ * элемент блочного типа не адресуется, поэтому размер элемента у него ноль,
+ * а байты считает smp_dtype_bytes. Последняя ось такого тензора кратна 32,
+ * и строка всегда состоит из целых блоков. */
+#define SMP_Q8_0_BLOCK 32u
+#define SMP_Q8_0_BYTES 34u
 
 #define SMP_MAX_RANK 4
 
 const char *smp_dtype_name(SmpDType dt);
-uint32_t    smp_dtype_size(SmpDType dt);      /* байт на элемент */
+uint32_t    smp_dtype_size(SmpDType dt);      /* байт на элемент; 0 у блочных */
+uint64_t    smp_dtype_bytes(SmpDType dt, uint64_t nelem);  /* байт на nelem */
+bool        smp_dtype_is_block(SmpDType dt);
 SmpDType    smp_dtype_parse(const char *s, size_t len);
 bool        smp_dtype_is_float(SmpDType dt);
 

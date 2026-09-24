@@ -1082,6 +1082,43 @@ static void test_store(void)
     g_store = NULL;
 }
 
+/* Весь путь весов: квантовать, умножить @mmul.t, взять строку по номеру
+ * из регистра и распаковать. Ожидания точные: распаковка q8_0 точна, а
+ * суммы здесь — степени двойки на одно и то же число. */
+static void test_q8(void)
+{
+    SECTION("q8_0 в исполнении");
+
+    CHECK(run_str("[#arena:1] *&F<f32:64,32> -> @fill(0.5) => *&F;\n"
+                  "*&F -> @cast.q8_0 => *&W<q8_0:64,32>;\n"
+                  "[#arena:0] *&x<f32:1,32> -> @fill(2.0) => *&x;\n"
+                  "*&x -> @mmul.t(*&W) => *&y<f32:1,64>;\n"
+                  "*&y -> @reduce.add => $s;\n"), "линейный слой на q8_0");
+    {
+        const float d = smp_f16_to_f32(smp_f32_to_f16(0.5f / 127.0f));
+        const float y = d * 8128.0f;                   /* 32 * 2 * 127 */
+        CHECK(felem("y", 0) == y && felem("y", 63) == y,
+              "y[0]=%.9g y[63]=%.9g, ждали %.9g", felem("y", 0), felem("y", 63), y);
+        CHECK(regval("s", NULL) == 64.0 * y, "сумма %.9g, ждали %.9g",
+              regval("s", NULL), 64.0 * y);
+    }
+
+    /* Строки разные: 0, 1, 2, 3. Взять надо вторую — по регистру. */
+    CHECK(run_str("*&F<f32:4,32> -> @alloc => $f;\n"
+                  "[#repeat:4, #index:i] *&F[$i, ..] -> @fill($i) => *&F[$i, ..];\n"
+                  "*&F -> @cast.q8_0 => *&W<q8_0:4,32>;\n"
+                  "2 => $t;\n"
+                  "*&W[$t, ..] -> @cast.f32 => *&r<f32:32>;\n"
+                  "*&r -> @reduce.add => $s;\n"), "строка q8_0 по регистру");
+    {
+        const float v = smp_f16_to_f32(smp_f32_to_f16(2.0f / 127.0f)) * 127.0f;
+        CHECK(felem("r", 0) == v && felem("r", 31) == v,
+              "r[0]=%.9g r[31]=%.9g, ждали %.9g", felem("r", 0), felem("r", 31), v);
+        CHECK(regval("s", NULL) == 32.0 * v, "сумма строки %.9g, ждали %.9g",
+              regval("s", NULL), 32.0 * v);
+    }
+}
+
 int main(void)
 {
     smp_console_setup();
@@ -1110,6 +1147,7 @@ int main(void)
     test_gemm_epilogue();
     test_fileio();
     test_store();
+    test_q8();
 
     smp_vm_release(&g_vm);
     fclose(g_sink);
