@@ -176,6 +176,11 @@ static void test_ops(void)
     expect_err(P2 "$a -> @scale($b) => $c;",    SMP_E0309, "scale тензором");
     expect_err(P2 "$a -> @add(2.0) => $c;",     SMP_E0309, "add скаляром");
     expect_err(P2 "$a -> @reduce.add -> @relu => $c;", SMP_E0309, "relu над скаляром");
+    expect_err(P2 "$a -> @mmul.t($b, $b) => $c;", SMP_E0309, "mmul.t: длина тензором");
+    expect_err(P2 "$a -> @mmul($b, $b) => $c;",   SMP_E0309, "mmul: длина тензором");
+    expect_err(P2 "$a -> @mmul($b, 2, 3) => $c;", SMP_E0306, "mmul с тремя аргументами");
+    expect_clean(P2 "4 => $n; $a -> @mmul.t($b, $n) => $c; $c -> @mmul($b, 2) => $d;",
+                 "mmul.t и mmul с живой длиной");
 
     /* Вывод — такая же свёртка: тензор на входе, скаляр на выходе. */
     expect_clean(P2 "$a -> @emit.num => $n;", "@emit.num над f32");

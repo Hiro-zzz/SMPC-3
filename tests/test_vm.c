@@ -1290,6 +1290,77 @@ static void test_attention(void)
     CHECK(felem("Kc", 5 * G * D) != 0.0f, "строка 5 кэша не записана — проверка маски ни о чём");
 }
 
+/* Живая длина: @mmul.t считает только первые n строк правого множителя,
+ * остальные столбцы — нули; @mmul обрезает ось K. Внимание с ней даёт тот
+ * же ответ, что с маской одной @softmax, но мёртвые позиции не считает. */
+static void test_live_len(void)
+{
+    SECTION("живая длина в @mmul.t и @mmul");
+
+    if (run_str("*&A<f32:2,8> -> @fill(1.0) => *&A;\n"
+                "*&B<f32:6,8> -> @fill(2.0) => *&B;\n"
+                "4 => $n;\n"
+                "*&A -> @mmul.t(*&B, $n) => *&C<f32:2,6>;\n")) {
+        bool ok = true;
+        for (uint32_t m = 0; m < 2; m++)
+            for (uint32_t j = 0; j < 6; j++)
+                ok &= felem("C", m * 6 + j) == (j < 4 ? 16.0f : 0.0f);
+        CHECK(ok, "@mmul.t с длиной 4: ждали 16 в первых четырёх столбцах и нули дальше");
+    }
+    if (run_str("*&A<f32:1,64> -> @fill(0.5) => *&A;\n"
+                "*&P<f32:5,64> -> @fill(0.25) => *&P;\n"
+                "*&P -> @cast.q8_0 => *&W<q8_0:5,64>;\n"
+                "*&A -> @mmul.t(*&W, 3) => *&C<f32:1,5>;\n")) {
+        const float w = felem("C", 0);
+        CHECK(w != 0.0f && felem("C", 2) == w && felem("C", 3) == 0.0f && felem("C", 4) == 0.0f,
+              "@mmul.t по q8_0 с длиной-литералом 3: %g %g %g", w, felem("C", 3), felem("C", 4));
+    }
+    if (run_str("*&A<f32:2,6> -> @fill(1.0) => *&A;\n"
+                "*&B<f32:6,3> -> @fill(2.0) => *&B;\n"
+                "4 => $k;\n"
+                "*&A -> @mmul(*&B, $k) => *&C<f32:2,3>;\n")) {
+        CHECK(felem("C", 0) == 8.0f && felem("C", 5) == 8.0f,
+              "@mmul с осью K, обрезанной до 4: %g, ждали 8", felem("C", 0));
+    }
+    /* Длина за краями: ноль и меньше — ничего, больше оси — вся ось. */
+    if (run_str("*&A<f32:1,8> -> @fill(1.0) => *&A;\n"
+                "*&B<f32:3,8> -> @fill(1.0) => *&B;\n"
+                "-2 => $lo;\n"
+                "100 => $hi;\n"
+                "*&A -> @mmul.t(*&B, $lo) => *&Z<f32:1,3>;\n"
+                "*&A -> @mmul.t(*&B, $hi) => *&F<f32:1,3>;\n")) {
+        CHECK(felem("Z", 0) == 0.0f && felem("Z", 2) == 0.0f, "длина -2 не дала нулей");
+        CHECK(felem("F", 0) == 8.0f && felem("F", 2) == 8.0f, "длина 100 не дала всю ось");
+    }
+
+    /* Внимание: маска одной @softmax против живой длины во всех трёх стадиях. */
+    static const char head[] =
+        "[#arena:1] *&Kc<f32:8,4> -> @alloc => $kc;\n"
+        "[#arena:1] *&Vc<f32:8,4> -> @alloc => $vc;\n"
+        "*&one<f32:4> -> @fill(1.0) => *&one;\n"
+        "[#repeat:8, #index:t] *&one -> @rope($t, 10.0) => *&Kc[$t, ..];\n"
+        "[#repeat:8, #index:t] *&one -> @rope($t, 3.0) -> @scale(0.7) => *&Vc[$t, ..];\n"
+        "*&one -> @scale(0.3) -> @rope(5, 7.0) -> @reshape(1, 4) => *&q<f32:1,4>;\n"
+        "5 => $len;\n";
+    char prog[1024];
+    float masked[4] = { 0 };
+    snprintf(prog, sizeof prog, "%s*&q -> @mmul.t(*&Kc) -> @scale(0.5) -> @softmax($len)"
+             " -> @mmul(*&Vc) => *&o<f32:1,4>;\n", head);
+    if (run_str(prog))
+        for (uint32_t d = 0; d < 4; d++) masked[d] = felem("o", d);
+    snprintf(prog, sizeof prog, "%s*&q -> @mmul.t(*&Kc, $len) -> @scale(0.5) -> @softmax($len)"
+             " -> @mmul(*&Vc, $len) => *&o<f32:1,4>;\n", head);
+    if (run_str(prog)) {
+        double worst = 0.0;
+        for (uint32_t d = 0; d < 4; d++) {
+            const double e = fabs((double)masked[d] - (double)felem("o", d));
+            if (e > worst) worst = e;
+        }
+        CHECK(masked[0] != 0.0f && worst < 1e-6,
+              "внимание с живой длиной разошлось с маской: %g", worst);
+    }
+}
+
 static void test_nn_chain(void)
 {
     SECTION("цепочка модели");
@@ -1342,6 +1413,7 @@ int main(void)
     test_q8();
     test_nn_chain();
     test_attention();
+    test_live_len();
 
     smp_vm_release(&g_vm);
     fclose(g_sink);

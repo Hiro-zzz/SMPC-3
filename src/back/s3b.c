@@ -303,6 +303,18 @@ SmpStatus smp_s3b_read(SmpModule *m, const char *path, SmpArena *arena,
         if (in->d > max_reg) max_reg = in->d;
         if (in->a > max_reg) max_reg = in->a;
         if (in->b > max_reg) max_reg = in->b;
+
+        /* @mmul и @mmul.t с живой длиной держат её регистр в k. */
+        if ((in->op == SMP_BC_MMUL || in->op == SMP_BC_MMULT) && in->aux == 1) {
+            if (in->k >= SMP_MAX_REGS) {
+                static char b[160];
+                snprintf(b, sizeof b, "Инструкция #%u берёт длину из регистра %u, "
+                                      "а их не больше %u.", i, in->k, SMP_MAX_REGS);
+                s3b_err(diag, b);
+                return SMP_ERR_IO;
+            }
+            if (in->k > max_reg) max_reg = in->k;
+        }
     }
     m->n_regs = max_reg + 1u;
 
@@ -404,6 +416,8 @@ void smp_disasm(FILE *out, const SmpModule *m, bool color)
             case SMP_FMT_D_A_B:
                 fprintf(out, "%sr%u, r%u, r%u%s", dc(color, D_REG), in->d, in->a, in->b,
                         dc(color, D_RESET));
+                if ((in->op == SMP_BC_MMUL || in->op == SMP_BC_MMULT) && in->aux == 1)
+                    fprintf(out, ", длина %sr%u%s", dc(color, D_REG), in->k, dc(color, D_RESET));
                 break;
             case SMP_FMT_D_T:
                 fprintf(out, "%sr%u%s, ", dc(color, D_REG), in->d, dc(color, D_RESET));

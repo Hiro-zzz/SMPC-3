@@ -718,6 +718,25 @@ static bool is_number(const SmpAstOperand *o)
     return o->kind == SMP_OPD_INT || o->kind == SMP_OPD_FLOAT;
 }
 
+/* Второй аргумент @mmul и @mmul.t — живая длина, как у @softmax: число
+ * (регистр или литерал), а не тензор. Формы она не меняет: мёртвая часть
+ * результата @mmul.t — нули, у @mmul её нет вовсе. */
+static bool live_len_arg(Ctx *c, const SmpAstStage *st, const char *op, const char *what)
+{
+    if (st->nargs < 2) return true;
+    SmpValue n;
+    memset(&n, 0, sizeof n);
+    n.sym = SMP_SYM_NONE;
+    if (!read_operand(c, &st->args[1], &n)) return false;
+    if (!n.is_scalar) {
+        serr(c, SMP_E0309, st->args[1].span,
+             sfmt(c, "Второй аргумент @%s — %s: это число, а получен тензор.", op, what),
+             NULL);
+        return false;
+    }
+    return true;
+}
+
 static bool apply_stage(Ctx *c, const SmpAstStage *st, SmpOpKind k, SmpValue *v)
 {
     const SmpOpDef *def = smp_op_def(k);
@@ -836,6 +855,8 @@ static bool apply_stage(Ctx *c, const SmpAstStage *st, SmpOpKind k, SmpValue *v)
 
         case SMP_OP_MMUL: {
             if (!require_rank(c, v, 2, st->span, "mmul")) return false;
+            if (!live_len_arg(c, st, "mmul", "сколько первых элементов оси K живые"))
+                return false;
             if (a0.is_scalar || a0.rank != 2) {
                 char sig[80];
                 serr(c, SMP_E0309, st->args[0].span,
@@ -883,6 +904,8 @@ static bool apply_stage(Ctx *c, const SmpAstStage *st, SmpOpKind k, SmpValue *v)
              * @mmul над @transpose: столбец q8_0 не адресуется, а строка —
              * ровно то, что нужно. */
             if (!require_rank(c, v, 2, st->span, "mmul.t")) return false;
+            if (!live_len_arg(c, st, "mmul.t", "сколько первых строк правого множителя живые"))
+                return false;
             if (a0.is_scalar || a0.rank != 2) {
                 char sig[80];
                 serr(c, SMP_E0309, st->args[0].span,

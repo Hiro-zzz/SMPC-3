@@ -310,6 +310,64 @@ static bool make_dst(SmpVM *vm, SmpBuf *b, const SmpTensor *t)
 }
 
 /* ========================================================================== */
+/*  Умножение по живой длине                                                  */
+/* ========================================================================== */
+
+/* Длина из регистра k (aux = 1): сколько первых строк B живые у @mmul.t,
+ * сколько первых элементов оси K — у @mmul. Меньше единицы или не число —
+ * ноль, больше оси — вся ось; как у @softmax. */
+static uint32_t live_len(const SmpVM *vm, const SmpInstr *in, uint32_t full)
+{
+    const SmpReg *r = &vm->regs[in->k];
+    const double  n = r->is_tensor ? 0.0 : r->s.f;
+    return n >= (double)full ? full : n >= 1.0 ? (uint32_t)n : 0u;
+}
+
+/* Первые n столбцов C = A x (первые n строк B)^T, остальные — нули. Каждый
+ * столбец — своё скалярное произведение, так что живые считаются ровно как
+ * без длины; мёртвые не считаются вовсе. */
+static void mmul_t_live(SmpVM *vm, const SmpInstr *in, const SmpBuf *c,
+                        const SmpBuf *a, const SmpBuf *b)
+{
+    const uint32_t M = c->t->shape[0], N = c->t->shape[1];
+    const uint32_t n = live_len(vm, in, N);
+    if (n > 0) {
+        SmpTensor ct = *c->t, bt = *b->t;
+        ct.shape[1] = n;
+        ct.nelem    = M * n;
+        bt.shape[0] = n;
+        bt.nelem    = n * bt.shape[1];
+        if (n < N) ct.flags = (uint16_t)(ct.flags & ~SMP_TF_CONTIG);
+        const SmpBuf c2 = { c->p, &ct }, b2 = { b->p, &bt };
+        smp_k_mmul_t(&c2, a, &b2, &vm->scratch);
+    }
+    const size_t esz = smp_dtype_size((SmpDType)c->t->dtype);
+    for (uint32_t m = 0; m < M && n < N; m++)
+        memset((uint8_t *)c->p + ((size_t)m * c->t->stride[0] + n) * esz, 0,
+               (size_t)(N - n) * esz);
+}
+
+/* C = (первые k столбцов A) x (первые k строк B): ось K обрезана. */
+static void mmul_live(SmpVM *vm, const SmpInstr *in, const SmpBuf *c,
+                      const SmpBuf *a, const SmpBuf *b)
+{
+    const uint32_t K = a->t->shape[1];
+    const uint32_t k = live_len(vm, in, K);
+    if (k == 0) {
+        smp_k_fill(c, 0.0);
+        return;
+    }
+    SmpTensor at = *a->t, bt = *b->t;
+    at.shape[1] = k;
+    at.nelem    = at.shape[0] * k;
+    bt.shape[0] = k;
+    bt.nelem    = k * bt.shape[1];
+    if (k < K) at.flags = (uint16_t)(at.flags & ~SMP_TF_CONTIG);
+    const SmpBuf a2 = { a->p, &at }, b2 = { b->p, &bt };
+    smp_k_gemm(c, &a2, &b2, &vm->scratch);
+}
+
+/* ========================================================================== */
 /*  Режимы с плавающей точкой                                                 */
 /* ========================================================================== */
 
@@ -1015,13 +1073,15 @@ dispatch_switch:
     VM_CASE(MMUL)
         /* Эпилог: @mmul -> @relu -> @add считается в выгрузке тайла, пока тот
          * лежит в L1. Не сошлось — обычный путь, а цепочка сольётся сама. */
-        if (SMP_UNLIKELY(in->flags & SMP_IF_FUSE) && vm_fuse_gemm(vm, &ip, in))
+        if (SMP_UNLIKELY(in->flags & SMP_IF_FUSE) && in->aux == 0 &&
+            vm_fuse_gemm(vm, &ip, in))
             VM_NEXT();
         apply_fp(vm, in->flags);
         if (!make_dst(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t) ||
             !make_buf(vm, &bb, &R[in->b].t)) return SMP_ERR_INTERNAL;
-        smp_k_gemm(&bd, &ba, &bb, &vm->scratch);
+        if (in->aux == 1) mmul_live(vm, in, &bd, &ba, &bb);
+        else              smp_k_gemm(&bd, &ba, &bb, &vm->scratch);
         VM_NEXT();
 
     VM_CASE(SUB)
@@ -1106,7 +1166,8 @@ dispatch_switch:
         if (!make_dst(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t) ||
             !make_buf(vm, &bb, &R[in->b].t)) return SMP_ERR_INTERNAL;
-        smp_k_mmul_t(&bd, &ba, &bb, &vm->scratch);
+        if (in->aux == 1) mmul_t_live(vm, in, &bd, &ba, &bb);
+        else              smp_k_mmul_t(&bd, &ba, &bb, &vm->scratch);
         VM_NEXT();
 
     VM_CASE(TRANS) {

@@ -578,6 +578,11 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
                 b = load_value(m, &st->args[0], &in->arg_val[i], flags, in->arena_id);
                 if (k == SMP_OP_SOFTMAX) kaux = 1;      /* b — длина строки */
             }
+            /* Живая длина @mmul и @mmul.t: её регистр — в k, aux = 1. */
+            if ((k == SMP_OP_MMUL || k == SMP_OP_MMUL_T) && st->nargs == 2) {
+                kk   = load_value(m, &st->args[1], &in->arg_val[i], flags, in->arena_id);
+                kaux = 1;
+            }
         }
 
         /* Вариант emit кодируется в aux — ровно так же, как тип константы
@@ -652,7 +657,9 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
             m->code[m->n_code - 2u].flags |= SMP_IF_FUSE;
 
         prev_instr = m->n_code ? m->n_code - 1u : 0xFFFFFFFFu;
-        prev_kind  = k;
+        /* @mmul с живой длиной цепочку не начинает: слитый эпилог считает
+         * весь тайл, а длину не знает. */
+        prev_kind  = (k == SMP_OP_MMUL && kaux == 1) ? SMP_OP__COUNT : k;
         if (!chain) chain_start = prev_instr;
         r = d;
     }
