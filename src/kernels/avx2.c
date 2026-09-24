@@ -642,37 +642,83 @@ static __m256 q8_lo8(const int8_t *q)
     return _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)q)));
 }
 
+/* Масштаб блока. Обычное f16 — сдвиг и смена смещения порядка, прямо в
+ * цикле; ноль, субнормальное, inf и NaN — редкость, их считает
+ * smp_f16_to_f32. Результат тот же бит в бит. */
+static inline float q8_scale(const uint8_t *blk)
+{
+    uint16_t h;
+    memcpy(&h, blk, sizeof h);
+    const uint32_t e = h & 0x7C00u;
+    if (SMP_LIKELY(e != 0 && e != 0x7C00u)) {
+        const uint32_t x = ((uint32_t)(h & 0x8000u) << 16) |
+                           (((uint32_t)(h & 0x7FFFu) << 13) + 0x38000000u);
+        float f;
+        memcpy(&f, &x, sizeof f);
+        return f;
+    }
+    return smp_f16_to_f32(h);
+}
+
+/* Блок b строки w: сумма x*q в четыре FMA, затем один раз на масштаб — в acc. */
+#define Q8_BLOCK(w, acc)                                                       \
+    do {                                                                       \
+        const uint8_t *blk_ = (w) + b * SMP_Q8_0_BYTES;                        \
+        const int8_t  *q_   = (const int8_t *)(blk_ + 2);                      \
+        __m256 s_ = _mm256_mul_ps(x0, q8_lo8(q_));                             \
+        s_ = _mm256_fmadd_ps(x1, q8_lo8(q_ +  8), s_);                         \
+        s_ = _mm256_fmadd_ps(x2, q8_lo8(q_ + 16), s_);                         \
+        s_ = _mm256_fmadd_ps(x3, q8_lo8(q_ + 24), s_);                         \
+        (acc) = _mm256_fmadd_ps(_mm256_set1_ps(q8_scale(blk_)), s_, (acc));    \
+    } while (0)
+
 /* Строки W с n0 по n1. Каждый выход считается одним проходом по своей
  * строке весов: внутри блока — сумма x*q в четыре FMA, затем она один раз
  * умножается на масштаб. При генерации M = 1, и вся работа — один проход по
- * весам, который упирается в память; распакованные веса никуда не пишутся. */
+ * весам, который упирается в память; распакованные веса никуда не пишутся.
+ *
+ * Строки идут по четыре: четыре независимые цепочки FMA и четыре потока
+ * чтения из памяти вместо одного, а x грузится один раз на все. Порядок
+ * действий в каждой строке тот же, что по одной, — и результат тоже. */
 void smp_ka_gemm_q8(float *C, size_t ldc, const float *A, size_t lda,
                     const uint8_t *W, size_t M, size_t K, size_t n0, size_t n1)
 {
     const size_t nb  = K / SMP_Q8_0_BLOCK;
     const size_t row = nb * SMP_Q8_0_BYTES;
 
-    for (size_t n = n0; n < n1; n++) {
-        const uint8_t *w = W + n * row;
-        for (size_t m = 0; m < M; m++) {
-            const float *a   = A + m * lda;
-            __m256       acc = _mm256_setzero_ps();
+    for (size_t m = 0; m < M; m++) {
+        const float *a = A + m * lda;
+        size_t       n = n0;
+        for (; n + 4 <= n1; n += 4) {
+            const uint8_t *w0 = W + n * row, *w1 = w0 + row, *w2 = w1 + row, *w3 = w2 + row;
+            __m256 c0 = _mm256_setzero_ps(), c1 = c0, c2 = c0, c3 = c0;
             for (size_t b = 0; b < nb; b++) {
-                const uint8_t *blk = w + b * SMP_Q8_0_BYTES;
-                const int8_t  *q   = (const int8_t *)(blk + 2);
-                const float   *x   = a + b * SMP_Q8_0_BLOCK;
-                uint16_t h;
-                memcpy(&h, blk, sizeof h);
-
-                __m256 s = _mm256_mul_ps(_mm256_loadu_ps(x), q8_lo8(q));
-                s = _mm256_fmadd_ps(_mm256_loadu_ps(x +  8), q8_lo8(q +  8), s);
-                s = _mm256_fmadd_ps(_mm256_loadu_ps(x + 16), q8_lo8(q + 16), s);
-                s = _mm256_fmadd_ps(_mm256_loadu_ps(x + 24), q8_lo8(q + 24), s);
-                acc = _mm256_fmadd_ps(_mm256_set1_ps(smp_f16_to_f32(h)), s, acc);
+                const float *x  = a + b * SMP_Q8_0_BLOCK;
+                const __m256 x0 = _mm256_loadu_ps(x),      x1 = _mm256_loadu_ps(x +  8);
+                const __m256 x2 = _mm256_loadu_ps(x + 16), x3 = _mm256_loadu_ps(x + 24);
+                Q8_BLOCK(w0, c0);
+                Q8_BLOCK(w1, c1);
+                Q8_BLOCK(w2, c2);
+                Q8_BLOCK(w3, c3);
             }
-            C[m * ldc + n] = hsum256(acc);
+            C[m * ldc + n]     = hsum256(c0);
+            C[m * ldc + n + 1] = hsum256(c1);
+            C[m * ldc + n + 2] = hsum256(c2);
+            C[m * ldc + n + 3] = hsum256(c3);
+        }
+        for (; n < n1; n++) {
+            const uint8_t *w0 = W + n * row;
+            __m256 c0 = _mm256_setzero_ps();
+            for (size_t b = 0; b < nb; b++) {
+                const float *x  = a + b * SMP_Q8_0_BLOCK;
+                const __m256 x0 = _mm256_loadu_ps(x),      x1 = _mm256_loadu_ps(x +  8);
+                const __m256 x2 = _mm256_loadu_ps(x + 16), x3 = _mm256_loadu_ps(x + 24);
+                Q8_BLOCK(w0, c0);
+            }
+            C[m * ldc + n] = hsum256(c0);
         }
     }
+#undef Q8_BLOCK
 }
 
 /* ========================================================================== */
