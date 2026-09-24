@@ -89,6 +89,17 @@ const char *smp_vm_backend(void) { return smp_kernels_name(); }
 /*  Диагностика времени исполнения                                            */
 /* ========================================================================== */
 
+/* Профиль: время с прошлой диспетчеризации — инструкции, которая только
+ * что кончилась. Слитая цепочка записывается на свою первую инструкцию. */
+static void vm_prof(SmpVM *vm)
+{
+    const double now = smp_plat_seconds();
+    if (vm->prof_started && vm->pc < vm->mod->n_code)
+        vm->prof[vm->pc] += now - vm->prof_last;
+    vm->prof_last    = now;
+    vm->prof_started = true;
+}
+
 static void vm_fatal(SmpVM *vm, SmpDiagCode code, const char *details,
                      const char *fix)
 {
@@ -803,6 +814,7 @@ SmpStatus smp_vm_run(SmpVM *vm)
      * или удалить объект. Хранилищу без адресов — своя копия, заводится
      * здесь, до первой инструкции, и остаётся до smp_vm_release. */
     vm->n_views = 0;
+    vm->prof_started = false;
     if (vm->mod->view_bytes && !vm->view_mem && !(vm->store && vm->store->map)) {
         vm->view_mem = (uint8_t *)smp_plat_pages((size_t)vm->mod->view_bytes);
         if (!vm->view_mem) return SMP_ERR_OOM;
@@ -829,6 +841,7 @@ SmpStatus smp_vm_run(SmpVM *vm)
         do {                                                                  \
             if (SMP_UNLIKELY(vm->trapped)) return SMP_ERR_INTERNAL;           \
             vm->n_executed++;                                                 \
+            if (SMP_UNLIKELY(vm->prof != NULL)) vm_prof(vm);                  \
             vm->pc = (uint32_t)(ip - code);                                   \
             in = ip++;                                                        \
             goto *dispatch[in->op];                                           \
@@ -839,6 +852,7 @@ SmpStatus smp_vm_run(SmpVM *vm)
         do {                                                                  \
             if (SMP_UNLIKELY(vm->trapped)) return SMP_ERR_INTERNAL;           \
             vm->n_executed++;                                                 \
+            if (SMP_UNLIKELY(vm->prof != NULL)) vm_prof(vm);                  \
             vm->pc = (uint32_t)(ip - code);                                   \
             in = ip++;                                                        \
             goto dispatch_switch;                                             \
@@ -860,6 +874,7 @@ dispatch_switch:
 #endif
 
     VM_CASE(HALT)
+        if (vm->prof) vm_prof(vm);
         return SMP_OK;
 
     VM_CASE(NOP)
