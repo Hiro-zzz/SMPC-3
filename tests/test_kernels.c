@@ -789,6 +789,123 @@ static void test_q8_gemm(void)
 }
 
 /* ========================================================================== */
+/*  Операции нейросети против эталона на libm хоста                          */
+/* ========================================================================== */
+
+static double max_abs_err(const float *ref, const float *got, size_t n)
+{
+    double worst = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        const double e = fabs((double)ref[i] - (double)got[i]);
+        if (!(e <= worst)) worst = e;              /* NaN тоже худший */
+    }
+    return worst;
+}
+
+static void test_nn(void)
+{
+    SECTION("silu, rmsnorm, softmax, rope, argmax, sub");
+
+    const uint32_t R = 5, C = 64;
+    SmpTensor t = mk(R, C);
+    SmpBuf in = { g_a, &t }, out = { g_got, &t };
+
+    fill_rand(g_a, (size_t)R * C);
+    for (size_t i = 0; i < (size_t)R * C; i++) g_a[i] *= 4.0f;    /* [-8, 8) */
+
+    /* silu */
+    smp_k_silu(&out, &in);
+    for (size_t i = 0; i < (size_t)R * C; i++)
+        g_ref[i] = (float)((double)g_a[i] / (1.0 + exp(-(double)g_a[i])));
+    CHECK(max_rel_err(g_ref, g_got, (size_t)R * C) < 1e-6, "silu: %g",
+          max_rel_err(g_ref, g_got, (size_t)R * C));
+
+    /* rmsnorm */
+    smp_k_rmsnorm(&out, &in, 1e-6);
+    for (uint32_t r = 0; r < R; r++) {
+        double ss = 0.0;
+        for (uint32_t j = 0; j < C; j++) ss += (double)g_a[r * C + j] * g_a[r * C + j];
+        const double inv = 1.0 / sqrt(ss / C + 1e-6);
+        for (uint32_t j = 0; j < C; j++) g_ref[r * C + j] = (float)(g_a[r * C + j] * inv);
+    }
+    CHECK(max_rel_err(g_ref, g_got, (size_t)R * C) < 1e-6, "rmsnorm: %g",
+          max_rel_err(g_ref, g_got, (size_t)R * C));
+
+    /* softmax: целиком и по первым len; хвост — нули, живые суммируются в 1 */
+    static const uint64_t lens[] = { UINT64_MAX, 64, 37, 1, 0 };
+    for (size_t li = 0; li < SMP_ARRLEN(lens); li++) {
+        const uint64_t L = lens[li] < C ? lens[li] : C;
+        smp_k_softmax(&out, &in, lens[li]);
+        uint32_t bad_sum = 0;
+        for (uint32_t r = 0; r < R; r++) {
+            double m = -INFINITY, s = 0.0, got_s = 0.0;
+            for (uint32_t j = 0; j < L; j++) if (g_a[r * C + j] > m) m = g_a[r * C + j];
+            for (uint32_t j = 0; j < L; j++) s += exp(g_a[r * C + j] - m);
+            for (uint32_t j = 0; j < C; j++) {
+                g_ref[r * C + j] = j < L ? (float)(exp(g_a[r * C + j] - m) / s) : 0.0f;
+                got_s += g_got[r * C + j];
+            }
+            if (L && fabs(got_s - 1.0) > 1e-5) bad_sum++;
+        }
+        CHECK(max_abs_err(g_ref, g_got, (size_t)R * C) < 1e-7,
+              "softmax(len=%llu): %g", (unsigned long long)lens[li],
+              max_abs_err(g_ref, g_got, (size_t)R * C));
+        CHECK(bad_sum == 0, "softmax(len=%llu): %u строк не в сумме 1",
+              (unsigned long long)lens[li], bad_sum);
+    }
+
+    /* rope: эталон как у Qwen2 в HF — частота и угол в f32 */
+    static const double poses[] = { 0.0, 1.0, 17.0, 4095.0, 32767.0 };
+    for (size_t pi = 0; pi < SMP_ARRLEN(poses); pi++) {
+        const double pos = poses[pi], theta = 1000000.0;
+        smp_k_rope(&out, &in, pos, theta);
+        const uint32_t half = C / 2;
+        for (uint32_t i = 0; i < half; i++) {
+            const float  inv = 1.0f / (float)pow(theta, (double)((float)(2 * i) / (float)C));
+            const float  ang = (float)pos * inv;
+            const float  c = (float)cos((double)ang), s = (float)sin((double)ang);
+            for (uint32_t r = 0; r < R; r++) {
+                const double x0 = g_a[r * C + i], x1 = g_a[r * C + i + half];
+                g_ref[r * C + i]        = (float)(x0 * c - x1 * s);
+                g_ref[r * C + i + half] = (float)(x1 * c + x0 * s);
+            }
+        }
+        CHECK(max_abs_err(g_ref, g_got, (size_t)R * C) < 2e-6, "rope(pos=%g): %g",
+              pos, max_abs_err(g_ref, g_got, (size_t)R * C));
+    }
+    smp_k_rope(&out, &in, 0.0, 10000.0);
+    CHECK(memcmp(g_a, g_got, (size_t)R * C * sizeof(float)) == 0, "rope(0) — не тождество");
+
+    /* На месте: вход и выход — один буфер. */
+    memcpy(g_b, g_a, (size_t)R * C * sizeof(float));
+    SmpBuf same = { g_b, &t };
+    smp_k_softmax(&same, &same, UINT64_MAX);
+    smp_k_softmax(&out, &in, UINT64_MAX);
+    CHECK(memcmp(g_b, g_got, (size_t)R * C * sizeof(float)) == 0, "softmax на месте разошёлся");
+
+    /* argmax: первый наибольший, NaN мимо, по виду с шагом */
+    for (size_t i = 0; i < (size_t)R * C; i++) g_a[i] = 0.0f;
+    g_a[70] = 3.0f; g_a[200] = 3.0f; g_a[5] = NAN;
+    CHECK(smp_k_argmax(&in) == 70, "argmax: %llu, ждали 70",
+          (unsigned long long)smp_k_argmax(&in));
+    SmpTensor col = t;
+    col.rank = 1; col.shape[0] = R; col.stride[0] = C; col.nelem = R;
+    SmpBuf cb = { g_a + 8, &col };                   /* столбец 8 */
+    g_a[3 * C + 8] = 1.0f;
+    CHECK(smp_k_argmax(&cb) == 3, "argmax по столбцу: %llu, ждали 3",
+          (unsigned long long)smp_k_argmax(&cb));
+
+    /* sub */
+    fill_rand(g_a, (size_t)R * C);
+    fill_rand(g_b, (size_t)R * C);
+    SmpBuf bb = { g_b, &t };
+    smp_k_sub(&out, &in, &bb);
+    uint32_t bad = 0;
+    for (size_t i = 0; i < (size_t)R * C; i++) if (g_got[i] != g_a[i] - g_b[i]) bad++;
+    CHECK(bad == 0, "sub: %u мимо", bad);
+}
+
+/* ========================================================================== */
 
 int main(void)
 {
@@ -811,6 +928,7 @@ int main(void)
     test_f16();
     test_q8_quant();
     test_q8_gemm();
+    test_nn();
 
     smp_kernels_select(SMP_KB_AUTO);
     free(g_scmem);

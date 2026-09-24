@@ -4,6 +4,7 @@
  * было с чем сверяться поэлементно. Читаемость важнее тактов.
  */
 #include "impl.h"
+#include "smpc3/fmath.h"
 
 #include <string.h>
 #include <math.h>
@@ -288,7 +289,14 @@ void smp_ks_zero(const SmpBuf *dst)
 /*  Бинарные                                                                  */
 /* ========================================================================== */
 
-static void binary(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b, bool mul)
+enum { BIN_ADD, BIN_MUL, BIN_SUB };
+
+static double bin_op(double x, double y, int op)
+{
+    return op == BIN_MUL ? x * y : op == BIN_SUB ? x - y : x + y;
+}
+
+static void binary(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b, int op)
 {
     const SmpTensor *td = dst->t, *ta = a->t, *tb = b->t;
     const SmpDType   dd = (SmpDType)td->dtype;
@@ -297,7 +305,7 @@ static void binary(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b, bool mul
     if (dense(td) && dense(ta) && dense(tb)) {
         for (uint32_t i = 0; i < td->nelem; i++) {
             const double x = load_at(a->p, da, i), y = load_at(b->p, db, i);
-            store_at(dst->p, dd, i, mul ? x * y : x + y);
+            store_at(dst->p, dd, i, bin_op(x, y, op));
         }
         return;
     }
@@ -306,7 +314,7 @@ static void binary(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b, bool mul
     do {
         const double x = load_at(a->p, da, elem_index(ta, idx));
         const double y = load_at(b->p, db, elem_index(tb, idx));
-        store_at(dst->p, dd, elem_index(td, idx), mul ? x * y : x + y);
+        store_at(dst->p, dd, elem_index(td, idx), bin_op(x, y, op));
     } while (idx_next(td, idx));
 }
 
@@ -323,7 +331,7 @@ void smp_ks_add(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b)
         const SmpDType dt = (SmpDType)dst->t->dtype;
         KS_BINARY_DENSE(x + y);
     }
-    binary(dst, a, b, false);
+    binary(dst, a, b, BIN_ADD);
 }
 
 void smp_ks_mul(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b)
@@ -333,7 +341,136 @@ void smp_ks_mul(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b)
         const SmpDType dt = (SmpDType)dst->t->dtype;
         KS_BINARY_DENSE(x * y);
     }
-    binary(dst, a, b, true);
+    binary(dst, a, b, BIN_MUL);
+}
+
+void smp_ks_sub(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b)
+{
+    if (dense_same3(dst, a, b)) {
+        const uint32_t n = dst->t->nelem;
+        const SmpDType dt = (SmpDType)dst->t->dtype;
+        KS_BINARY_DENSE(x - y);
+    }
+    binary(dst, a, b, BIN_SUB);
+}
+
+/* ========================================================================== */
+/*  Операции нейросети                                                        */
+/* ========================================================================== */
+
+/* Здесь только скалярные версии: на шаг модели они стоят доли процента
+ * против прохода по весам. Суммы — в double, экспоненты и тригонометрия —
+ * свои (fmath.h), чтобы результат не зависел от libm хозяина. Вход и выход
+ * могут совпадать: каждая строка сначала читается, потом пишется. */
+
+static double f_silu(double x, double k) { SMP_UNUSED(k); return x / (1.0 + smp_exp(-x)); }
+
+void smp_ks_silu(const SmpBuf *dst, const SmpBuf *src) { unary(dst, src, f_silu, 0.0); }
+
+/* Смещение первого элемента строки r (строки — по последней оси). */
+static size_t row_base(const SmpTensor *t, size_t r)
+{
+    size_t off = 0;
+    for (uint32_t i = t->rank - 1u; i-- > 0; ) {
+        off += (r % t->shape[i]) * (size_t)t->stride[i];
+        r   /= t->shape[i];
+    }
+    return off;
+}
+
+static size_t row_len(const SmpTensor *t) { return t->rank ? t->shape[t->rank - 1u] : 1u; }
+
+void smp_ks_rmsnorm(const SmpBuf *dst, const SmpBuf *src, double eps)
+{
+    const SmpTensor *td = dst->t, *ts = src->t;
+    const SmpDType   dd = (SmpDType)td->dtype, ds = (SmpDType)ts->dtype;
+    const size_t     n  = row_len(ts), rows = ts->nelem / n;
+    const size_t     sd = td->stride[td->rank - 1u], ss = ts->stride[ts->rank - 1u];
+
+    for (size_t r = 0; r < rows; r++) {
+        const size_t bs = row_base(ts, r), bd = row_base(td, r);
+        double sum = 0.0;
+        for (size_t j = 0; j < n; j++) {
+            const double x = load_at(src->p, ds, bs + j * ss);
+            sum += x * x;
+        }
+        const double inv = 1.0 / smp_sqrt(sum / (double)n + eps);
+        for (size_t j = 0; j < n; j++)
+            store_at(dst->p, dd, bd + j * sd, load_at(src->p, ds, bs + j * ss) * inv);
+    }
+}
+
+void smp_ks_softmax(const SmpBuf *dst, const SmpBuf *src, uint64_t len)
+{
+    const SmpTensor *td = dst->t, *ts = src->t;
+    const SmpDType   dd = (SmpDType)td->dtype, ds = (SmpDType)ts->dtype;
+    const size_t     n  = row_len(ts), rows = ts->nelem / n;
+    const size_t     sd = td->stride[td->rank - 1u], ss = ts->stride[ts->rank - 1u];
+    const size_t     L  = len < n ? (size_t)len : n;
+
+    for (size_t r = 0; r < rows; r++) {
+        const size_t bs = row_base(ts, r), bd = row_base(td, r);
+        double m = -HUGE_VAL, sum = 0.0;
+        for (size_t j = 0; j < L; j++) {
+            const double x = load_at(src->p, ds, bs + j * ss);
+            if (x > m) m = x;
+        }
+        for (size_t j = 0; j < L; j++)
+            sum += smp_exp(load_at(src->p, ds, bs + j * ss) - m);
+        /* Вторым проходом экспонента считается заново, а не читается из
+         * приёмника: там она уже была бы округлена до его типа. */
+        for (size_t j = 0; j < n; j++) {
+            const double y = j < L ? smp_exp(load_at(src->p, ds, bs + j * ss) - m) / sum : 0.0;
+            store_at(dst->p, dd, bd + j * sd, y);
+        }
+    }
+}
+
+/* Поворот как в Qwen2 у HF: пары (i, i + n/2), частота θ^(-2i/n). Частота
+ * и угол округляются до f32 ровно там, где их округляет эталон, — иначе на
+ * дальних позициях углы разошлись бы с теми, на которых модель училась. */
+void smp_ks_rope(const SmpBuf *dst, const SmpBuf *src, double pos, double theta)
+{
+    const SmpTensor *td = dst->t, *ts = src->t;
+    const SmpDType   dd = (SmpDType)td->dtype, ds = (SmpDType)ts->dtype;
+    const size_t     n  = row_len(ts), half = n / 2u, rows = ts->nelem / n;
+    const size_t     sd = td->stride[td->rank - 1u], ss = ts->stride[ts->rank - 1u];
+    const double     lt = smp_log(theta);
+    const float      fp = (float)pos;
+
+    for (size_t i = 0; i < half; i++) {
+        const float  ex  = (float)(2u * i) / (float)n;
+        const float  inv = 1.0f / (float)smp_exp((double)ex * lt);
+        const float  ang = fp * inv;
+        double s, c;
+        smp_sincos((double)ang, &s, &c);
+        const float fs = (float)s, fc = (float)c;
+
+        for (size_t r = 0; r < rows; r++) {
+            const size_t bs = row_base(ts, r), bd = row_base(td, r);
+            const double x0 = load_at(src->p, ds, bs + i * ss);
+            const double x1 = load_at(src->p, ds, bs + (i + half) * ss);
+            store_at(dst->p, dd, bd + i * sd,          x0 * fc - x1 * fs);
+            store_at(dst->p, dd, bd + (i + half) * sd, x1 * fc + x0 * fs);
+        }
+    }
+}
+
+uint64_t smp_ks_argmax(const SmpBuf *src)
+{
+    const SmpTensor *t  = src->t;
+    const SmpDType   dt = (SmpDType)t->dtype;
+    uint64_t best = 0, i = 0;
+    double   bv   = -HUGE_VAL;
+    bool     any  = false;
+
+    uint32_t idx[SMP_MAX_RANK] = { 0, 0, 0, 0 };
+    do {
+        const double v = load_at(src->p, dt, elem_index(t, idx));
+        if (v == v && (!any || v > bv)) { bv = v; best = i; any = true; }
+        i++;
+    } while (idx_next(t, idx));
+    return best;
 }
 
 /* ========================================================================== */

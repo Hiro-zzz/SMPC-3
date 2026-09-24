@@ -22,6 +22,12 @@ void   smp_ks_fill (const SmpBuf *dst, double v);
 void   smp_ks_zero (const SmpBuf *dst);
 void   smp_ks_add  (const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b);
 void   smp_ks_mul  (const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b);
+void   smp_ks_sub  (const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b);
+void   smp_ks_silu (const SmpBuf *dst, const SmpBuf *src);
+void   smp_ks_rmsnorm(const SmpBuf *dst, const SmpBuf *src, double eps);
+void   smp_ks_softmax(const SmpBuf *dst, const SmpBuf *src, uint64_t len);
+void   smp_ks_rope (const SmpBuf *dst, const SmpBuf *src, double pos, double theta);
+uint64_t smp_ks_argmax(const SmpBuf *src);
 void   smp_ks_fuse (const SmpBuf *dst, const SmpBuf *src,
                     const SmpFuseStep *steps, uint32_t nsteps);
 double smp_ks_fuse_reduce(const SmpBuf *src, const SmpFuseStep *steps,

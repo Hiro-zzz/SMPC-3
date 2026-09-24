@@ -328,6 +328,13 @@ static SmpOpcode op_to_bc(SmpOpKind k)
         case SMP_OP_SCALE:      return SMP_BC_SCALE;
         case SMP_OP_ADD:        return SMP_BC_ADD;
         case SMP_OP_MUL:        return SMP_BC_MUL;
+        case SMP_OP_SUB:        return SMP_BC_SUB;
+        case SMP_OP_SILU:       return SMP_BC_SILU;
+        case SMP_OP_RMSNORM:    return SMP_BC_RMSN;
+        case SMP_OP_SOFTMAX:    return SMP_BC_SOFTMX;
+        case SMP_OP_ROPE:       return SMP_BC_ROPE;
+        case SMP_OP_ARGMAX:     return SMP_BC_ARGMAX;
+        case SMP_OP_RESHAPE:    return SMP_BC_RESHP;
         case SMP_OP_REDUCE_ADD: return SMP_BC_REDADD;
         case SMP_OP_REDUCE_MAX: return SMP_BC_REDMAX;
         case SMP_OP_EMIT_TEXT:
@@ -352,10 +359,11 @@ static bool needs_buffer(SmpOpKind k)
         case SMP_OP_CAST_F32: case SMP_OP_CAST_F64:
         case SMP_OP_CAST_I32: case SMP_OP_CAST_U64: case SMP_OP_CAST_Q8_0:
         case SMP_OP_RELU: case SMP_OP_ABS: case SMP_OP_SCALE:
-        case SMP_OP_ADD:  case SMP_OP_MUL:
+        case SMP_OP_ADD:  case SMP_OP_MUL: case SMP_OP_SUB:
+        case SMP_OP_SILU: case SMP_OP_RMSNORM: case SMP_OP_SOFTMAX: case SMP_OP_ROPE:
             return true;
         default:
-            return false;   /* alloc, fill, transpose, reduce — на месте */
+            return false;   /* alloc, fill, transpose, reshape, reduce — на месте */
     }
 }
 
@@ -412,7 +420,8 @@ static bool fmt_uses_b(SmpOpFmt f) { return f == SMP_FMT_D_A_B || f == SMP_FMT_D
 static bool fmt_uses_a(SmpOpFmt f)
 {
     return f == SMP_FMT_D_A   || f == SMP_FMT_D_A_B  || f == SMP_FMT_D_A_K ||
-           f == SMP_FMT_D_A_B_K || f == SMP_FMT_T_A  || f == SMP_FMT_D_A_X;
+           f == SMP_FMT_D_A_B_K || f == SMP_FMT_T_A  || f == SMP_FMT_D_A_X ||
+           f == SMP_FMT_D_A_T;
 }
 
 /* Поднимает загрузки дескрипторов [from, n_code) выше всей цепочки — к
@@ -534,7 +543,21 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
         uint8_t  kaux = 0;
 
         /* Аргумент стадии. */
-        if (st->nargs >= 1) {
+        if (k == SMP_OP_RESHAPE) {
+            /* Размеры едут не аргументами, а дескриптором новой формы: VM
+             * берёт из него форму и шаги, а память оставляет прежней. */
+            kk = add_tens(m, &in->stage_out[i], 0, 0, 0);
+            if (kk == 0xFFFFFFFFu) return false;
+        } else if (k == SMP_OP_RMSNORM) {
+            const SmpAstOperand *ao = &st->args[0];
+            kk   = const_f64(m, ao->kind == SMP_OPD_INT ? (double)ao->ival : ao->fval);
+            kaux = (uint8_t)SMP_DT_F64;
+        } else if (k == SMP_OP_ROPE) {
+            const SmpAstOperand *th = &st->args[1];
+            b    = load_value(m, &st->args[0], &in->arg_val[i], flags, in->arena_id);
+            kk   = const_f64(m, th->kind == SMP_OPD_INT ? (double)th->ival : th->fval);
+            kaux = (uint8_t)SMP_DT_F64;
+        } else if (st->nargs >= 1) {
             if (k == SMP_OP_SCALE || k == SMP_OP_FILL) {
                 const SmpAstOperand *ao = &st->args[0];
                 if (ao->kind == SMP_OPD_INT) {
@@ -546,6 +569,7 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
                 }
             } else {
                 b = load_value(m, &st->args[0], &in->arg_val[i], flags, in->arena_id);
+                if (k == SMP_OP_SOFTMAX) kaux = 1;      /* b — длина строки */
             }
         }
 
@@ -594,11 +618,11 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
                 d = a;
             }
         } else if (k == SMP_OP_REDUCE_ADD || k == SMP_OP_REDUCE_MAX ||
-                   k == SMP_OP_STORE ||
+                   k == SMP_OP_STORE || k == SMP_OP_ARGMAX ||
                    (k >= SMP_OP_EMIT_TEXT && k <= SMP_OP_EMIT_NUM)) {
             d = alloc_temp(m);
             m->reg_scratch[d] = false;
-        } else if (k == SMP_OP_TRANSPOSE) {
+        } else if (k == SMP_OP_TRANSPOSE || k == SMP_OP_RESHAPE) {
             d = alloc_temp(m);
             m->reg_scratch[d] = m->reg_scratch[a];
         }

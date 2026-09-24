@@ -872,6 +872,83 @@ dispatch_switch:
         smp_k_gemm(&bd, &ba, &bb, &vm->scratch);
         VM_NEXT();
 
+    VM_CASE(SUB)
+        apply_fp(vm, in->flags);
+        if (!make_buf(vm, &bd, &R[in->d].t) ||
+            !make_buf(vm, &ba, &R[in->a].t) ||
+            !make_buf(vm, &bb, &R[in->b].t)) return SMP_ERR_INTERNAL;
+        smp_k_sub(&bd, &ba, &bb);
+        VM_NEXT();
+
+    VM_CASE(SILU)
+        apply_fp(vm, in->flags);
+        if (!make_buf(vm, &bd, &R[in->d].t) ||
+            !make_buf(vm, &ba, &R[in->a].t)) return SMP_ERR_INTERNAL;
+        smp_k_silu(&bd, &ba);
+        VM_NEXT();
+
+    VM_CASE(RMSN)
+        apply_fp(vm, in->flags);
+        if (!make_buf(vm, &bd, &R[in->d].t) ||
+            !make_buf(vm, &ba, &R[in->a].t)) return SMP_ERR_INTERNAL;
+        smp_k_rmsnorm(&bd, &ba, smp_const_as_double(mod->consts[in->k], in->aux));
+        VM_NEXT();
+
+    VM_CASE(SOFTMX) {
+        /* Длина из регистра: сколько первых элементов строки живые. Всё,
+         * что меньше нуля или не число, — ноль; больше строки — вся строка. */
+        uint64_t len = UINT64_MAX;
+        if (in->aux) {
+            const double n = R[in->b].is_tensor ? 0.0 : R[in->b].s.f;
+            len = n >= 1.8e19 ? UINT64_MAX : n >= 0.0 ? (uint64_t)n : 0u;
+        }
+        apply_fp(vm, in->flags);
+        if (!make_buf(vm, &bd, &R[in->d].t) ||
+            !make_buf(vm, &ba, &R[in->a].t)) return SMP_ERR_INTERNAL;
+        smp_k_softmax(&bd, &ba, len);
+        VM_NEXT();
+    }
+
+    VM_CASE(ROPE) {
+        const double pos = R[in->b].is_tensor ? 0.0 : R[in->b].s.f;
+        if (!(pos >= 0.0 && pos <= 16777216.0)) {
+            vm_fatal(vm, SMP_E0410,
+                     vfmt(vm, "Позиция @rope %g вне 0..2^24: угол считается в f32, "
+                              "и дальше позиции уже неразличимы.", pos), NULL);
+            return SMP_ERR_INTERNAL;
+        }
+        apply_fp(vm, in->flags);
+        if (!make_buf(vm, &bd, &R[in->d].t) ||
+            !make_buf(vm, &ba, &R[in->a].t)) return SMP_ERR_INTERNAL;
+        smp_k_rope(&bd, &ba, pos, smp_const_as_double(mod->consts[in->k], in->aux));
+        VM_NEXT();
+    }
+
+    VM_CASE(ARGMAX) {
+        uint64_t idx = 0;
+        if (R[in->a].is_tensor) {
+            if (!make_buf(vm, &ba, &R[in->a].t)) return SMP_ERR_INTERNAL;
+            idx = smp_k_argmax(&ba);
+        }
+        R[in->d].is_tensor = false;
+        R[in->d].s.f       = (double)idx;
+        R[in->d].dtype     = (uint8_t)SMP_DT_U64;
+        VM_NEXT();
+    }
+
+    VM_CASE(RESHP) {
+        /* Та же память, другая форма: смещение, арена и имя — от rA. */
+        const SmpTensor *nt = &mod->tens[in->k];
+        R[in->d] = R[in->a];
+        SmpTensor *t = &R[in->d].t;
+        t->rank  = nt->rank;
+        t->nelem = nt->nelem;
+        memcpy(t->shape, nt->shape, sizeof t->shape);
+        memcpy(t->stride, nt->stride, sizeof t->stride);
+        t->flags = (uint16_t)((t->flags & (uint16_t)~SMP_TF_TRANSPOSED) | SMP_TF_CONTIG);
+        VM_NEXT();
+    }
+
     VM_CASE(MMULT)
         apply_fp(vm, in->flags);
         if (!make_buf(vm, &bd, &R[in->d].t) ||

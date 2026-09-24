@@ -278,7 +278,8 @@ SmpStatus smp_s3b_read(SmpModule *m, const char *path, SmpArena *arena,
             return SMP_ERR_IO;
         }
         const SmpOpFmt fmt = g_bc[in->op].fmt;
-        const bool uses_tens = (fmt == SMP_FMT_D_T || fmt == SMP_FMT_T_A);
+        const bool uses_tens = (fmt == SMP_FMT_D_T || fmt == SMP_FMT_T_A ||
+                                fmt == SMP_FMT_D_A_T);
         const bool uses_const = (fmt == SMP_FMT_D_K || fmt == SMP_FMT_D_A_K ||
                                  fmt == SMP_FMT_D_A_B_K);
         if (uses_tens && in->k >= m->n_tens) {
@@ -427,9 +428,19 @@ void smp_disasm(FILE *out, const SmpModule *m, bool color)
             case SMP_FMT_D_A_B_K:
                 fprintf(out, "%sr%u, r%u, r%u%s, K%u", dc(color, D_REG), in->d, in->a,
                         in->b, dc(color, D_RESET), in->k);
-                if (in->k < m->n_consts)
+                if (in->k < m->n_consts && in->op == SMP_BC_SLICED)
                     fprintf(out, " %s(шаг %llu Б)%s", dc(color, D_DIM),
                             (unsigned long long)m->consts[in->k].u, dc(color, D_RESET));
+                else if (in->k < m->n_consts)
+                    fprintf(out, " %s(%s %g)%s", dc(color, D_DIM),
+                            smp_dtype_name((SmpDType)in->aux),
+                            smp_const_as_double(m->consts[in->k], in->aux),
+                            dc(color, D_RESET));
+                break;
+            case SMP_FMT_D_A_T:
+                fprintf(out, "%sr%u, r%u%s, ", dc(color, D_REG), in->d, in->a,
+                        dc(color, D_RESET));
+                print_tensor(out, m, in->k, color);
                 break;
         }
         fputc('\n', out);

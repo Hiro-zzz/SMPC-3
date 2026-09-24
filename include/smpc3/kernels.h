@@ -31,6 +31,23 @@ void smp_k_zero (const SmpBuf *dst);
 void smp_k_add(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b);
 void smp_k_mul(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b);
 
+void smp_k_sub(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b);
+
+/* --- Операции нейросети ----------------------------------------------------
+ *
+ * Всё — по последней оси, строка за строкой; вход и выход могут совпадать.
+ *   silu     x / (1 + e^-x)
+ *   rmsnorm  x / sqrt(mean(x^2) + eps)
+ *   softmax  по первым len элементам строки; остальные — нули
+ *   rope     поворот пар (i, i + n/2) на угол pos * theta^(-2i/n), как у Qwen2
+ *   argmax   номер первого наибольшего элемента в логическом порядке; NaN
+ *            пропускаются */
+void     smp_k_silu   (const SmpBuf *dst, const SmpBuf *src);
+void     smp_k_rmsnorm(const SmpBuf *dst, const SmpBuf *src, double eps);
+void     smp_k_softmax(const SmpBuf *dst, const SmpBuf *src, uint64_t len);
+void     smp_k_rope   (const SmpBuf *dst, const SmpBuf *src, double pos, double theta);
+uint64_t smp_k_argmax (const SmpBuf *src);
+
 /* --- Слияние поэлементных стадий -------------------------------------------
  *
  * Цепочка вида @add -> @relu -> @scale делала проход по памяти на каждую

@@ -585,6 +585,41 @@ static void test_q8(void)
 
 /* ========================================================================== */
 
+/* Операции модели: всё по строкам, типы — f32/f64, параметры модели —
+ * литералами, данные — регистрами. */
+#define NN "*&X<f32:2,64> -> @alloc => $x;\n"
+
+static void test_nn_ops(void)
+{
+    SECTION("операции модели");
+
+    expect_clean(NN "5 => $p;\n3 => $n;\n"
+                    "*&X -> @rmsnorm(0.000001) -> @silu => *&A<f32:2,64>;\n"
+                    "*&X -> @rope($p, 1000000.0) => *&B<f32:2,64>;\n"
+                    "*&X -> @softmax($n) => *&C<f32:2,64>;\n"
+                    "*&X -> @softmax -> @sub(*&C) => *&D<f32:2,64>;\n"
+                    "*&X -> @reshape(4,32) => *&H<f32:4,32>;\n"
+                    "*&X -> @reshape(128) -> @argmax => $i;",
+                 "rmsnorm, silu, rope, softmax, sub, reshape, argmax");
+
+    expect_err("*&I<i32:2,8> -> @alloc => $i;\n*&I -> @silu => *&J<i32:2,8>;",
+               SMP_E0303, "silu над i32");
+    expect_err(NN "1 => $e;\n*&X -> @rmsnorm($e) => *&A<f32:2,64>;",
+               SMP_E0309, "eps регистром");
+    expect_err(NN "*&X -> @softmax(*&X) => *&A<f32:2,64>;", SMP_E0309, "длина тензором");
+    expect_err(NN "*&X -> @rope(*&X, 10000.0) => *&A<f32:2,64>;", SMP_E0309, "позиция тензором");
+    expect_err(NN "1 => $p;\n2 => $t;\n*&X -> @rope($p, $t) => *&A<f32:2,64>;",
+               SMP_E0309, "основание регистром");
+    expect_err("*&O<f32:2,7> -> @alloc => $o;\n*&O -> @rope(1, 10000.0) => *&A<f32:2,7>;",
+               SMP_E0309, "rope по нечётной оси");
+    expect_err(NN "*&X -> @reshape(3,40) => *&A<f32:3,40>;", SMP_E0309, "reshape: не то число элементов");
+    expect_err(NN "*&X -> @reshape(0,128) => $a;", SMP_E0309, "reshape: нулевая ось");
+    expect_err(NN "*&X[.., 3] -> @reshape(2,1) => $a;", SMP_E0309, "reshape вида с шагом");
+    expect_err(NN "*&X -> @argmax => *&A<u64:1>;", SMP_E0303, "argmax в тензор");
+}
+
+/* ========================================================================== */
+
 int main(void)
 {
     smp_console_setup();
@@ -607,6 +642,7 @@ int main(void)
     test_registries();
     test_repeat();
     test_q8();
+    test_nn_ops();
     test_fileio_rules();
 
     fclose(g_sink);

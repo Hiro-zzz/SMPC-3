@@ -3,11 +3,13 @@
 #include "smpc3/cpu.h"
 #include "smpc3/diag.h"
 #include "smpc3/types.h"
+#include "smpc3/fmath.h"
 
 #include "harness.h"
 
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 /* ========================================================================== */
 
@@ -433,6 +435,67 @@ static void test_diag_mute(void)
     fclose(f);
 }
 
+/* Свои exp, log, sin, cos против libm хоста. Допуск — несколько ulp
+ * результата плюс крошечный абсолютный: около нулей синуса приведение
+ * тремя частями pi/2 честно теряет относительную точность, а libm с её
+ * Payne–Hanek — нет. */
+static uint64_t g_fm = 0x9E3779B97F4A7C15ull;
+
+static double fm_rand(double lo, double hi)
+{
+    g_fm ^= g_fm << 13; g_fm ^= g_fm >> 7; g_fm ^= g_fm << 17;
+    return lo + (hi - lo) * ((double)(g_fm >> 11) / 9007199254740992.0);
+}
+
+static bool fm_close(double got, double want, double ulps)
+{
+    if (isnan(want)) return isnan(got);
+    if (isinf(want)) return got == want;
+    const double ulp = want == 0.0 ? 4.9e-324 : fabs(nextafter(want, INFINITY) - want);
+    return fabs(got - want) <= ulps * ulp + 1e-22;
+}
+
+static void test_fmath(void)
+{
+    SECTION("exp, log, sin, cos");
+
+    uint32_t bad = 0;
+    double worst_x = 0.0;
+    for (uint32_t i = 0; i < 200000u; i++) {
+        const double x = i % 4u == 0 ? fm_rand(-745.0, 709.7)
+                       : i % 4u == 1 ? fm_rand(-20.0, 20.0)
+                       : fm_rand(-1e-3, 1e-3);
+        if (!fm_close(smp_exp(x), exp(x), 2.0)) { bad++; worst_x = x; }
+    }
+    CHECK(bad == 0, "exp: %u мимо, например exp(%.17g) = %.17g, libm %.17g",
+          bad, worst_x, smp_exp(worst_x), exp(worst_x));
+    CHECK(smp_exp(710.0) == INFINITY && smp_exp(-746.0) == 0.0 && smp_exp(0.0) == 1.0,
+          "exp: края");
+    CHECK(isnan(smp_exp(NAN)), "exp(NaN)");
+
+    bad = 0;
+    for (uint32_t i = 0; i < 200000u; i++) {
+        const double x = i % 3u == 0 ? exp(fm_rand(-744.0, 709.0))
+                       : i % 3u == 1 ? fm_rand(0.5, 2.0) : fm_rand(1e-310, 1e-305);
+        if (!fm_close(smp_log(x), log(x), 2.0)) { bad++; worst_x = x; }
+    }
+    CHECK(bad == 0, "log: %u мимо, например log(%.17g) = %.17g, libm %.17g",
+          bad, worst_x, smp_log(worst_x), log(worst_x));
+    CHECK(smp_log(1.0) == 0.0 && isinf(smp_log(0.0)) && isnan(smp_log(-1.0)), "log: края");
+
+    bad = 0;
+    for (uint32_t i = 0; i < 200000u; i++) {
+        const double x = i % 3u == 0 ? fm_rand(-40000.0, 40000.0)
+                       : i % 3u == 1 ? fm_rand(-7.0, 7.0) : fm_rand(-1e-6, 1e-6);
+        double s, c;
+        smp_sincos(x, &s, &c);
+        if (!fm_close(s, sin(x), 2.0) || !fm_close(c, cos(x), 2.0)) { bad++; worst_x = x; }
+    }
+    CHECK(bad == 0, "sin/cos: %u мимо, например x = %.17g", bad, worst_x);
+
+    CHECK(smp_sqrt(2.0) == sqrt(2.0) && smp_sqrt(0.0) == 0.0, "sqrt");
+}
+
 int main(void)
 {
     smp_console_setup();
@@ -445,6 +508,7 @@ int main(void)
     test_diag_pools();
     test_diag_own();
     test_diag_mute();
+    test_fmath();
 
     return REPORT();
 }

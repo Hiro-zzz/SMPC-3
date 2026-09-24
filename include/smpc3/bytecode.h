@@ -31,7 +31,8 @@ typedef enum SmpOpFmt {
     SMP_FMT_D_A_K,
     SMP_FMT_D_A_B_K,
     SMP_FMT_T_A,
-    SMP_FMT_D_A_X    /* D, A, а в aux — вариант операции */
+    SMP_FMT_D_A_X,   /* D, A, а в aux — вариант операции */
+    SMP_FMT_D_A_T    /* D, A и дескриптор T: новая форма для A */
 } SmpOpFmt;
 
 /*   X(суффикс, мнемоника, формат, описание)                                  */
@@ -65,7 +66,14 @@ typedef enum SmpOpFmt {
     X(STORE,  "store",   SMP_FMT_D_A,     "rA -> привязанный файл; rD <- байт") \
     X(STORER, "storer",  SMP_FMT_D_A,     "rA -> вид в rD (срез с индексом-регистром)") \
     X(MMULT,  "mmul.t",  SMP_FMT_D_A_B,   "rD <- rA x rB^T")                   \
-    X(CVTQ80, "cvt.q8_0", SMP_FMT_D_A,    "rD <- (q8_0)rA, блоками по 32")
+    X(CVTQ80, "cvt.q8_0", SMP_FMT_D_A,    "rD <- (q8_0)rA, блоками по 32")    \
+    X(SUB,    "sub",     SMP_FMT_D_A_B,   "rD <- rA - rB поэлементно")         \
+    X(SILU,   "silu",    SMP_FMT_D_A,     "rD <- rA / (1 + e^-rA)")            \
+    X(RMSN,   "rmsnorm", SMP_FMT_D_A_K,   "rD <- строки rA / rms, eps = K")    \
+    X(SOFTMX, "softmax", SMP_FMT_D_A_B,   "rD <- softmax строк rA; aux=1: длина rB") \
+    X(ROPE,   "rope",    SMP_FMT_D_A_B_K, "rD <- RoPE(rA), позиция rB, основание K") \
+    X(ARGMAX, "argmax",  SMP_FMT_D_A,     "rD <- номер наибольшего в rA")      \
+    X(RESHP,  "reshape", SMP_FMT_D_A_T,   "rD <- rA в форме T, память та же")
 
 #define SMP_BC_ENUM(id, mn, fmt, desc) SMP_BC_##id,
 typedef enum SmpOpcode {

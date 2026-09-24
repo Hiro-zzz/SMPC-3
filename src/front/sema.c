@@ -713,6 +713,11 @@ static bool require_rank(Ctx *c, const SmpValue *v, uint32_t rank, SmpSpan sp,
     return false;
 }
 
+static bool is_number(const SmpAstOperand *o)
+{
+    return o->kind == SMP_OPD_INT || o->kind == SMP_OPD_FLOAT;
+}
+
 static bool apply_stage(Ctx *c, const SmpAstStage *st, SmpOpKind k, SmpValue *v)
 {
     const SmpOpDef *def = smp_op_def(k);
@@ -960,7 +965,8 @@ static bool apply_stage(Ctx *c, const SmpAstStage *st, SmpOpKind k, SmpValue *v)
             return true;
 
         case SMP_OP_ADD:
-        case SMP_OP_MUL: {
+        case SMP_OP_MUL:
+        case SMP_OP_SUB: {
             if (!require_tensor(c, v, st->span, def->name)) return false;
             if (a0.is_scalar) {
                 serr(c, SMP_E0309, st->args[0].span,
@@ -983,6 +989,104 @@ static bool apply_stage(Ctx *c, const SmpAstStage *st, SmpOpKind k, SmpValue *v)
                           val_sig(v, s1, sizeof s1), val_sig(&a0, s2, sizeof s2)), NULL);
                 return false;
             }
+            return true;
+        }
+
+        case SMP_OP_SILU:
+        case SMP_OP_RMSNORM:
+        case SMP_OP_SOFTMAX:
+        case SMP_OP_ROPE:
+            /* Строки — по последней оси; форма и тип не меняются. */
+            if (!require_tensor(c, v, st->span, def->name)) return false;
+            if (v->dtype != SMP_DT_F32 && v->dtype != SMP_DT_F64) {
+                serr(c, SMP_E0303, st->span,
+                     sfmt(c, "@%s считает над f32 или f64, а на входе %s.",
+                          def->name, smp_dtype_name(v->dtype)),
+                     "Приведи явно через @cast.f32.");
+                return false;
+            }
+            if (k == SMP_OP_RMSNORM && !is_number(&st->args[0])) {
+                serr(c, SMP_E0309, st->args[0].span,
+                     "eps у @rmsnorm — числовой литерал: он известен, когда пишется программа.",
+                     "Например: @rmsnorm(0.000001).");
+                return false;
+            }
+            if (k == SMP_OP_SOFTMAX && st->nargs == 1 && !a0.is_scalar) {
+                serr(c, SMP_E0309, st->args[0].span,
+                     "Аргумент @softmax — сколько первых элементов строки учитывать; "
+                     "это число, а получен тензор.", NULL);
+                return false;
+            }
+            if (k == SMP_OP_ROPE) {
+                if (!a0.is_scalar) {
+                    serr(c, SMP_E0309, st->args[0].span,
+                         "Позиция у @rope — число (регистр или литерал), а получен тензор.",
+                         NULL);
+                    return false;
+                }
+                if (!is_number(&st->args[1])) {
+                    serr(c, SMP_E0309, st->args[1].span,
+                         "Основание у @rope — числовой литерал: оно часть модели, а не данных.",
+                         "У Qwen2.5 это 1000000.0.");
+                    return false;
+                }
+                if (v->shape[v->rank - 1u] % 2u) {
+                    serr(c, SMP_E0309, st->span,
+                         sfmt(c, "@rope поворачивает пары (i, i + n/2), а последняя ось "
+                                 "нечётная: %u.", v->shape[v->rank - 1u]), NULL);
+                    return false;
+                }
+            }
+            return true;
+
+        case SMP_OP_ARGMAX:
+            if (v->dtype == SMP_DT_RAW_PTR) {
+                serr(c, SMP_E0303, st->span, "@argmax не определён для raw_ptr.", NULL);
+                return false;
+            }
+            v->is_scalar = true;
+            v->rank      = 0;
+            v->dtype     = SMP_DT_U64;         /* номер элемента */
+            v->sym       = SMP_SYM_NONE;
+            v->flags     = SMP_TF_CONTIG;
+            v->byte_off  = 0;
+            return true;
+
+        case SMP_OP_RESHAPE: {
+            /* Вид, а не копия: память та же, поэтому и плотность обязательна —
+             * у среза с шагом строки новой формы легли бы не туда. */
+            if (!require_tensor(c, v, st->span, "reshape")) return false;
+            if (!(v->flags & SMP_TF_CONTIG)) {
+                serr(c, SMP_E0309, st->span,
+                     "@reshape меняет форму плотного тензора, а у этого шаг.",
+                     "Материализуй его через @pack.");
+                return false;
+            }
+            SmpValue out = *v;
+            uint64_t n   = 1;
+            out.rank = st->nargs;
+            for (uint32_t i = 0; i < st->nargs; i++) {
+                const SmpAstOperand *o = &st->args[i];
+                if (o->kind != SMP_OPD_INT || o->ival == 0 || o->ival > SMP_DIM_MAX) {
+                    serr(c, SMP_E0309, o->span,
+                         "Размеры @reshape — целые литералы от 1.", NULL);
+                    return false;
+                }
+                out.shape[i] = (uint32_t)o->ival;
+                n *= o->ival;
+            }
+            if (n != val_nelem(v)) {
+                char sig[80];
+                serr(c, SMP_E0309, st->span,
+                     sfmt(c, "В %s %llu элементов, а новая форма даёт %llu.",
+                          val_sig(v, sig, sizeof sig),
+                          (unsigned long long)val_nelem(v), (unsigned long long)n),
+                     NULL);
+                return false;
+            }
+            out.flags = (uint16_t)(out.flags & (uint16_t)~SMP_TF_TRANSPOSED);
+            val_dense(&out);
+            *v = out;
             return true;
         }
 

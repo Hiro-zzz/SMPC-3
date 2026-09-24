@@ -1119,6 +1119,29 @@ static void test_q8(void)
     }
 }
 
+/* Как в модели: линейный слой в скретч, @reshape в головы, RoPE по позиции
+ * из регистра, softmax по живой длине — и всё это через регистры и виды,
+ * без копий. Числа подобраны так, чтобы проверять точно. */
+static void test_nn_chain(void)
+{
+    SECTION("цепочка модели");
+
+    CHECK(run_str("[#arena:1] *&W<f32:8,4> -> @fill(0.25) => *&W;\n"
+                  "[#arena:0] *&x<f32:1,4> -> @fill(1.0) => *&x;\n"
+                  "*&x -> @mmul.t(*&W) -> @reshape(2,4) => $h;\n"
+                  "0 => $p;\n"
+                  "$h -> @rope($p, 10000.0) -> @softmax($p) => *&S<f32:2,4>;\n"
+                  "2 => $n;\n"
+                  "$h -> @softmax($n) => *&T<f32:2,4>;\n"
+                  "*&T -> @reshape(8) -> @argmax => $i;\n"), "цепочка");
+    CHECK(felem("S", 0) == 0.0f && felem("S", 7) == 0.0f, "softmax(0) — не нули");
+    CHECK(felem("T", 0) == 0.5f && felem("T", 1) == 0.5f && felem("T", 2) == 0.0f &&
+          felem("T", 5) == 0.5f && felem("T", 7) == 0.0f,
+          "softmax(2): T = %g %g %g .. %g %g", felem("T", 0), felem("T", 1),
+          felem("T", 2), felem("T", 5), felem("T", 7));
+    CHECK(regval("i", NULL) == 0.0, "argmax %g, ждали 0", regval("i", NULL));
+}
+
 int main(void)
 {
     smp_console_setup();
@@ -1148,6 +1171,7 @@ int main(void)
     test_fileio();
     test_store();
     test_q8();
+    test_nn_chain();
 
     smp_vm_release(&g_vm);
     fclose(g_sink);
