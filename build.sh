@@ -117,5 +117,20 @@ if [[ "$MODE" == "test" || "${2:-}" == "test" ]]; then
     echo
     ./tests/golden.sh || RC=1
 
+    # Шаг Qwen2 против эталона на Python. Нужен интерпретатор, который
+    # действительно запускается: python3 на Windows бывает заглушкой.
+    PY=""
+    for p in python python3; do
+        if "$p" -c "import sys" >/dev/null 2>&1; then PY="$p"; break; fi
+    done
+    echo
+    echo "SMPC3 tests :: шаг Qwen2 против эталона"
+    echo
+    if [[ -n "$PY" ]]; then
+        "$PY" -X utf8 tests/qwen_step.py "$BIN" || RC=1
+    else
+        echo "  пропущено: нет Python"
+    fi
+
     exit $RC
 fi
