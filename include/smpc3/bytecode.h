@@ -184,7 +184,7 @@ SMP_INLINE double smp_const_as_double(SmpConst c, uint8_t dtype)
 #define SMP_S3B_MAGIC3 0x33u  /* '3' */
 
 #define SMP_S3B_VER_MAJOR 0u
-#define SMP_S3B_VER_MINOR 1u
+#define SMP_S3B_VER_MINOR 2u
 
 enum SmpS3bFlags {
     SMP_S3B_LITTLE_ENDIAN = 1u << 0,

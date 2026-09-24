@@ -337,7 +337,7 @@ static void print_tensor(FILE *o, const SmpModule *m, uint32_t idx, bool color)
     fprintf(o, "%s<%s", smp_module_str(m, t->name_id), smp_dtype_name((SmpDType)t->dtype));
     for (uint32_t i = 0; i < t->rank; i++)
         fprintf(o, "%s%u", i ? "," : ":", (unsigned)t->shape[i]);
-    fprintf(o, "> a%u:0x%X", smp_tf_arena(t->flags), t->off);
+    fprintf(o, "> a%u:0x%llX", smp_tf_arena(t->flags), (unsigned long long)t->off);
 }
 
 void smp_disasm(FILE *out, const SmpModule *m, bool color)

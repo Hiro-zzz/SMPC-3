@@ -71,7 +71,7 @@ static void test_types(void)
 {
     SECTION("types");
 
-    CHECK(sizeof(SmpTensor) == 32, "дескриптор %zu байт вместо 32", sizeof(SmpTensor));
+    CHECK(sizeof(SmpTensor) == 64, "дескриптор %zu байт вместо 64", sizeof(SmpTensor));
 
     CHECK(smp_dtype_size(SMP_DT_F32) == 4, "f32 не 4 байта");
     CHECK(smp_dtype_size(SMP_DT_F64) == 8, "f64 не 8 байт");
@@ -85,7 +85,7 @@ static void test_types(void)
     CHECK(smp_dtype_lanes(SMP_DT_F32, 256) == 8, "f32 дорожек в v256");
     CHECK(smp_dtype_lanes(SMP_DT_F64, 512) == 8, "f64 дорожек в v512");
 
-    uint16_t shape[3] = { 2, 3, 4 };
+    uint32_t shape[3] = { 2, 3, 4 };
     SmpTensor t;
     smp_tensor_dense(&t, SMP_DT_F32, 3, shape);
 
@@ -107,6 +107,15 @@ static void test_types(void)
     CHECK(smp_tensor_same_shape(&t, &u), "одинаковые формы не совпали");
     u.shape[1] = 9;
     CHECK(!smp_tensor_same_shape(&t, &u), "разные формы совпали");
+
+    /* Ось словаря языковой модели: больше 65535, шаг тоже. */
+    uint32_t vocab[2] = { 151936, 896 };
+    SmpTensor w;
+    smp_tensor_dense(&w, SMP_DT_F32, 2, vocab);
+    CHECK(w.shape[0] == 151936 && w.stride[0] == 896, "ось словаря %u, шаг %u",
+          w.shape[0], w.stride[0]);
+    CHECK(w.nelem == 151936u * 896u, "nelem словаря %u", w.nelem);
+    CHECK(smp_tensor_bytes(&w) == 151936ull * 896ull * 4ull, "байт словаря");
 
     char sig[64];
     smp_tensor_sig(&t, sig, sizeof sig);

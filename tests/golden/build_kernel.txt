@@ -10,7 +10,7 @@ $ smpc3 build examples/kernel.smpc -o <tmp>/kernel.s3b -S
     +-- ИСПРАВЛЕНИЕ: Либо используй результат, либо не вычисляй его.
 собрано: <tmp>/kernel.s3b (14 инстр., 5 дескр., 0 конст.)
 итог: 1 предупреждение
-arena#1 'compile' 1.5 MiB / 128.0 MiB (peak 1.5 MiB, 116 allocs)
+arena#1 'compile' 1.7 MiB / 128.0 MiB (peak 1.7 MiB, 116 allocs)
 
 ; модуль: 14 инструкций, 5 дескрипторов, 0 констант, 6 регистров
 ; арена #0: 12587008 байт

@@ -105,7 +105,7 @@ static uint32_t const_u64(Em *m, uint64_t u) { SmpConst c; c.u = u; return inter
 static uint32_t const_f64(Em *m, double f)   { SmpConst c; c.f = f; return intern_const(m, c); }
 
 /* Запись в таблице дескрипторов. Возвращает индекс или UINT32_MAX. */
-static uint32_t add_tens(Em *m, const SmpValue *v, uint32_t abs_off,
+static uint32_t add_tens(Em *m, const SmpValue *v, uint64_t abs_off,
                          uint32_t name_id, uint32_t arena_id)
 {
     SmpTensor t;
@@ -126,9 +126,9 @@ static uint32_t add_tens(Em *m, const SmpValue *v, uint32_t abs_off,
 
     /* Один и тот же тензор упоминается в десятке инструкций, и каждая клала в
      * таблицу собственную копию дескриптора: A из семи строк давал восемь
-     * одинаковых записей по 32 байта. Сравнение побайтовое и потому полное —
-     * в дескрипторе нет ни выравнивающих дыр, ни полей, которые здесь можно
-     * было бы не учесть (32 байта без дыр — инвариант, закреплённый в types.h).
+     * одинаковых записей. Сравнение побайтовое и потому полное — в дескрипторе
+     * нет ни выравнивающих дыр, ни полей, которые здесь можно было бы не
+     * учесть (64 байта без дыр — инвариант, закреплённый в types.h).
      * Срез отличается формой, шагом или смещением, так что с полным видом он
      * не сольётся. */
     for (uint32_t i = 0; i < m->n_tens; i++)
@@ -146,7 +146,8 @@ static uint32_t add_tens(Em *m, const SmpValue *v, uint32_t abs_off,
 /* Дескриптор для значения, привязанного к символу (в т.ч. срез). */
 static uint32_t tens_for_value(Em *m, const SmpValue *v, uint32_t fallback_arena)
 {
-    uint32_t base_off = 0, name_id = 0, arena = fallback_arena;
+    uint64_t base_off = 0;
+    uint32_t name_id = 0, arena = fallback_arena;
     if (v->sym != SMP_SYM_NONE) {
         const SmpSym *s = &m->sema->syms[v->sym];
         base_off = s->offset;
@@ -168,12 +169,7 @@ static uint32_t tens_scratch(Em *m, const SmpValue *v, uint32_t arena_id)
 
     uint64_t *cur = &m->arena_bytes[arena_id];
     *cur = SMP_ALIGN_UP(*cur, SMP_CACHELINE);
-    if (*cur + sz > 0xFFFFFFFFull) {
-        eerr(m, SMP_E0401, m->cur_span,
-             efmt(m, "Арена #%u перевалила за 4 ГиБ при размещении временных.", arena_id));
-        return 0xFFFFFFFFu;
-    }
-    const uint32_t off = (uint32_t)*cur;
+    const uint64_t off = *cur;
     *cur += sz;
     if (arena_id > m->max_arena) m->max_arena = arena_id;
 
@@ -302,7 +298,7 @@ static uint32_t load_value(Em *m, const SmpAstOperand *o, const SmpValue *v,
                 }
             }
             if (!found) continue;
-            const uint32_t stride_bytes = base->val.stride[ax] * esz;
+            const uint64_t stride_bytes = (uint64_t)base->val.stride[ax] * esz;
             emit_aux(m, SMP_BC_SLICED, flags, r, r, ridx,
                      const_u64(m, stride_bytes), (uint8_t)SMP_DT_U64);
         }

@@ -96,7 +96,7 @@ $ smpc3 build examples/repeat.smpc -o <tmp>/repeat.s3b -S
 0067  [v256              ] loadt    r2, T3 M<f32:8> a0:0x40
 0068  [v256              ] loadt    r3, T23 %t23<f32:8> aсобрано: <tmp>/repeat.s3b (104 инстр., 35 дескр., 8 конст.)
 итог: 2 предупреждения
-arena#1 'compile' 1.6 MiB / 128.0 MiB (peak 1.6 MiB, 282 allocs)
+arena#1 'compile' 1.8 MiB / 128.0 MiB (peak 1.8 MiB, 282 allocs)
 0:0x180
 0069  [v256,fuse         ] abs      r3, r2
 0070  [v256              ] redadd   r4, r3

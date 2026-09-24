@@ -264,7 +264,7 @@ static bool val_contiguous(const SmpValue *v)
 {
     uint32_t acc = 1;
     for (uint32_t i = v->rank; i-- > 0; ) {
-        if (v->stride[i] != (uint16_t)acc) return false;
+        if (v->stride[i] != acc) return false;
         acc *= (uint32_t)v->shape[i];
     }
     return true;
@@ -274,7 +274,7 @@ static void val_dense(SmpValue *v)
 {
     uint32_t acc = 1;
     for (uint32_t i = v->rank; i-- > 0; ) {
-        v->stride[i] = (uint16_t)acc;
+        v->stride[i] = acc;
         acc *= (uint32_t)v->shape[i];
     }
     v->flags |= SMP_TF_CONTIG;
@@ -337,7 +337,7 @@ static uint32_t sym_index(const SmpSemaResult *r, const SmpSym *s)
 
 /* Выделение места под тензор. Каждый тензор начинается с границы 64 байт —
  * на этом стоит вся SIMD-часть, обсуждать нечего. */
-static bool sym_alloc(Ctx *c, SmpSym *s, SmpSpan sp)
+static bool sym_alloc(Ctx *c, SmpSym *s)
 {
     const uint64_t sz = val_nelem(&s->val) * smp_dtype_size(s->val.dtype);
     if (s->arena_id >= SMP_MAX_ARENAS) return false;
@@ -345,14 +345,7 @@ static bool sym_alloc(Ctx *c, SmpSym *s, SmpSpan sp)
     uint64_t *cursor = &c->res->arena_bytes[s->arena_id];
     *cursor = SMP_ALIGN_UP(*cursor, SMP_CACHELINE);
 
-    if (*cursor + sz > 0xFFFFFFFFull) {
-        serr(c, SMP_E0401, sp,
-             sfmt(c, "Арена #%u перевалила за 4 ГиБ: смещения хранятся в uint32_t.",
-                  s->arena_id), NULL);
-        return false;
-    }
-
-    s->offset       = (uint32_t)*cursor;
+    s->offset       = *cursor;
     s->bytes        = sz;
     s->val.byte_off = 0;
     s->val.flags   |= SMP_TF_ALIGN64 | SMP_TF_ALIGN32;
@@ -541,7 +534,7 @@ static bool apply_index(Ctx *c, const SmpAstTensor *t, SmpValue *v)
                               (unsigned long long)ix->ival), NULL);
                     return false;
                 }
-                out.byte_off += (uint32_t)ix->ival * v->stride[i] * esz;
+                out.byte_off += (uint64_t)ix->ival * v->stride[i] * esz;
                 break;
 
             case SMP_IDX_REG: {
@@ -600,7 +593,7 @@ static bool resolve_source_tensor(Ctx *c, const SmpAstTensor *t, SmpValue *out)
         s->val.sym       = sym_index(c->res, s);
         s->val.is_scalar = (t->rank == 0);
 
-        if (!sym_alloc(c, s, t->span)) return false;
+        if (!sym_alloc(c, s)) return false;
     } else {
         if (!s) {
             const char *hint = suggest_sym(c, SMP_SYM_TENSOR, t->name);
@@ -844,8 +837,8 @@ static bool apply_stage(Ctx *c, const SmpAstStage *st, SmpOpKind k, SmpValue *v)
             memset(&out, 0, sizeof out);
             out.dtype    = v->dtype;
             out.rank     = 2;
-            out.shape[0] = (uint16_t)M;
-            out.shape[1] = (uint16_t)N;
+            out.shape[0] = M;
+            out.shape[1] = N;
             out.sym      = SMP_SYM_NONE;
             val_dense(&out);
             *v = out;
@@ -854,8 +847,8 @@ static bool apply_stage(Ctx *c, const SmpAstStage *st, SmpOpKind k, SmpValue *v)
 
         case SMP_OP_TRANSPOSE: {
             if (!require_rank(c, v, 2, st->span, "transpose")) return false;
-            const uint16_t s0 = v->shape[0], s1 = v->shape[1];
-            const uint16_t t0 = v->stride[0], t1 = v->stride[1];
+            const uint32_t s0 = v->shape[0], s1 = v->shape[1];
+            const uint32_t t0 = v->stride[0], t1 = v->stride[1];
             v->shape[0] = s1; v->shape[1] = s0;
             v->stride[0] = t1; v->stride[1] = t0;
             v->flags = (uint16_t)((v->flags & (uint16_t)~SMP_TF_CONTIG) | SMP_TF_TRANSPOSED);
@@ -906,7 +899,7 @@ static bool apply_stage(Ctx *c, const SmpAstStage *st, SmpOpKind k, SmpValue *v)
                 return false;
             }
             if (v->rank != a0.rank ||
-                memcmp(v->shape, a0.shape, sizeof(uint16_t) * v->rank) != 0) {
+                memcmp(v->shape, a0.shape, sizeof v->shape[0] * v->rank) != 0) {
                 char s1[80], s2[80];
                 serr(c, SMP_E0309, st->args[0].span,
                      sfmt(c, "Формы не совпадают: %s и %s.\n"
@@ -1001,10 +994,10 @@ static void check_align(Ctx *c, const SmpValue *v, SmpSpan sp, const char *what)
     if (v->byte_off % req == 0) return;
 
     serr(c, SMP_E0402, sp,
-         sfmt(c, "%s начинается со смещения %u байт от базы тензора, "
+         sfmt(c, "%s начинается со смещения %llu байт от базы тензора, "
                  "а %s требует кратности %u.\n"
                  "База выровнена на 64, срез сбил выравнивание.",
-              what, v->byte_off, smp_vec_name(bits), req),
+              what, (unsigned long long)v->byte_off, smp_vec_name(bits), req),
          sfmt(c, "Материализуй срез через @pack либо возьми ось, "
                  "длина которой кратна %u элементам.",
               req / (smp_dtype_size(v->dtype) ? smp_dtype_size(v->dtype) : 1u)));
@@ -1106,7 +1099,7 @@ static void check_stmt(Ctx *c)
 
         if (v.is_scalar != dv.is_scalar || v.dtype != dv.dtype ||
             v.rank != dv.rank ||
-            (v.rank && memcmp(v.shape, dv.shape, sizeof(uint16_t) * v.rank) != 0)) {
+            (v.rank && memcmp(v.shape, dv.shape, sizeof v.shape[0] * v.rank) != 0)) {
             char s1[80], s2[80];
             serr(c, SMP_E0303, s->dest.span,
                  sfmt(c, "Конвейер даёт %s, а приёмник объявлен как %s.",
@@ -1240,8 +1233,8 @@ void smp_sema_dump(FILE *out, const SmpSemaResult *res)
         const SmpSym *s = &res->syms[i];
         char sig[80];
         if (s->kind == SMP_SYM_TENSOR) {
-            fprintf(out, "  *&%-8.*s арена#%u  off=0x%08X  %10llu Б  <%s>  %s  чт=%u зп=%u\n",
-                    (int)s->name.len, s->name.p, s->arena_id, s->offset,
+            fprintf(out, "  *&%-8.*s арена#%u  off=0x%08llX  %10llu Б  <%s>  %s  чт=%u зп=%u\n",
+                    (int)s->name.len, s->name.p, s->arena_id, (unsigned long long)s->offset,
                     (unsigned long long)s->bytes, val_sig(&s->val, sig, sizeof sig),
                     s->initialized ? "инициализирован" : "ПУСТ",
                     s->n_reads, s->n_writes);

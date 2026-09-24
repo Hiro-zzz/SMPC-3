@@ -273,7 +273,7 @@ static void test_memory(void)
                   "*&C<f32:3,3> -> @alloc => $c;\n"), "три тензора");
     for (uint32_t i = 0; i < g_mod.n_tens; i++)
         CHECK(g_mod.tens[i].off % 64u == 0,
-              "тензор %u лежит по смещению %u", i, g_mod.tens[i].off);
+              "тензор %u лежит по смещению %llu", i, (unsigned long long)g_mod.tens[i].off);
 }
 
 static void test_arith(void)

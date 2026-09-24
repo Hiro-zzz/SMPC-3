@@ -48,7 +48,7 @@ uint32_t smp_dtype_lanes(SmpDType dt, uint32_t vec_bits)
     return vec_bits / (sz * 8u);
 }
 
-void smp_tensor_dense(SmpTensor *t, SmpDType dt, uint32_t rank, const uint16_t *shape)
+void smp_tensor_dense(SmpTensor *t, SmpDType dt, uint32_t rank, const uint32_t *shape)
 {
     memset(t, 0, sizeof(*t));
     if (rank == 0 || rank > SMP_MAX_RANK) return;
@@ -61,15 +61,15 @@ void smp_tensor_dense(SmpTensor *t, SmpDType dt, uint32_t rank, const uint16_t *
     uint32_t n = 1;
     for (uint32_t i = 0; i < rank; i++) {
         t->shape[i] = shape[i];
-        n *= (uint32_t)shape[i];
+        n *= shape[i];
     }
     t->nelem = n;
 
     /* row-major: последняя ось самая быстрая */
     uint32_t acc = 1;
     for (uint32_t i = rank; i-- > 0; ) {
-        t->stride[i] = (uint16_t)acc;
-        acc *= (uint32_t)shape[i];
+        t->stride[i] = acc;
+        acc *= shape[i];
     }
 }
 
@@ -82,7 +82,7 @@ bool smp_tensor_is_contiguous(const SmpTensor *t)
 {
     uint32_t acc = 1;
     for (uint32_t i = t->rank; i-- > 0; ) {
-        if (t->stride[i] != (uint16_t)acc) return false;
+        if (t->stride[i] != acc) return false;
         acc *= (uint32_t)t->shape[i];
     }
     return true;

@@ -160,6 +160,7 @@ static bool parse_type(SmpParser *p, SmpAstTensor *t)
 
     t->rank = 0;
     if (accept(p, SMP_TK_COLON)) {
+        uint64_t nelem = 1;
         for (;;) {
             if (!at(p, SMP_TK_INT)) {
                 perr(p, SMP_E0304, cur(p)->span,
@@ -180,7 +181,16 @@ static bool parse_type(SmpParser *p, SmpAstTensor *t)
                          t->rank, (unsigned long long)d->num.u, SMP_DIM_MAX), NULL);
                 return false;
             }
-            t->dims[t->rank++] = (uint16_t)d->num.u;
+            /* Каждая ось влезает в uint32_t, но их произведение — число
+             * элементов — обязано влезть туда же. */
+            nelem *= d->num.u;
+            if (nelem > SMP_NELEM_MAX) {
+                perr(p, SMP_E0304, d->span,
+                     fmt(p, "На оси #%u элементов уже больше %u.",
+                         t->rank, SMP_NELEM_MAX), NULL);
+                return false;
+            }
+            t->dims[t->rank++] = (uint32_t)d->num.u;
 
             if (!accept(p, SMP_TK_COMMA)) break;
         }

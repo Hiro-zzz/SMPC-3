@@ -50,7 +50,7 @@ static bool dense_f32(const SmpTensor *t)
     if (t->dtype != SMP_DT_F32) return false;
     uint32_t acc = 1;
     for (uint32_t i = t->rank; i-- > 0; ) {
-        if (t->stride[i] != (uint16_t)acc) return false;
+        if (t->stride[i] != acc) return false;
         acc *= (uint32_t)t->shape[i];
     }
     return true;

@@ -26,7 +26,7 @@ static bool dense(const SmpTensor *t)
 {
     uint32_t acc = 1;
     for (uint32_t i = t->rank; i-- > 0; ) {
-        if (t->stride[i] != (uint16_t)acc) return false;
+        if (t->stride[i] != acc) return false;
         acc *= (uint32_t)t->shape[i];
     }
     return true;

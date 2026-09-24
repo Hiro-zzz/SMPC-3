@@ -56,11 +56,11 @@ static SmpTensor mk(uint32_t r0, uint32_t r1)
     memset(&t, 0, sizeof t);
     t.dtype = SMP_DT_F32;
     if (r1) {
-        t.rank = 2; t.shape[0] = (uint16_t)r0; t.shape[1] = (uint16_t)r1;
-        t.stride[0] = (uint16_t)r1; t.stride[1] = 1;
+        t.rank = 2; t.shape[0] = r0; t.shape[1] = r1;
+        t.stride[0] = r1; t.stride[1] = 1;
         t.nelem = r0 * r1;
     } else {
-        t.rank = 1; t.shape[0] = (uint16_t)r0; t.stride[0] = 1;
+        t.rank = 1; t.shape[0] = r0; t.stride[0] = 1;
         t.nelem = r0;
     }
     t.flags = SMP_TF_CONTIG;

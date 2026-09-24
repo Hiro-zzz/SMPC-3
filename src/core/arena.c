@@ -109,11 +109,11 @@ void *smp_arena_push_zero(SmpArena *a, size_t bytes, size_t align)
     return p;
 }
 
-uint32_t smp_arena_push_off(SmpArena *a, size_t bytes, size_t align)
+uint64_t smp_arena_push_off(SmpArena *a, size_t bytes, size_t align)
 {
     void *p = smp_arena_push(a, bytes, align);
     if (!p) return SMP_ARENA_NIL;
-    return (uint32_t)((uint8_t *)p - a->base);
+    return (uint64_t)((uint8_t *)p - a->base);
 }
 
 void smp_arena_rewind(SmpArena *a, SmpArenaMark m)

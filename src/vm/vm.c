@@ -148,8 +148,9 @@ void smp_vm_regdump(SmpDiagCtx *d, void *user, bool color)
         if (r->is_tensor) {
             char sig[80];
             smp_tensor_sig(&r->t, sig, sizeof sig);
-            smp_diag_write(d, "   %-8s = tensor{ a%u:0x%08X  %-18s stride=",
-                           lbl, smp_tf_arena(r->t.flags), r->t.off, sig);
+            smp_diag_write(d, "   %-8s = tensor{ a%u:0x%08llX  %-18s stride=",
+                           lbl, smp_tf_arena(r->t.flags),
+                           (unsigned long long)r->t.off, sig);
             for (uint32_t k = 0; k < r->t.rank; k++)
                 smp_diag_write(d, "%s%u", k ? "," : "", (unsigned)r->t.stride[k]);
             smp_diag_write(d, "  flags=%s%s%s }\n",
@@ -781,24 +782,25 @@ dispatch_switch:
         R[in->d] = R[in->a];
         const int64_t  n    = R[in->b].is_tensor ? 0 : (int64_t)R[in->b].s.f;
         const uint64_t step = mod->consts[in->k].u;
-        const int64_t  add  = n * (int64_t)step;
 
-        if (add < 0 || (uint64_t)R[in->a].t.off + (uint64_t)add > 0xFFFFFFFFull) {
+        /* Здесь только арифметика не должна переполниться; попадание в
+         * арену проверит tensor_base там, где срез читают. */
+        if (n < 0 || (step && (uint64_t)n > (UINT64_MAX / 2 - R[in->a].t.off) / step)) {
             vm_fatal(vm, SMP_E0410,
                      vfmt(vm, "Динамический индекс %lld даёт смещение вне тензора.",
                           (long long)n), NULL);
             return SMP_ERR_INTERNAL;
         }
-        R[in->d].t.off = R[in->a].t.off + (uint32_t)add;
+        R[in->d].t.off = R[in->a].t.off + (uint64_t)n * step;
 
         /* Срез мог сбить выравнивание, которое компилятор проверить не мог:
          * индекс стал известен только сейчас. */
         const uint32_t bits = smp_vec_bits(in->flags & SMP_IF_VEC_MASK);
         if (bits >= 256 && (R[in->d].t.off % (bits / 8u)) != 0) {
             vm_fatal(vm, SMP_E0402,
-                     vfmt(vm, "Динамический индекс %lld дал смещение %u байт, "
+                     vfmt(vm, "Динамический индекс %lld дал смещение %llu байт, "
                               "а %s требует кратности %u.",
-                          (long long)n, R[in->d].t.off,
+                          (long long)n, (unsigned long long)R[in->d].t.off,
                           smp_vec_name(bits), bits / 8u),
                      "Выровняй индекс или сними #simd с этой инструкции.");
             return SMP_ERR_INTERNAL;
@@ -869,8 +871,8 @@ dispatch_switch:
     VM_CASE(TRANS) {
         R[in->d] = R[in->a];
         SmpTensor *t = &R[in->d].t;
-        const uint16_t s0 = t->shape[0], s1 = t->shape[1];
-        const uint16_t d0 = t->stride[0], d1 = t->stride[1];
+        const uint32_t s0 = t->shape[0], s1 = t->shape[1];
+        const uint32_t d0 = t->stride[0], d1 = t->stride[1];
         t->shape[0] = s1; t->shape[1] = s0;
         t->stride[0] = d1; t->stride[1] = d0;
         t->flags = (uint16_t)((t->flags & (uint16_t)~SMP_TF_CONTIG) | SMP_TF_TRANSPOSED);

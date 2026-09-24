@@ -56,27 +56,34 @@ SMP_INLINE uint16_t smp_tf_with_arena(uint16_t flags, uint32_t arena)
                       ((arena & 7u) << SMP_TF_ARENA_SHIFT));
 }
 
-/* --- Дескриптор тензора: ровно 32 байта, ни байтом больше ----------------- */
+/* --- Дескриптор тензора: ровно 64 байта, одна строка кэша ----------------- */
+/* Было 32 байта с осями в uint16_t, и ось не вмещала словарь языковой модели:
+ * у Qwen2.5 их 151 936. Оси и шаги стали uint32_t, смещение — uint64_t, чтобы
+ * арена не упиралась в 4 ГиБ. Число элементов осталось uint32_t: тензор до
+ * 4 294 967 295 элементов, и шаг любой оси тогда тоже влезает в uint32_t.
+ * Хвост — нули: дескрипторы сравниваются побайтово, дыр быть не должно. */
 typedef struct SmpTensor {
-    uint32_t off;                    /*  0: смещение в арене, байты          */
-    uint32_t nelem;                  /*  4: полное число элементов           */
-    uint16_t shape[SMP_MAX_RANK];    /*  8: размерности                      */
-    uint16_t stride[SMP_MAX_RANK];   /* 16: шаги В ЭЛЕМЕНТАХ, не в байтах    */
-    uint8_t  dtype;                  /* 24: SmpDType                         */
-    uint8_t  rank;                   /* 25: 1..4                             */
-    uint16_t flags;                  /* 26: SmpTensorFlags                   */
-    uint32_t name_id;                /* 28: символ в таблице имён (диагност.)*/
+    uint64_t off;                    /*  0: смещение в арене, байты          */
+    uint32_t nelem;                  /*  8: полное число элементов           */
+    uint32_t name_id;                /* 12: символ в таблице имён (диагност.)*/
+    uint32_t shape[SMP_MAX_RANK];    /* 16: размерности                      */
+    uint32_t stride[SMP_MAX_RANK];   /* 32: шаги В ЭЛЕМЕНТАХ, не в байтах    */
+    uint8_t  dtype;                  /* 48: SmpDType                         */
+    uint8_t  rank;                   /* 49: 1..4                             */
+    uint16_t flags;                  /* 50: SmpTensorFlags                   */
+    uint8_t  reserved[12];           /* 52: нули                             */
 } SmpTensor;
 
-SMP_STATIC_ASSERT(sizeof(SmpTensor) == 32, tensor_descriptor_is_32_bytes);
-SMP_STATIC_ASSERT(offsetof(SmpTensor, dtype) == 24, tensor_dtype_offset);
+SMP_STATIC_ASSERT(sizeof(SmpTensor) == 64, tensor_descriptor_is_64_bytes);
+SMP_STATIC_ASSERT(offsetof(SmpTensor, dtype) == 48, tensor_dtype_offset);
 
-#define SMP_DIM_MAX 65535u   /* потолок одной размерности (uint16_t)         */
+#define SMP_DIM_MAX   0xFFFFFFFFu   /* потолок одной размерности (uint32_t)  */
+#define SMP_NELEM_MAX 0xFFFFFFFFu   /* потолок числа элементов (uint32_t)    */
 
 /* --- Операции над дескрипторами ------------------------------------------- */
 
 /* Заполнить плотный (contiguous, row-major) дескриптор. Не выделяет память. */
-void     smp_tensor_dense(SmpTensor *t, SmpDType dt, uint32_t rank, const uint16_t *shape);
+void     smp_tensor_dense(SmpTensor *t, SmpDType dt, uint32_t rank, const uint32_t *shape);
 
 /* Полный размер в байтах логического содержимого. */
 uint64_t smp_tensor_bytes(const SmpTensor *t);

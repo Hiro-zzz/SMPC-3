@@ -58,7 +58,7 @@ typedef struct SmpAstTensor {
     SmpSpan  type_span;
     SmpDType dtype;
     uint32_t rank;
-    uint16_t dims[SMP_MAX_RANK];
+    uint32_t dims[SMP_MAX_RANK];
 
     bool        has_index; /* был ли [...]                                   */
     SmpSpan     index_span;

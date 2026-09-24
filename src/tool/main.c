@@ -94,7 +94,7 @@ static void cmd_info(void)
         return;
     }
 
-    uint16_t shape[2] = { 1024, 1024 };
+    uint32_t shape[2] = { 1024, 1024 };
     SmpTensor A, B;
     smp_tensor_dense(&A, SMP_DT_F32, 2, shape);
     smp_tensor_dense(&B, SMP_DT_F32, 2, shape);
@@ -104,12 +104,12 @@ static void cmd_info(void)
 
     char buf[160], sig[64];
     printf("\n%s\n", smp_arena_report(&a, buf, sizeof buf));
-    printf("A  <%s>  off=%u  align64=%s  contig=%s\n",
-           smp_tensor_sig(&A, sig, sizeof sig), A.off,
+    printf("A  <%s>  off=%llu  align64=%s  contig=%s\n",
+           smp_tensor_sig(&A, sig, sizeof sig), (unsigned long long)A.off,
            SMP_IS_ALIGNED(smp_arena_at(&a, A.off), 64) ? "да" : "НЕТ",
            smp_tensor_is_contiguous(&A) ? "да" : "нет");
-    printf("B  <%s>  off=%u  align64=%s\n",
-           smp_tensor_sig(&B, sig, sizeof sig), B.off,
+    printf("B  <%s>  off=%llu  align64=%s\n",
+           smp_tensor_sig(&B, sig, sizeof sig), (unsigned long long)B.off,
            SMP_IS_ALIGNED(smp_arena_at(&a, B.off), 64) ? "да" : "НЕТ");
 
     smp_arena_release(&a);
@@ -532,7 +532,7 @@ static int cmd_run(const char *path, bool verbose,
 static void bench_gemm(SmpArena *a, uint32_t n, double min_sec)
 {
     SmpTensor ta, tb, tc;
-    uint16_t shape[2] = { (uint16_t)n, (uint16_t)n };
+    uint32_t shape[2] = { n, n };
     smp_tensor_dense(&ta, SMP_DT_F32, 2, shape);
     tb = ta; tc = ta;
 
@@ -609,7 +609,7 @@ static void bench_worker(void *ctx, uint32_t idx)
 {
     BenchCtx *b = (BenchCtx *)ctx;
     SmpTensor t;
-    uint16_t shape[2] = { (uint16_t)b->n, (uint16_t)b->n };
+    uint32_t shape[2] = { b->n, b->n };
     smp_tensor_dense(&t, SMP_DT_F32, 2, shape);
 
     SmpBuf bc = { b->C[idx], &t }, ba = { b->A[idx], &t }, bb = { b->B[idx], &t };
@@ -620,7 +620,7 @@ static void bench_worker(void *ctx, uint32_t idx)
 static void bench_threads(uint32_t n, uint32_t threads, uint32_t iters)
 {
     SmpTensor t;
-    uint16_t shape[2] = { (uint16_t)n, (uint16_t)n };
+    uint32_t shape[2] = { n, n };
     smp_tensor_dense(&t, SMP_DT_F32, 2, shape);
     const size_t bytes = (size_t)smp_tensor_bytes(&t);
 

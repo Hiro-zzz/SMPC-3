@@ -73,11 +73,11 @@ typedef struct SmpValue {
     bool     is_scalar;                  /* результат @reduce и литералы      */
     SmpDType dtype;
     uint32_t rank;
-    uint16_t shape[SMP_MAX_RANK];
-    uint16_t stride[SMP_MAX_RANK];       /* в элементах                       */
+    uint32_t shape[SMP_MAX_RANK];
+    uint32_t stride[SMP_MAX_RANK];       /* в элементах                       */
     uint16_t flags;                      /* SmpTensorFlags                    */
     uint32_t sym;                        /* тензор-источник или SMP_SYM_NONE  */
-    uint32_t byte_off;                   /* смещение с учётом среза           */
+    uint64_t byte_off;                   /* смещение с учётом среза           */
 } SmpValue;
 
 /* --- Символ --------------------------------------------------------------- */
@@ -91,7 +91,7 @@ typedef struct SmpSym {
 
     /* только для тензоров */
     uint32_t   arena_id;
-    uint32_t   offset;      /* байт от начала своей арены, выровнено на 64    */
+    uint64_t   offset;      /* байт от начала своей арены, выровнено на 64    */
     uint64_t   bytes;
     bool       initialized; /* прошёл @alloc или побывал приёмником           */
 

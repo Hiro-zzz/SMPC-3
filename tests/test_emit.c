@@ -200,7 +200,8 @@ static void test_pipeline(void)
         CHECK(base && view, "срез не стал отдельным дескриптором");
         if (base && view) {
             CHECK(view->off == base->off + 8u * 4u,
-                  "смещение среза %u, ждали %u", view->off, base->off + 32u);
+                  "смещение среза %llu, ждали %llu",
+                  (unsigned long long)view->off, (unsigned long long)base->off + 32u);
             CHECK(view->shape[0] == 8 && view->stride[0] == 1, "форма среза");
         }
     }
@@ -461,7 +462,7 @@ static void test_formats(void)
     SECTION("размеры структур");
 
     CHECK(sizeof(SmpInstr)      ==  8, "инструкция %zu Б", sizeof(SmpInstr));
-    CHECK(sizeof(SmpTensor)     == 32, "дескриптор %zu Б", sizeof(SmpTensor));
+    CHECK(sizeof(SmpTensor)     == 64, "дескриптор %zu Б", sizeof(SmpTensor));
     CHECK(sizeof(SmpConst)      ==  8, "константа %zu Б", sizeof(SmpConst));
     CHECK(sizeof(SmpS3bHeader)  == 32, "заголовок %zu Б", sizeof(SmpS3bHeader));
     CHECK(sizeof(SmpS3bSection) == 16, "секция %zu Б", sizeof(SmpS3bSection));

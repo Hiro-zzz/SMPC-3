@@ -45,8 +45,8 @@ void         *smp_arena_push_zero(SmpArena *a, size_t bytes, size_t align);
 void         *smp_arena_push_raw(SmpArena *a, size_t bytes, size_t align);
 
 /* То же, но возвращает смещение (для SmpTensor.off). SMP_ARENA_NIL при OOM. */
-#define SMP_ARENA_NIL 0xFFFFFFFFu
-uint32_t      smp_arena_push_off(SmpArena *a, size_t bytes, size_t align);
+#define SMP_ARENA_NIL UINT64_MAX
+uint64_t      smp_arena_push_off(SmpArena *a, size_t bytes, size_t align);
 
 /* Отметка / откат — единственная форма «освобождения». */
 SMP_INLINE SmpArenaMark smp_arena_mark(const SmpArena *a) { return a->used; }
@@ -54,7 +54,7 @@ void          smp_arena_rewind(SmpArena *a, SmpArenaMark m);
 void          smp_arena_reset(SmpArena *a);
 
 SMP_INLINE size_t smp_arena_avail(const SmpArena *a) { return a->cap - a->used; }
-SMP_INLINE void  *smp_arena_at(const SmpArena *a, uint32_t off) { return a->base + off; }
+SMP_INLINE void  *smp_arena_at(const SmpArena *a, uint64_t off) { return a->base + off; }
 
 /* Принадлежит ли указатель этой арене (для проверок сырых указателей). */
 bool          smp_arena_owns(const SmpArena *a, const void *p);

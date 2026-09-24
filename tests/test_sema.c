@@ -131,8 +131,8 @@ static void test_flow(void)
         const SmpSym *s = &res.syms[i];
         if (s->kind != SMP_SYM_TENSOR) continue;
         ntensors++;
-        CHECK(s->offset % 64u == 0, "тензор '%.*s' лежит по смещению %u — не кратно 64",
-              (int)s->name.len, s->name.p, s->offset);
+        CHECK(s->offset % 64u == 0, "тензор '%.*s' лежит по смещению %llu — не кратно 64",
+              (int)s->name.len, s->name.p, (unsigned long long)s->offset);
         for (uint32_t j = 0; j < res.nsyms; j++) {
             if (j == i || res.syms[j].kind != SMP_SYM_TENSOR) continue;
             const SmpSym *o = &res.syms[j];
