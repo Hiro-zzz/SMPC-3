@@ -1122,6 +1122,59 @@ static void test_q8(void)
 /* Как в модели: линейный слой в скретч, @reshape в головы, RoPE по позиции
  * из регистра, softmax по живой длине — и всё это через регистры и виды,
  * без копий. Числа подобраны так, чтобы проверять точно. */
+/* Внимание по KV-кэшу, как в Qwen2: кэш лежит по позициям [T, группы,
+ * голова], новая строка пишется по номеру позиции, группа голов запроса
+ * читает свою голову K/V видом с шагом, и softmax смотрит только на первые
+ * $len позиций. Эталон — те же формулы в double по содержимому тензоров. */
+static void test_attention(void)
+{
+    SECTION("внимание по KV-кэшу");
+
+    enum { T_ = 8, G = 2, H = 3, D = 4, LEN = 5 };
+    CHECK(run_str("[#arena:1] *&Kc<f32:8,2,4> -> @alloc => $kc;\n"
+                  "[#arena:1] *&Vc<f32:8,2,4> -> @alloc => $vc;\n"
+                  "[#arena:0] *&one<f32:2,4> -> @fill(1.0) => *&one;\n"
+                  "*&one[1, ..] -> @scale(-0.5) => *&one[1, ..];\n"
+                  "[#repeat:6, #index:t] *&one -> @rope($t, 10.0) => *&Kc[$t, .., ..];\n"
+                  "[#repeat:6, #index:t] *&one -> @rope($t, 3.0) -> @scale(0.7) => *&Vc[$t, .., ..];\n"
+                  "*&q6<f32:6,4> -> @alloc => $q6;\n"
+                  "[#repeat:6, #index:i] *&q6[$i, ..] -> @fill($i) => *&q6[$i, ..];\n"
+                  "*&q6 -> @scale(0.3) -> @rope(5, 7.0) -> @reshape(2,3,4) => *&q<f32:2,3,4>;\n"
+                  "*&o<f32:2,3,4> -> @alloc => $o;\n"
+                  "5 => $len;\n"
+                  "[#repeat:2, #index:g] *&q[$g, .., ..] -> @mmul.t(*&Kc[.., $g, ..])"
+                  " -> @scale(0.5) -> @softmax($len) -> @mmul(*&Vc[.., $g, ..])"
+                  " => *&o[$g, .., ..];\n"), "внимание");
+
+    double worst = 0.0;
+    for (int g = 0; g < G; g++)
+        for (int h = 0; h < H; h++) {
+            double s[T_], m = -INFINITY, sum = 0.0;
+            for (int t = 0; t < LEN; t++) {
+                s[t] = 0.0;
+                for (int d = 0; d < D; d++)
+                    s[t] += (double)felem("q", (uint32_t)((g * H + h) * D + d)) *
+                            (double)felem("Kc", (uint32_t)((t * G + g) * D + d));
+                s[t] *= 0.5;
+                if (s[t] > m) m = s[t];
+            }
+            for (int t = 0; t < LEN; t++) sum += exp(s[t] - m);
+            for (int d = 0; d < D; d++) {
+                double o = 0.0;
+                for (int t = 0; t < LEN; t++)
+                    o += exp(s[t] - m) / sum * (double)felem("Vc", (uint32_t)((t * G + g) * D + d));
+                const double e = fabs(o - (double)felem("o", (uint32_t)((g * H + h) * D + d)));
+                if (e > worst) worst = e;
+            }
+        }
+    CHECK(worst < 1e-5, "внимание разошлось с эталоном: %g", worst);
+
+    /* Позиции 5 и дальше в кэше заняты, но маской отрезаны: их вклад — ноль,
+     * иначе строка 5 (записана) изменила бы ответ. Проверяем, что она
+     * действительно записана и отличается. */
+    CHECK(felem("Kc", 5 * G * D) != 0.0f, "строка 5 кэша не записана — проверка маски ни о чём");
+}
+
 static void test_nn_chain(void)
 {
     SECTION("цепочка модели");
@@ -1172,6 +1225,7 @@ int main(void)
     test_store();
     test_q8();
     test_nn_chain();
+    test_attention();
 
     smp_vm_release(&g_vm);
     fclose(g_sink);

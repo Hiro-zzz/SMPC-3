@@ -766,7 +766,7 @@ static void test_q8_gemm(void)
     if (!mem) { CHECK(0, "нет памяти под четыре комплекта"); return; }
     SmpKScratch par;
     smp_k_scratch_bind(&par, mem, bytes);
-    smp_k_gemm_q8_par_min(0);
+    smp_k_mmul_t_par_min(0);
 
     static const uint32_t pshapes[][3] = { { 1, 600, 256 }, { 1, 65, 32 }, { 4, 300, 128 } };
     for (size_t i = 0; i < SMP_ARRLEN(pshapes); i++) {
@@ -784,7 +784,59 @@ static void test_q8_gemm(void)
         CHECK(memcmp(g_ref, g_got, (size_t)M * N * sizeof(float)) == 0,
               "q8_0 на потоках %ux%ux%u разошёлся с одним потоком", M, N, K);
     }
-    smp_k_gemm_q8_par_min((uint64_t)1 << 18);
+    smp_k_mmul_t_par_min((uint64_t)1 << 18);
+    free(mem);
+}
+
+/* C = A x B^T с B в f32: строки B подряд, шаг между ними ldb >= K — так
+ * лежит голова KV-кэша. Векторная ветка против эталона (GEMM по
+ * транспонированному виду), потоки — бит в бит против одного. */
+static void mt_case(uint32_t M, uint32_t N, uint32_t K, uint32_t ldb, SmpKScratch *par)
+{
+    if ((size_t)M * K > MAXN || (size_t)N * ldb > MAXN || (size_t)M * N > MAXN) {
+        CHECK(0, "mt_case %ux%ux%u не влезает в буферы теста", M, N, K);
+        return;
+    }
+    fill_rand(g_a, (size_t)M * K);
+    fill_rand(g_b, (size_t)N * ldb);
+
+    SmpTensor ta = mk(M, K), tc = mk(M, N), tb = mk(N, K);
+    tb.stride[0] = ldb;
+    tb.flags = ldb == K ? SMP_TF_CONTIG : SMP_TF_NONE;
+    SmpBuf a = { g_a, &ta }, b = { g_b, &tb };
+    SmpBuf ref = { g_ref, &tc }, got = { g_got, &tc }, many = { g_e, &tc };
+
+    smp_kernels_select(SMP_KB_SCALAR); smp_k_mmul_t(&ref, &a, &b, &g_sc);
+    smp_kernels_select(SMP_KB_AVX2);   smp_k_mmul_t(&got, &a, &b, &g_sc);
+    smp_k_mmul_t(&many, &a, &b, par);
+
+    const double e = max_rel_err(g_ref, g_got, (size_t)M * N);
+    CHECK(e < 1e-5, "mmul.t f32 %ux%ux%u (ldb %u): %g", M, N, K, ldb, e);
+    CHECK(memcmp(g_got, g_e, (size_t)M * N * sizeof(float)) == 0,
+          "mmul.t f32 %ux%ux%u на потоках разошёлся с одним", M, N, K);
+}
+
+static void test_mmul_t_f32(void)
+{
+    SECTION("mmul.t на f32: q x K^T");
+    if (!smp_kernels_select(SMP_KB_AVX2)) return;
+
+    const size_t bytes = smp_k_scratch_bytes_for(4);
+    void *mem = malloc(bytes);
+    if (!mem) { CHECK(0, "нет памяти под четыре комплекта"); return; }
+    SmpKScratch par;
+    smp_k_scratch_bind(&par, mem, bytes);
+    smp_k_mmul_t_par_min(0);
+
+    /* 7x2048x64 с шагом 128 — внимание Qwen2.5 по кэшу на 2048 позиций. */
+    static const uint32_t cases[][4] = {
+        { 1, 1, 1, 1 }, { 1, 5, 7, 7 }, { 3, 9, 24, 24 }, { 7, 300, 64, 128 },
+        { 2, 65, 37, 40 }, { 7, 2048, 64, 128 }, { 1, 300, 896, 896 },
+    };
+    for (size_t i = 0; i < SMP_ARRLEN(cases); i++)
+        mt_case(cases[i][0], cases[i][1], cases[i][2], cases[i][3], &par);
+
+    smp_k_mmul_t_par_min((uint64_t)1 << 18);
     free(mem);
 }
 
@@ -929,6 +981,7 @@ int main(void)
     test_q8_quant();
     test_q8_gemm();
     test_nn();
+    test_mmul_t_f32();
 
     smp_kernels_select(SMP_KB_AUTO);
     free(g_scmem);

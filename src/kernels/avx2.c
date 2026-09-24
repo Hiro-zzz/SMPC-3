@@ -674,3 +674,35 @@ void smp_ka_gemm_q8(float *C, size_t ldc, const float *A, size_t lda,
         }
     }
 }
+
+/* ========================================================================== */
+/*  C = A x B^T, B в f32                                                      */
+/* ========================================================================== */
+
+/* Скалярное произведение строки A на строку B: два накопителя, чтобы FMA не
+ * ждали друг друга, хвост меньше 8 — скалярно. Строки B идут подряд, а шаг
+ * между ними любой: голова KV-кэша лежит через одну. */
+void smp_ka_gemm_t(float *C, size_t ldc, const float *A, size_t lda,
+                   const float *B, size_t ldb, size_t M, size_t K,
+                   size_t n0, size_t n1)
+{
+    for (size_t n = n0; n < n1; n++) {
+        const float *b = B + n * ldb;
+        for (size_t m = 0; m < M; m++) {
+            const float *a  = A + m * lda;
+            __m256       s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+            size_t       k  = 0;
+            for (; k + 16 <= K; k += 16) {
+                s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + k),     _mm256_loadu_ps(b + k),     s0);
+                s1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + k + 8), _mm256_loadu_ps(b + k + 8), s1);
+            }
+            if (k + 8 <= K) {
+                s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + k), _mm256_loadu_ps(b + k), s0);
+                k += 8;
+            }
+            float s = hsum256(_mm256_add_ps(s0, s1));
+            for (; k < K; k++) s += a[k] * b[k];
+            C[m * ldc + n] = s;
+        }
+    }
+}

@@ -347,36 +347,49 @@ void smp_k_gemm(const SmpBuf *c, const SmpBuf *a, const SmpBuf *b,
 
 /* Порог ниже, чем у GEMM: здесь не арифметика, а проход по весам, и делить
  * его между ядрами выгодно раньше. 2^18 — матрица 512x512 на один вектор. */
-static uint64_t g_q8_par_min = (uint64_t)1 << 18;
+static uint64_t g_mt_par_min = (uint64_t)1 << 18;
 
-void smp_k_gemm_q8_par_min(uint64_t work) { g_q8_par_min = work; }
+void smp_k_mmul_t_par_min(uint64_t work) { g_mt_par_min = work; }
 
 /* Строк B на одну порцию: достаточно, чтобы раздача не стоила больше
  * работы, и достаточно мало, чтобы хвост не простаивал. */
 #define Q8_ROWS 64u
 
+/* Строки B раздаются порциями; каждая строка — это столбец C, и считает
+ * её один поток. B — либо q8_0 (плотный), либо f32 со строками подряд и
+ * любым шагом между ними: так выглядят головы KV-кэша, Kc[.., g, ..]. */
 typedef struct {
     float            *C;
     const float      *A;
-    const uint8_t    *W;
-    size_t            ldc, lda, M, N, K;
+    const void       *B;
+    size_t            ldc, lda, ldb, M, N, K;
+    bool              q8;
     uint32_t          chunks;
     uint32_t          mxcsr;
     volatile int32_t  next;
-} ParQ8;
+} ParRows;
 
-static void q8_worker(void *ctx, uint32_t t)
+static void rows_run(const ParRows *g, size_t n0, size_t n1)
+{
+    if (g->q8)
+        smp_ka_gemm_q8(g->C, g->ldc, g->A, g->lda, (const uint8_t *)g->B,
+                       g->M, g->K, n0, n1);
+    else
+        smp_ka_gemm_t(g->C, g->ldc, g->A, g->lda, (const float *)g->B, g->ldb,
+                      g->M, g->K, n0, n1);
+}
+
+static void rows_worker(void *ctx, uint32_t t)
 {
     (void)t;
-    ParQ8 *g = (ParQ8 *)ctx;
+    ParRows *g = (ParRows *)ctx;
     const uint32_t saved = smp_fpu_get_mxcsr();
     smp_fpu_set_mxcsr(g->mxcsr);
     for (;;) {
         const int32_t i = smp_atomic_fetch_add(&g->next, 1);
         if (i < 0 || (uint32_t)i >= g->chunks) break;
         const size_t n0 = (size_t)i * Q8_ROWS;
-        const size_t n1 = SMP_MIN(n0 + Q8_ROWS, g->N);
-        smp_ka_gemm_q8(g->C, g->ldc, g->A, g->lda, g->W, g->M, g->K, n0, n1);
+        rows_run(g, n0, SMP_MIN(n0 + Q8_ROWS, g->N));
     }
     smp_fpu_set_mxcsr(saved);
 }
@@ -384,7 +397,15 @@ static void q8_worker(void *ctx, uint32_t t)
 void smp_k_mmul_t(const SmpBuf *c, const SmpBuf *a, const SmpBuf *b,
                   SmpKScratch *scratch)
 {
-    if (b->t->dtype != SMP_DT_Q8_0) {
+    resolve();
+    const bool q8   = (b->t->dtype == SMP_DT_Q8_0);
+    const bool fast = g_use_avx2 && rowmajor_f32(c->t) && rowmajor_f32(a->t) &&
+                      (q8 || rowmajor_f32(b->t));
+    if (!fast && q8) {
+        smp_ks_gemm_q8(c, a, b);
+        return;
+    }
+    if (!fast) {
         /* Транспонированный вид — перестановка шагов, данные на месте. */
         SmpTensor bt = *b->t;
         bt.shape[0]  = b->t->shape[1]; bt.shape[1]  = b->t->shape[0];
@@ -395,29 +416,25 @@ void smp_k_mmul_t(const SmpBuf *c, const SmpBuf *a, const SmpBuf *b,
         return;
     }
 
-    resolve();
-    if (!g_use_avx2 || !rowmajor_f32(c->t) || !rowmajor_f32(a->t)) {
-        smp_ks_gemm_q8(c, a, b);
-        return;
-    }
-
-    ParQ8 g;
+    ParRows g;
     g.C   = (float *)c->p;
     g.A   = (const float *)a->p;
-    g.W   = (const uint8_t *)b->p;
+    g.B   = b->p;
     g.ldc = c->t->stride[0];
     g.lda = a->t->stride[0];
+    g.ldb = q8 ? 0 : b->t->stride[0];
     g.M   = a->t->shape[0];
     g.N   = b->t->shape[0];
     g.K   = a->t->shape[1];
+    g.q8  = q8;
     g.chunks = (uint32_t)((g.N + Q8_ROWS - 1) / Q8_ROWS);
     g.mxcsr  = smp_fpu_get_mxcsr();
     g.next   = 0;
 
     const uint32_t sets = scratch ? scratch->sets : 0u;
-    if (sets >= 2 && g.chunks >= 2 && (uint64_t)g.M * g.N * g.K >= g_q8_par_min) {
-        smp_threads_run(q8_worker, &g, SMP_MIN(sets, g.chunks));
+    if (sets >= 2 && g.chunks >= 2 && (uint64_t)g.M * g.N * g.K >= g_mt_par_min) {
+        smp_threads_run(rows_worker, &g, SMP_MIN(sets, g.chunks));
         return;
     }
-    smp_ka_gemm_q8(g.C, g.ldc, g.A, g.lda, g.W, g.M, g.K, 0, g.N);
+    rows_run(&g, 0, g.N);
 }

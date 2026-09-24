@@ -72,4 +72,9 @@ void   smp_ka_gemm_ep(float *C, size_t ldc, const float *A, size_t lda,
 void   smp_ka_gemm_q8(float *C, size_t ldc, const float *A, size_t lda,
                       const uint8_t *W, size_t M, size_t K, size_t n0, size_t n1);
 
+/* C = A x B^T по строкам B с n0 по n1; строки B подряд, между ними ldb. */
+void   smp_ka_gemm_t(float *C, size_t ldc, const float *A, size_t lda,
+                     const float *B, size_t ldb, size_t M, size_t K,
+                     size_t n0, size_t n1);
+
 #endif /* SMPC3_KERNELS_IMPL_H */
