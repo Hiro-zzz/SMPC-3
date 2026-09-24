@@ -110,6 +110,7 @@ check run_slices    run   examples/slices.smpc
 check run_types     run   examples/types.smpc
 check run_gemm      run   examples/gemm.smpc
 check run_forward   run   examples/forward.smpc
+check run_layer     run   examples/layer.smpc
 check check_forward check examples/forward.smpc -v
 check run_repeat    run   examples/repeat.smpc
 check run_io        run   examples/io.smpc --out V="$TMP/io.bin" --in W="$TMP/io.bin"
