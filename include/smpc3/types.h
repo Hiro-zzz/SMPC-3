@@ -112,7 +112,8 @@ bool     smp_tensor_same_shape(const SmpTensor *a, const SmpTensor *b);
 char    *smp_tensor_sig(const SmpTensor *t, char *buf, size_t cap);
 
 /* Число для человека: целые — целыми, дробные — кратчайшей записью, которая
- * читается обратно в то же значение своего типа. Возвращает buf. */
+ * читается обратно в то же значение своего типа; у f64 — не длиннее 15
+ * значащих цифр, как у калькулятора. Возвращает buf. */
 char    *smp_num_fmt(double v, SmpDType dt, char *buf, size_t cap);
 
 #endif /* SMPC3_TYPES_H */

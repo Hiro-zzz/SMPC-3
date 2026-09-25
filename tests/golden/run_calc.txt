@@ -67,10 +67,10 @@ $ smpc3 run examples/calc.smpc
 $product      <i32>  391
 $difference   <i32>  63
 $int_quotient <i32>  3
-$quotient     <f32>  3.5
-$root2        <f32>  1.4142135
+$quotient     <f64>  3.5
+$root2        <f64>  1.4142135623731
 $modulus      <i32>  12
-$sq           <f32>  14
+$sq           <f64>  14
 $mean         <f32>  18
 $top          <f32>  42
 $norm         <f32>  1.4142135

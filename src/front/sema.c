@@ -683,14 +683,14 @@ static bool read_operand(Ctx *c, const SmpAstOperand *o, SmpValue *out)
 
         case SMP_OPD_FLOAT:
             out->is_scalar = true;
-            out->dtype     = SMP_DT_F32;
+            out->dtype     = SMP_DT_F64;
             return true;
 
         case SMP_OPD_LIST: {
             /* Безымянный плотный тензор; тип — по числам, пока приёмник или
              * соседний операнд не дадут другой. */
             const SmpAstList *l = o->list;
-            out->dtype = l->any_float ? SMP_DT_F32 : SMP_DT_I32;
+            out->dtype = l->any_float ? SMP_DT_F64 : SMP_DT_I32;
             out->rank  = l->rank;
             for (uint32_t i = 0; i < l->rank; i++) out->shape[i] = l->dims[i];
             val_dense(out);
@@ -762,16 +762,17 @@ static bool lit_fits(Ctx *c, const SmpAstOperand *o, SmpDType to)
     return true;
 }
 
-/* Тип, который литерал берёт сам, когда взять его не у кого: дробный, если
- * в нём есть точка, иначе целый. */
+/* Тип, который литерал берёт сам, когда взять его не у кого: f64, если в
+ * нём есть точка, иначе i32. Дробь без контекста — это калькулятор, а у
+ * калькулятора 1234.56 * 12 обязано быть 14814.72, а не 14814.719 из f32. */
 static SmpDType lit_own(const SmpAstOperand *o)
 {
-    if (o->kind == SMP_OPD_LIST)  return o->list->any_float ? SMP_DT_F32 : SMP_DT_I32;
-    return o->kind == SMP_OPD_FLOAT ? SMP_DT_F32 : SMP_DT_I32;
+    if (o->kind == SMP_OPD_LIST)  return o->list->any_float ? SMP_DT_F64 : SMP_DT_I32;
+    return o->kind == SMP_OPD_FLOAT ? SMP_DT_F64 : SMP_DT_I32;
 }
 
 /* Два числа одной операции: литерал без собственного типа принимает тип
- * другой стороны, два литерала — общий: f32, если хоть в одном есть точка. */
+ * другой стороны, два литерала — общий: f64, если хоть в одном есть точка. */
 static bool unify_lits(Ctx *c, SmpValue *v, const SmpAstOperand *vo,
                        SmpValue *a, const SmpAstOperand *ao)
 {
@@ -783,8 +784,8 @@ static bool unify_lits(Ctx *c, SmpValue *v, const SmpAstOperand *vo,
         if (!lit_fits(c, ao, v->dtype)) return false;
         a->dtype = v->dtype;
     } else if (vl && al) {
-        const SmpDType t = (lit_own(vo) == SMP_DT_F32 || lit_own(ao) == SMP_DT_F32)
-                         ? SMP_DT_F32 : SMP_DT_I32;
+        const SmpDType t = (lit_own(vo) == SMP_DT_F64 || lit_own(ao) == SMP_DT_F64)
+                         ? SMP_DT_F64 : SMP_DT_I32;
         if (!lit_fits(c, vo, t) || !lit_fits(c, ao, t)) return false;
         v->dtype = a->dtype = t;
     }
@@ -1098,7 +1099,7 @@ static bool apply_stage(Ctx *c, const SmpAstStage *st, SmpOpKind k, SmpValue *v)
              * получит. Целый тензор или регистр — уже тип, и приводить его
              * молча было бы неявным приведением. */
             if (c->lit && lit_own(c->lit) == SMP_DT_I32)
-                c->info->src_val.dtype = v->dtype = SMP_DT_F32;
+                c->info->src_val.dtype = v->dtype = SMP_DT_F64;
             if (v->dtype != SMP_DT_F32 && v->dtype != SMP_DT_F64) {
                 serr(c, SMP_E0303, st->span,
                      sfmt(c, "@sqrt считает над f32 или f64, а на входе %s.",
@@ -1188,7 +1189,7 @@ static bool apply_stage(Ctx *c, const SmpAstStage *st, SmpOpKind k, SmpValue *v)
             /* Строки — по последней оси; форма и тип не меняются. */
             if (!require_tensor(c, v, st->span, def->name)) return false;
             if (c->lit && lit_own(c->lit) == SMP_DT_I32)       /* как у @sqrt */
-                c->info->src_val.dtype = v->dtype = SMP_DT_F32;
+                c->info->src_val.dtype = v->dtype = SMP_DT_F64;
             if (v->dtype != SMP_DT_F32 && v->dtype != SMP_DT_F64) {
                 serr(c, SMP_E0303, st->span,
                      sfmt(c, "@%s считает над f32 или f64, а на входе %s.",

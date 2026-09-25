@@ -1383,15 +1383,21 @@ static void test_calc(void)
                   "0.1 -> @add(0.2) => $t;\n"
                   "2 -> @sqrt => $r;\n"
                   "-12 -> @abs => $a;\n"
-                  "$f -> @mul($f) -> @sub(0.25) => $sq;\n"), "арифметика чисел");
+                  "$f -> @mul($f) -> @sub(0.25) => $sq;\n"
+                  "[0.1] => *&h<f32:1>;\n"
+                  "*&h[0] -> @add(0.2) => $t32;\n"), "арифметика чисел");
     CHECK(regval("p", NULL) == 391.0 && regtype("p") == SMP_DT_I32, "17*23 = %g", regval("p", NULL));
     CHECK(regval("q", NULL) == 3.0, "7/2 в i32 = %g, ждали 3", regval("q", NULL));
     CHECK(regval("qn", NULL) == -3.0, "-7/2 в i32 = %g, ждали -3 (к нулю)", regval("qn", NULL));
-    CHECK(regval("f", NULL) == 3.5 && regtype("f") == SMP_DT_F32, "7.0/2 = %g", regval("f", NULL));
-    /* f32 обязан быть f32: сумма округлена в float, а не оставлена double. */
-    CHECK(regval("t", NULL) == (double)(0.1f + 0.2f), "0.1+0.2 в f32 = %.17g", regval("t", NULL));
-    CHECK(regval("r", NULL) == (double)sqrtf(2.0f) && regtype("r") == SMP_DT_F32,
+    /* Дробь без типизированного соседа — f64. */
+    CHECK(regval("f", NULL) == 3.5 && regtype("f") == SMP_DT_F64, "7.0/2 = %g", regval("f", NULL));
+    CHECK(regval("t", NULL) == 0.1 + 0.2 && regtype("t") == SMP_DT_F64,
+          "0.1+0.2 в f64 = %.17g", regval("t", NULL));
+    CHECK(regval("r", NULL) == sqrt(2.0) && regtype("r") == SMP_DT_F64,
           "корень из 2 = %.17g", regval("r", NULL));
+    /* f32 обязан быть f32: сумма округлена в float, а не оставлена double. */
+    CHECK(regval("t32", NULL) == (double)(0.1f + 0.2f) && regtype("t32") == SMP_DT_F32,
+          "0.1+0.2 в f32 = %.17g", regval("t32", NULL));
     CHECK(regval("a", NULL) == 12.0 && regtype("a") == SMP_DT_I32, "|-12| = %g", regval("a", NULL));
     CHECK(regval("sq", NULL) == 12.0, "3.5^2 - 0.25 = %g", regval("sq", NULL));
 
@@ -1455,7 +1461,7 @@ static void test_calc(void)
               "столбец T: %d %d %d %d", t ? t[0] : -1, t ? t[1] : -1, t ? t[3] : -1,
               t ? t[5] : -1);
     }
-    CHECK(regval("s", NULL) == 4.0 && regtype("s") == SMP_DT_F32, "сумма литерала %g",
+    CHECK(regval("s", NULL) == 4.0 && regtype("s") == SMP_DT_F64, "сумма литерала %g",
           regval("s", NULL));
     CHECK(regval("rs", NULL) == 1.0 && regtype("rs") == SMP_DT_I32, "литерал в регистре: %g",
           regval("rs", NULL));
