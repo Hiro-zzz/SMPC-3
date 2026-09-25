@@ -1361,6 +1361,129 @@ static void test_live_len(void)
     }
 }
 
+/* Логический тип именованного скалярного регистра. */
+static SmpDType regtype(const char *name)
+{
+    for (uint32_t i = 0; i < g_vm.n_regs && i < g_mod.n_reg_names; i++) {
+        if (!g_mod.reg_names[i]) continue;
+        if (strcmp(smp_module_str(&g_mod, g_mod.reg_names[i]), name) != 0) continue;
+        return (SmpDType)g_vm.regs[i].dtype;
+    }
+    return SMP_DT_INVALID;
+}
+
+static void test_calc(void)
+{
+    SECTION("калькулятор: числа");
+
+    CHECK(run_str("17 -> @mul(23) => $p;\n"
+                  "7 -> @div(2) => $q;\n"
+                  "-7 -> @div(2) => $qn;\n"
+                  "7.0 -> @div(2) => $f;\n"
+                  "0.1 -> @add(0.2) => $t;\n"
+                  "2 -> @sqrt => $r;\n"
+                  "-12 -> @abs => $a;\n"
+                  "$f -> @mul($f) -> @sub(0.25) => $sq;\n"), "арифметика чисел");
+    CHECK(regval("p", NULL) == 391.0 && regtype("p") == SMP_DT_I32, "17*23 = %g", regval("p", NULL));
+    CHECK(regval("q", NULL) == 3.0, "7/2 в i32 = %g, ждали 3", regval("q", NULL));
+    CHECK(regval("qn", NULL) == -3.0, "-7/2 в i32 = %g, ждали -3 (к нулю)", regval("qn", NULL));
+    CHECK(regval("f", NULL) == 3.5 && regtype("f") == SMP_DT_F32, "7.0/2 = %g", regval("f", NULL));
+    /* f32 обязан быть f32: сумма округлена в float, а не оставлена double. */
+    CHECK(regval("t", NULL) == (double)(0.1f + 0.2f), "0.1+0.2 в f32 = %.17g", regval("t", NULL));
+    CHECK(regval("r", NULL) == (double)sqrtf(2.0f) && regtype("r") == SMP_DT_F32,
+          "корень из 2 = %.17g", regval("r", NULL));
+    CHECK(regval("a", NULL) == 12.0 && regtype("a") == SMP_DT_I32, "|-12| = %g", regval("a", NULL));
+    CHECK(regval("sq", NULL) == 12.0, "3.5^2 - 0.25 = %g", regval("sq", NULL));
+
+    /* Литерал берёт тип соседа: 1 рядом с u64 из @argmax — это u64. */
+    CHECK(run_str("*&v<f32:3> -> @alloc => *&v;\n"
+                  "9.0 => *&v[1];\n"
+                  "*&v -> @argmax -> @add(1) => $pos;\n"), "argmax + 1");
+    CHECK(regval("pos", NULL) == 2.0 && regtype("pos") == SMP_DT_U64,
+          "argmax+1 = %g", regval("pos", NULL));
+
+    /* Элемент тензора — тоже число. */
+    CHECK(run_str("[2.0, 5.0] => *&v<f32:2>;\n"
+                  "*&v[1] -> @mul(*&v[0]) => $m;\n"), "элементы как числа");
+    CHECK(regval("m", NULL) == 10.0, "5*2 = %g", regval("m", NULL));
+
+    SECTION("калькулятор: ловушки");
+
+    CHECK(!run_str("5 -> @div(0) => $x;\n"), "деление на ноль прошло");
+    CHECK(strstr(g_out, "E0601") != NULL, "нет E0601");
+    CHECK(!run_str("2147483647 -> @add(1) => $x;\n"), "переполнение i32 прошло");
+    CHECK(strstr(g_out, "E0613") != NULL, "нет E0613");
+    CHECK(!run_str("*&v<f32:2> -> @alloc => *&v;\n"
+                   "*&v -> @argmax -> @sub(1) => $x;\n"), "u64 ниже нуля прошло");
+    CHECK(strstr(g_out, "E0613") != NULL, "нет E0613 для u64");
+    /* У дробных деление на ноль — IEEE, а не ошибка. */
+    CHECK(run_str("1.0 -> @div(0) => $x;\n"), "1.0/0 обязано дать бесконечность");
+    CHECK(isinf(regval("x", NULL)), "1.0/0 = %g", regval("x", NULL));
+
+    SECTION("калькулятор: число из регистра в @fill и @scale");
+
+    /* Раньше VM брала число из пула констант по индексу 0 — то есть первую
+     * попавшуюся константу программы, а регистр не читала вовсе. */
+    CHECK(run_str("*&v<f32:4> -> @fill(3.0) => *&v;\n"
+                  "*&v -> @reduce.add => $s;\n"
+                  "*&w<f32:4> -> @fill($s) => *&w;\n"
+                  "*&w -> @scale($s) => *&x<f32:4>;\n"
+                  "*&w -> @scale($s) -> @relu => *&y<f32:4>;\n"
+                  "*&z<f32:4> -> @fill(*&v[0]) => *&z;\n"), "@fill($s), @scale($s)");
+    CHECK(felem("w", 3) == 12.0f, "@fill($s): %g, ждали 12", felem("w", 3));
+    CHECK(felem("x", 0) == 144.0f, "@scale($s): %g, ждали 144", felem("x", 0));
+    CHECK(felem("y", 1) == 144.0f, "слитая @scale($s): %g, ждали 144", felem("y", 1));
+    CHECK(felem("z", 2) == 3.0f, "@fill(*&v[0]): %g, ждали 3", felem("z", 2));
+
+    SECTION("калькулятор: литералы тензоров");
+
+    CHECK(run_str("[[1, 2, 3], [4, 5, 6]] => *&M<f32:2,3>;\n"
+                  "*&T<i32:3,2> -> @alloc => *&T;\n"
+                  "[7, 8, 9] => *&T[.., 1];\n"
+                  "[1.5, 2.5] -> @reduce.add => $s;\n"
+                  "[-1, 2] => $r;\n"
+                  "$r -> @reduce.add => $rs;\n"
+                  "1 => $i;\n"
+                  "[10.0, 20, 30] => *&M[$i, ..];\n"), "литералы");
+    {
+        const float   *m = (const float *)tensor_data("M", NULL);
+        const int32_t *t = (const int32_t *)tensor_data("T", NULL);
+        CHECK(m && m[0] == 1.0f && m[2] == 3.0f && m[3] == 10.0f && m[5] == 30.0f,
+              "M = [%g %g %g; %g %g %g]", m ? m[0] : -1, m ? m[1] : -1, m ? m[2] : -1,
+              m ? m[3] : -1, m ? m[4] : -1, m ? m[5] : -1);
+        CHECK(t && t[0] == 0 && t[1] == 7 && t[3] == 8 && t[5] == 9,
+              "столбец T: %d %d %d %d", t ? t[0] : -1, t ? t[1] : -1, t ? t[3] : -1,
+              t ? t[5] : -1);
+    }
+    CHECK(regval("s", NULL) == 4.0 && regtype("s") == SMP_DT_F32, "сумма литерала %g",
+          regval("s", NULL));
+    CHECK(regval("rs", NULL) == 1.0 && regtype("rs") == SMP_DT_I32, "литерал в регистре: %g",
+          regval("rs", NULL));
+
+    /* Строка f32:3 по индексу-регистру начинается с 12-го байта. Без #simd
+     * это законно; с явным #simd:v256 — ловушка, как у статического среза. */
+    CHECK(run_str("*&M<f32:2,3> -> @fill(1.0) => *&M;\n"
+                  "1 => $i;\n"
+                  "*&M[$i, ..] -> @reduce.add => $s;\n"), "невыровненная строка без #simd");
+    CHECK(regval("s", NULL) == 3.0, "сумма строки %g", regval("s", NULL));
+    CHECK(!run_str("*&M<f32:2,3> -> @fill(1.0) => *&M;\n"
+                   "1 => $i;\n"
+                   "[#simd:v256] *&M[$i, ..] -> @reduce.add => $s;\n"),
+          "невыровненная строка под #simd:v256 прошла");
+    CHECK(strstr(g_out, "E0402") != NULL, "нет E0402");
+
+    SECTION("калькулятор: деление и корень тензоров");
+
+    CHECK(run_str("[1.0, 4.0, 9.0] => *&a<f32:3>;\n"
+                  "[2.0, 8.0, 3.0] => *&b<f32:3>;\n"
+                  "*&a -> @div(*&b) => *&q<f32:3>;\n"
+                  "*&a -> @sqrt => *&r<f32:3>;\n"), "div/sqrt");
+    CHECK(felem("q", 0) == 0.5f && felem("q", 1) == 0.5f && felem("q", 2) == 3.0f,
+          "a/b = %g %g %g", felem("q", 0), felem("q", 1), felem("q", 2));
+    CHECK(felem("r", 0) == 1.0f && felem("r", 1) == 2.0f && felem("r", 2) == 3.0f,
+          "sqrt(a) = %g %g %g", felem("r", 0), felem("r", 1), felem("r", 2));
+}
+
 static void test_nn_chain(void)
 {
     SECTION("цепочка модели");
@@ -1399,6 +1522,7 @@ int main(void)
     test_memory();
     test_arith();
     test_literals();
+    test_calc();
     test_emit();
     test_views();
     test_traps();

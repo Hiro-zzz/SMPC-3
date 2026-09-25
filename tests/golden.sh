@@ -111,6 +111,10 @@ check run_types     run   examples/types.smpc
 check run_gemm      run   examples/gemm.smpc
 check run_forward   run   examples/forward.smpc
 check run_layer     run   examples/layer.smpc
+check run_calc      run   examples/calc.smpc
+check check_bad_calc check examples/bad_calc.smpc
+# Короткая форма диагностики — та, что уходит модели.
+SMPC3_DIAG=compact check check_bad_calc_compact check examples/bad_calc.smpc
 check check_forward check examples/forward.smpc -v
 check run_repeat    run   examples/repeat.smpc
 check run_io        run   examples/io.smpc --out V="$TMP/io.bin" --in W="$TMP/io.bin"

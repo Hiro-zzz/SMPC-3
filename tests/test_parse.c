@@ -66,6 +66,40 @@ static void expect_ok(const char *text, uint32_t nstmts, const char *label)
 
 /* ========================================================================== */
 
+static void test_lists(void)
+{
+    SECTION("литералы тензоров");
+
+    SmpAstProgram prog;
+    CHECK(parse_str("[#arena:1] [[1, -2.5, 3], [4, 5, 6]] -> @reduce.add => $s;", &prog) == 0,
+          "матрица 2x3 не разобралась");
+    if (prog.nstmts == 1) {
+        const SmpAstStmt *s = &prog.stmts[0];
+        const SmpAstList *l = s->source.list;
+        CHECK(s->nprefix == 1, "префикс потерялся");
+        CHECK(s->source.kind == SMP_OPD_LIST && l, "источник не литерал");
+        if (l) {
+            CHECK(l->rank == 2 && l->dims[0] == 2 && l->dims[1] == 3 && l->n == 6,
+                  "форма %ux%u, чисел %u", l->dims[0], l->dims[1], l->n);
+            CHECK(l->any_float && l->vals[1].is_float && l->vals[1].fval == -2.5,
+                  "второе число не -2.5");
+            CHECK(!l->vals[2].is_float && l->vals[2].ival == 3u, "третье число не 3");
+        }
+    }
+
+    expect_ok("[1] => $a; [-1, 2] => $b; [[[1]], [[2]]] => $c;", 3, "вектор, минус, ранг 3");
+    expect_error("[[1, 2], [3]] => $a;",   SMP_E0211, "строки разной длины");
+    expect_error("[[1, 2], 3] => $a;",     SMP_E0211, "число вместо строки");
+    expect_error("[1, [2, 3]] => $a;",     SMP_E0211, "строка вместо числа");
+    expect_error("[[]] => $a;",            SMP_E0211, "пустая строка");
+    expect_error("[1, $x] => $a;",         SMP_E0209, "регистр в литерале");
+    expect_error("[1, 2 => $a;",           SMP_E0203, "не закрыт литерал");
+    expect_error("[[[[[1]]]]] => $a;",     SMP_E0302, "ранг 5");
+    expect_error("$a => [1, 2];",          SMP_E0208, "литерал как приёмник");
+}
+
+/* ========================================================================== */
+
 static const char g_kernel[] =
     "// Инициализация матриц в выровненной арене\n"
     "[#arena:0]  *&A<f32:1024,1024>  ->  @alloc  =>  $r1;\n"
@@ -391,6 +425,7 @@ int main(void)
     test_errors();
     test_recovery();
     test_ambiguity();
+    test_lists();
 
     fclose(g_sink);
     smp_arena_release(&g_arena);

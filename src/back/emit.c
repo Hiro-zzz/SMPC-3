@@ -104,6 +104,28 @@ static uint32_t intern_const(Em *m, SmpConst v)
 static uint32_t const_u64(Em *m, uint64_t u) { SmpConst c; c.u = u; return intern_const(m, c); }
 static uint32_t const_f64(Em *m, double f)   { SmpConst c; c.f = f; return intern_const(m, c); }
 
+/* Числа литерала тензора — подряд и без слияния с уже лежащими в пуле:
+ * lit читает их одним куском, начиная с первого. Целые типы едут целыми,
+ * дробные — double. UINT32_MAX — пул переполнен. */
+static uint32_t const_run(Em *m, const SmpAstList *l, SmpDType dt)
+{
+    if (m->n_consts + l->n > EM_MAX_CONST) {
+        eerr(m, SMP_E0207, m->cur_span,
+             efmt(m, "Констант в программе больше %u.", EM_MAX_CONST));
+        return 0xFFFFFFFFu;
+    }
+    const bool to_float = (dt == SMP_DT_F32 || dt == SMP_DT_F64);
+    const uint32_t first = m->n_consts;
+    for (uint32_t i = 0; i < l->n; i++) {
+        const SmpAstNum *v = &l->vals[i];
+        SmpConst c;
+        if (to_float) c.f = v->is_float ? v->fval : (double)(int64_t)v->ival;
+        else          c.u = v->ival;
+        m->consts[m->n_consts++] = c;
+    }
+    return first;
+}
+
 /* Запись в таблице дескрипторов. Возвращает индекс или UINT32_MAX. */
 static uint32_t add_tens(Em *m, const SmpValue *v, uint64_t abs_off,
                          uint32_t name_id, uint32_t arena_id)
@@ -245,6 +267,7 @@ static uint8_t stmt_flags(const SmpStmtInfo *in)
     if (in->strict)   f |= SMP_IF_STRICT;
     if (in->no_alias) f |= SMP_IF_NOALIAS;
     if (in->raw)      f |= SMP_IF_RAW;
+    if (in->req_vec_bits) f |= SMP_IF_SIMD;
     return f;
 }
 
@@ -271,11 +294,17 @@ static uint32_t load_value(Em *m, const SmpAstOperand *o, const SmpValue *v,
     }
 
     if (o->kind == SMP_OPD_INT || o->kind == SMP_OPD_FLOAT) {
+        /* Тип литералу дала семантика: свой или соседа по операции. Целый
+         * тип едет целым, дробный — double, округлённый VM под тип. */
         const uint32_t r = alloc_temp(m);
         const bool     is_int = (o->kind == SMP_OPD_INT);
-        const uint32_t k = is_int ? const_u64(m, o->ival) : const_f64(m, o->fval);
-        emit_aux(m, SMP_BC_LOADK, flags, r, 0, 0, k,
-                 (uint8_t)(is_int ? SMP_DT_I32 : SMP_DT_F64));
+        SmpDType       dt = v->dtype;
+        if (dt != SMP_DT_F32 && dt != SMP_DT_F64 && dt != SMP_DT_I32 && dt != SMP_DT_U64)
+            dt = is_int ? SMP_DT_I32 : SMP_DT_F64;
+        const bool to_float = (dt == SMP_DT_F32 || dt == SMP_DT_F64);
+        const uint32_t k = !to_float ? const_u64(m, o->ival)
+                         : const_f64(m, is_int ? (double)(int64_t)o->ival : o->fval);
+        emit_aux(m, SMP_BC_LOADK, flags, r, 0, 0, k, (uint8_t)dt);
         return r;
     }
 
@@ -336,6 +365,8 @@ static SmpOpcode op_to_bc(SmpOpKind k)
         case SMP_OP_ADD:        return SMP_BC_ADD;
         case SMP_OP_MUL:        return SMP_BC_MUL;
         case SMP_OP_SUB:        return SMP_BC_SUB;
+        case SMP_OP_DIV:        return SMP_BC_DIV;
+        case SMP_OP_SQRT:       return SMP_BC_SQRT;
         case SMP_OP_SILU:       return SMP_BC_SILU;
         case SMP_OP_RMSNORM:    return SMP_BC_RMSN;
         case SMP_OP_SOFTMAX:    return SMP_BC_SOFTMX;
@@ -366,7 +397,8 @@ static bool needs_buffer(SmpOpKind k)
         case SMP_OP_CAST_F32: case SMP_OP_CAST_F64:
         case SMP_OP_CAST_I32: case SMP_OP_CAST_U64: case SMP_OP_CAST_Q8_0:
         case SMP_OP_RELU: case SMP_OP_ABS: case SMP_OP_SCALE:
-        case SMP_OP_ADD:  case SMP_OP_MUL: case SMP_OP_SUB:
+        case SMP_OP_ADD:  case SMP_OP_MUL: case SMP_OP_SUB: case SMP_OP_DIV:
+        case SMP_OP_SQRT:
         case SMP_OP_SILU: case SMP_OP_RMSNORM: case SMP_OP_SOFTMAX: case SMP_OP_ROPE:
             return true;
         default:
@@ -533,7 +565,39 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
             if (s->dest.tensor->idx[ax].kind == SMP_IDX_REG) dest_dyn = true;
 
     /* --- источник --- */
-    uint32_t r = load_value(m, &s->source, &in->src_val, flags, in->arena_id);
+    uint32_t r;
+    if (s->source.kind == SMP_OPD_LIST) {
+        /* Литерал тензора: числа лежат в пуле подряд, lit раскладывает их по
+         * шагам того, что в регистре. Без стадий — прямо в приёмник, хоть в
+         * столбец; иначе — во временный буфер, с которым работают стадии. */
+        const SmpDType ldt = (SmpDType)in->src_val.dtype;
+        const uint32_t k0  = const_run(m, s->source.list, ldt);
+        if (k0 == 0xFFFFFFFFu) return false;
+
+        if (s->nstages == 0 && in->dest_is_tensor) {
+            uint32_t dr;
+            if (dest_dyn) {
+                dr = load_value(m, &s->dest, &in->dest_val, flags, in->arena_id);
+            } else {
+                const uint32_t dt = tens_for_value(m, &in->dest_val, in->arena_id);
+                if (dt == 0xFFFFFFFFu) return false;
+                dr = alloc_temp(m);
+                emit(m, SMP_BC_LOADT, flags, dr, 0, 0, dt);
+            }
+            m->cur_span = s->span;
+            emit_aux(m, SMP_BC_LIT, flags, dr, 0, 0, k0, (uint8_t)ldt);
+            return false;
+        }
+
+        const uint32_t t = tens_scratch(m, &in->src_val, in->arena_id);
+        if (t == 0xFFFFFFFFu) return false;
+        r = alloc_temp(m);
+        emit(m, SMP_BC_LOADT, flags, r, 0, 0, t);
+        m->reg_scratch[r] = true;
+        emit_aux(m, SMP_BC_LIT, flags, r, 0, 0, k0, (uint8_t)ldt);
+    } else {
+        r = load_value(m, &s->source, &in->src_val, flags, in->arena_id);
+    }
 
     /* --- стадии --- */
     uint32_t  prev_instr  = 0xFFFFFFFFu;  /* инструкция предыдущей стадии    */
@@ -548,6 +612,11 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
 
         uint32_t a = r, b = 0, kk = 0, d = r;
         uint8_t  kaux = 0;
+
+        /* Арифметика над числами: считает VM сама, буфер ей не нужен. */
+        const bool scal = in->stage_out[i].is_scalar &&
+                          (k == SMP_OP_ADD || k == SMP_OP_SUB || k == SMP_OP_MUL ||
+                           k == SMP_OP_DIV || k == SMP_OP_ABS || k == SMP_OP_SQRT);
 
         /* Аргумент стадии. */
         if (k == SMP_OP_RESHAPE) {
@@ -596,8 +665,9 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
             case SMP_OP_EMIT_NUM:  kaux = SMP_EMIT_NUM;  break;
             default: break;
         }
+        if (scal) kaux = SMP_AUX_SCALAR;
 
-        if (needs_buffer(k)) {
+        if (needs_buffer(k) && !scal) {
             const bool last = (i + 1u == s->nstages);
             uint32_t t;
 
@@ -629,7 +699,7 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
             } else {
                 d = a;
             }
-        } else if (k == SMP_OP_REDUCE_ADD || k == SMP_OP_REDUCE_MAX ||
+        } else if (scal || k == SMP_OP_REDUCE_ADD || k == SMP_OP_REDUCE_MAX ||
                    k == SMP_OP_STORE || k == SMP_OP_ARGMAX ||
                    (k >= SMP_OP_EMIT_TEXT && k <= SMP_OP_EMIT_NUM)) {
             d = alloc_temp(m);
@@ -644,7 +714,7 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
          * незачем. Утверждать это может лишь компилятор — VM сама не знает,
          * что буфер больше никем не читается. */
         bool chain = (prev_instr != 0xFFFFFFFFu) && fusable_head(prev_kind) &&
-                     (fusable_op(k) || fusable_tail(k));
+                     (fusable_op(k) || fusable_tail(k)) && !scal;
         if (chain) {
             const uint32_t ns = hoist_loads(m, chain_start, prev_instr + 1u);
             if (ns == 0xFFFFFFFFu) chain = false;
@@ -659,7 +729,7 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
         prev_instr = m->n_code ? m->n_code - 1u : 0xFFFFFFFFu;
         /* @mmul с живой длиной цепочку не начинает: слитый эпилог считает
          * весь тайл, а длину не знает. */
-        prev_kind  = (k == SMP_OP_MMUL && kaux == 1) ? SMP_OP__COUNT : k;
+        prev_kind  = ((k == SMP_OP_MMUL && kaux == 1) || scal) ? SMP_OP__COUNT : k;
         if (!chain) chain_start = prev_instr;
         r = d;
     }
@@ -687,6 +757,7 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
     /* Если последняя стадия уже писала в приёмник, копировать нечего. */
     const SmpOpKind lastk = s->nstages ? in->ops[s->nstages - 1u] : SMP_OP__COUNT;
     const bool wrote_direct = s->nstages && needs_buffer(lastk) &&
+                              !in->stage_out[s->nstages - 1u].is_scalar &&
                               !dest_is_read && (in->dest_val.flags & SMP_TF_CONTIG);
     if (wrote_direct) return false;
 

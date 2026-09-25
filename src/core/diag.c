@@ -305,6 +305,11 @@ void smp_diag_init(SmpDiagCtx *d, const SmpSource *src, FILE *out)
     d->color         = smp_plat_isatty(d->out);
     d->deterministic = true;
     d->rng           = 0x123456789ABCDEFull;
+
+    /* Короткая форма снаружи — переменной, чтобы инструментам вокруг модели
+     * не нужен был свой флаг у каждой команды CLI. */
+    const char *mode = smp_plat_env("SMPC3_DIAG");
+    d->compact = mode && strcmp(mode, "compact") == 0;
 }
 
 void smp_console_setup(void) { smp_plat_console_setup(); }
@@ -533,6 +538,39 @@ bool smp_diag_mute(SmpDiagCtx *d, SmpDiagCode code)
     return true;
 }
 
+/* Поле короткой формы: продолжения строк ДЕТАЛИ — с отступом под текстом. */
+static void smp__compact_field(SmpDiagCtx *d, const char *label, const char *body)
+{
+    const char *p = body ? body : "";
+    smp_diag_write(d, "  %s: ", label);
+    for (;;) {
+        const char *nl = strchr(p, '\n');
+        smp_diag_write(d, "%.*s\n", nl ? (int)(nl - p) : (int)strlen(p), p);
+        if (!nl) break;
+        p = nl + 1;
+        smp_diag_write(d, "    ");
+    }
+}
+
+static void smp__emit_compact(SmpDiagCtx *d, const SmpDiagMsg *m, const SmpDiagInfo *inf)
+{
+    const bool has_span = smp_span_valid(m->span);
+    if (has_span)
+        smp_diag_write(d, "%s %u:%u %s\n", inf->text, m->span.line, m->span.col, inf->title);
+    else
+        smp_diag_write(d, "%s %s\n", inf->text, inf->title);
+
+    SmpLineRef ln;
+    if (has_span && smp__line_at(d->src, m->span.line, &ln)) {
+        while (ln.len && (*ln.p == ' ' || *ln.p == '\t')) { ln.p++; ln.len--; }
+        smp_diag_write(d, "  %u | %.*s\n", m->span.line,
+                       (int)(ln.len < 200u ? ln.len : 200u), ln.p);
+    }
+    if (m->details && m->details[0]) smp__compact_field(d, "ДЕТАЛИ", m->details);
+    smp__compact_field(d, "ИСПРАВЛЕНИЕ", m->fix ? m->fix : inf->fix);
+    if (!d->log) fflush(d->out);
+}
+
 static void smp__emit(SmpDiagCtx *d, const SmpDiagMsg *m)
 {
     const SmpDiagInfo *inf = smp_diag_info(m->code);
@@ -542,6 +580,11 @@ static void smp__emit(SmpDiagCtx *d, const SmpDiagMsg *m)
         case SMP_SEV_FATAL: d->n_fatal++; break;
         case SMP_SEV_WARN:  d->n_warn++;  break;
         default:            d->n_note++;  break;
+    }
+
+    if (d->compact) {
+        smp__emit_compact(d, m, inf);
+        return;
     }
 
     const char *dim  = smp__c(d, C_DIM);

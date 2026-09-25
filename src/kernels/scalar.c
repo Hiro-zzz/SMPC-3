@@ -289,11 +289,11 @@ void smp_ks_zero(const SmpBuf *dst)
 /*  Бинарные                                                                  */
 /* ========================================================================== */
 
-enum { BIN_ADD, BIN_MUL, BIN_SUB };
+enum { BIN_ADD, BIN_MUL, BIN_SUB, BIN_DIV };
 
 static double bin_op(double x, double y, int op)
 {
-    return op == BIN_MUL ? x * y : op == BIN_SUB ? x - y : x + y;
+    return op == BIN_MUL ? x * y : op == BIN_SUB ? x - y : op == BIN_DIV ? x / y : x + y;
 }
 
 static void binary(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b, int op)
@@ -352,6 +352,33 @@ void smp_ks_sub(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b)
         KS_BINARY_DENSE(x - y);
     }
     binary(dst, a, b, BIN_SUB);
+}
+
+/* Компилятор пускает сюда только f32 и f64: целое деление над тензорами
+ * не определено, и насыщать 1/0 до INT_MAX молча было бы хуже ошибки. */
+void smp_ks_div(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b)
+{
+    if (dense_same3(dst, a, b)) {
+        const uint32_t n = dst->t->nelem;
+        const SmpDType dt = (SmpDType)dst->t->dtype;
+        KS_BINARY_DENSE(x / y);
+    }
+    binary(dst, a, b, BIN_DIV);
+}
+
+static double f_sqrt(double x, double k) { SMP_UNUSED(k); return smp_sqrt(x); }
+
+void smp_ks_sqrt(const SmpBuf *dst, const SmpBuf *src) { unary(dst, src, f_sqrt, 0.0); }
+
+void smp_ks_set(const SmpBuf *dst, uint32_t i, double v)
+{
+    const SmpTensor *t = dst->t;
+    uint32_t idx[SMP_MAX_RANK] = { 0, 0, 0, 0 };
+    for (uint32_t ax = t->rank; ax-- > 0; ) {
+        idx[ax] = i % t->shape[ax];
+        i      /= t->shape[ax];
+    }
+    store_at(dst->p, (SmpDType)t->dtype, elem_index(t, idx), v);
 }
 
 /* ========================================================================== */

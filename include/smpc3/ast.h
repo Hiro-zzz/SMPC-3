@@ -66,13 +66,34 @@ typedef struct SmpAstTensor {
     SmpAstIndex idx[SMP_MAX_RANK];
 } SmpAstTensor;
 
+/* --- Литерал тензора: [1, 2, 3], [[1, 2], [3, 4]] ------------------------- */
+
+/* Числа литерала едут в пул констант подряд, и пул общий на программу:
+ * потолок держит одну таблицу чисел от того, чтобы съесть его целиком. */
+#define SMP_MAX_LIST 1024u
+
+typedef struct SmpAstNum {
+    bool     is_float;
+    uint64_t ival;             /* целое; отрицательное — в дополнительном коде */
+    double   fval;
+} SmpAstNum;
+
+typedef struct SmpAstList {
+    uint32_t   rank;           /* глубина вложенности, 1..4                  */
+    uint32_t   dims[SMP_MAX_RANK];
+    uint32_t   n;              /* чисел всего, строка за строкой             */
+    SmpAstNum *vals;
+    bool       any_float;      /* есть ли хоть одно дробное                  */
+} SmpAstList;
+
 /* --- Операнд -------------------------------------------------------------- */
 typedef enum SmpOperandKind {
     SMP_OPD_NONE = 0,
     SMP_OPD_REG,
     SMP_OPD_TENSOR,
     SMP_OPD_INT,
-    SMP_OPD_FLOAT
+    SMP_OPD_FLOAT,
+    SMP_OPD_LIST
 } SmpOperandKind;
 
 typedef struct SmpAstOperand {
@@ -82,6 +103,7 @@ typedef struct SmpAstOperand {
     SmpAstTensor  *tensor;     /* SMP_OPD_TENSOR                             */
     uint64_t       ival;       /* SMP_OPD_INT                                */
     double         fval;       /* SMP_OPD_FLOAT                              */
+    SmpAstList    *list;       /* SMP_OPD_LIST                               */
 } SmpAstOperand;
 
 /* --- Стадия конвейера: @mmul($r2), @reduce.add ---------------------------- */

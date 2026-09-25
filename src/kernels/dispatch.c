@@ -119,6 +119,9 @@ void smp_k_cast(const SmpBuf *d, const SmpBuf *s) { smp_ks_cast(d, s); }
 void smp_k_fill(const SmpBuf *d, double v)        { smp_ks_fill(d, v); }
 
 void smp_k_sub(const SmpBuf *d, const SmpBuf *a, const SmpBuf *b) { smp_ks_sub(d, a, b); }
+void smp_k_div(const SmpBuf *d, const SmpBuf *a, const SmpBuf *b) { smp_ks_div(d, a, b); }
+void smp_k_sqrt(const SmpBuf *d, const SmpBuf *s)                { smp_ks_sqrt(d, s); }
+void smp_k_set(const SmpBuf *d, uint32_t i, double v)            { smp_ks_set(d, i, v); }
 void smp_k_silu(const SmpBuf *d, const SmpBuf *s)                { smp_ks_silu(d, s); }
 void smp_k_rmsnorm(const SmpBuf *d, const SmpBuf *s, double eps) { smp_ks_rmsnorm(d, s, eps); }
 void smp_k_softmax(const SmpBuf *d, const SmpBuf *s, uint64_t n) { smp_ks_softmax(d, s, n); }

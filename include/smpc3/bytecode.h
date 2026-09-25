@@ -73,7 +73,10 @@ typedef enum SmpOpFmt {
     X(SOFTMX, "softmax", SMP_FMT_D_A_B,   "rD <- softmax строк rA; aux=1: длина rB") \
     X(ROPE,   "rope",    SMP_FMT_D_A_B_K, "rD <- RoPE(rA), позиция rB, основание K") \
     X(ARGMAX, "argmax",  SMP_FMT_D_A,     "rD <- номер наибольшего в rA")      \
-    X(RESHP,  "reshape", SMP_FMT_D_A_T,   "rD <- rA в форме T, память та же")
+    X(RESHP,  "reshape", SMP_FMT_D_A_T,   "rD <- rA в форме T, память та же")  \
+    X(DIV,    "div",     SMP_FMT_D_A_B,   "rD <- rA / rB поэлементно")         \
+    X(SQRT,   "sqrt",    SMP_FMT_D_A,     "rD <- корень rA поэлементно")       \
+    X(LIT,    "lit",     SMP_FMT_D_K,     "rD <- литерал: константы K.. по порядку")
 
 #define SMP_BC_ENUM(id, mn, fmt, desc) SMP_BC_##id,
 typedef enum SmpOpcode {
@@ -110,7 +113,13 @@ enum SmpInstrFlags {
      * никем не читается. VM ничего не выводит сама: снимет флаг — получит
      * прежнее поведение, инструкция за инструкцией. Поэтому старый рантайм
      * исполнит новый модуль правильно, просто медленнее. */
-    SMP_IF_FUSE     = 0x40u
+    SMP_IF_FUSE     = 0x40u,
+
+    /* Ширина вектора запрошена явно, через #simd, а не выбрана по
+     * процессору. Выравнивание среза с индексом-регистром проверяется
+     * только тогда — так же, как компилятор проверяет статические срезы:
+     * без #simd ядра вправе читать невыровненно. */
+    SMP_IF_SIMD     = 0x80u
 };
 
 SMP_INLINE uint8_t  smp_vec_code(uint32_t bits)
@@ -140,6 +149,15 @@ typedef struct SmpInstr {
 } SmpInstr;
 
 SMP_STATIC_ASSERT(sizeof(SmpInstr) == 8, instruction_is_8_bytes);
+
+/* aux у add, sub, mul, div, abs и sqrt: операнды — скаляры, а не тензоры.
+ * Скаляр в регистре — double с логическим типом, и считается он прямо в VM,
+ * без ядер и без буфера под результат. */
+#define SMP_AUX_SCALAR 1u
+
+/* aux у fill и scale: ноль — число не из пула констант, а из регистра b.
+ * Иначе там тип константы, как у всех, кто читает пул. */
+#define SMP_AUX_REG 0u
 
 #define SMP_MAX_REGS 256u
 
@@ -195,7 +213,7 @@ SMP_INLINE double smp_const_as_double(SmpConst c, uint8_t dtype)
 #define SMP_S3B_MAGIC3 0x33u  /* '3' */
 
 #define SMP_S3B_VER_MAJOR 0u
-#define SMP_S3B_VER_MINOR 3u
+#define SMP_S3B_VER_MINOR 4u
 
 enum SmpS3bFlags {
     SMP_S3B_LITTLE_ENDIAN = 1u << 0,

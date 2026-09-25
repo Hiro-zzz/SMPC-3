@@ -33,6 +33,17 @@ void smp_k_mul(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b);
 
 void smp_k_sub(const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b);
 
+/* Деление и корень — только f32 и f64: целого деления над тензорами в
+ * языке нет. Считаются в double и округляются в тип один раз; для f32 это
+ * то же, что сделало бы железо (53 бита double с запасом покрывают двойное
+ * округление), поэтому результат не зависит от ветки ядер. */
+void smp_k_div (const SmpBuf *dst, const SmpBuf *a, const SmpBuf *b);
+void smp_k_sqrt(const SmpBuf *dst, const SmpBuf *src);
+
+/* Элемент номер i в логическом порядке (строка за строкой) — по шагам, так
+ * что годится и срез со столбцом. Для литералов тензора. */
+void smp_k_set(const SmpBuf *dst, uint32_t i, double v);
+
 /* --- Операции нейросети ----------------------------------------------------
  *
  * Всё — по последней оси, строка за строкой; вход и выход могут совпадать.

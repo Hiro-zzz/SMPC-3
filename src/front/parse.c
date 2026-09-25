@@ -294,6 +294,143 @@ static SmpAstTensor *parse_tensor(SmpParser *p)
 }
 
 /* ========================================================================== */
+/*  Литерал тензора                                                           */
+/* ========================================================================== */
+
+/* '[' с числом, минусом или ещё одной '[' следом — литерал, а не группа:
+ * индекс стоит только за именем тензора, а префикс начинается с # или ^. */
+static bool at_list(const SmpParser *p)
+{
+    if (!at(p, SMP_TK_LBRACKET)) return false;
+    switch (peek(p, 1)->kind) {
+        case SMP_TK_INT: case SMP_TK_FLOAT: case SMP_TK_MINUS: case SMP_TK_LBRACKET:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Сборка литерала: числа подряд, а длина каждого уровня запоминается по
+ * первой встреченной строке и сверяется со всеми остальными. */
+typedef struct ListB {
+    SmpAstNum vals[SMP_MAX_LIST];
+    uint32_t  n;
+    uint32_t  rank;                  /* 0 — чисел ещё не было            */
+    uint32_t  dims[SMP_MAX_RANK];
+    bool      dim_set[SMP_MAX_RANK];
+    bool      any_float;
+} ListB;
+
+static bool list_level(SmpParser *p, ListB *b, uint32_t depth)
+{
+    const SmpToken *open = advance(p);        /* '[' */
+
+    if (depth >= SMP_MAX_RANK) {
+        perr(p, SMP_E0302, open->span,
+             fmt(p, "Литерал вложен глубже %u уровней.", SMP_MAX_RANK), NULL);
+        return false;
+    }
+    if (at(p, SMP_TK_RBRACKET)) {
+        perr(p, SMP_E0211, span_join(open->span, cur(p)->span),
+             "Пустая строка: нулевых осей не бывает.", NULL);
+        return false;
+    }
+
+    uint32_t count = 0;
+    for (;;) {
+        const SmpToken *tk = cur(p);
+        if (at(p, SMP_TK_LBRACKET)) {
+            if (b->rank && depth + 1u >= b->rank) {
+                perr(p, SMP_E0211, tk->span,
+                     fmt(p, "Здесь ожидалось число, как в первой строке, а открыт "
+                            "уровень %u.", depth + 2u), NULL);
+                return false;
+            }
+            if (!list_level(p, b, depth + 1u)) return false;
+        } else {
+            const bool neg = accept(p, SMP_TK_MINUS);
+            if (!at(p, SMP_TK_INT) && !at(p, SMP_TK_FLOAT)) {
+                perr(p, SMP_E0209, cur(p)->span,
+                     fmt(p, "В литерале тензора — только числа; найдено: %s.",
+                         found_str(p)), NULL);
+                return false;
+            }
+            if (!b->rank) b->rank = depth + 1u;
+            else if (b->rank != depth + 1u) {
+                perr(p, SMP_E0211, cur(p)->span,
+                     fmt(p, "Число на уровне %u, а в первой строке числа на уровне %u.",
+                         depth + 1u, b->rank), NULL);
+                return false;
+            }
+            if (b->n >= SMP_MAX_LIST) {
+                perr(p, SMP_E0207, cur(p)->span,
+                     fmt(p, "В литерале больше %u чисел.", SMP_MAX_LIST),
+                     "Большие таблицы кладут в рабочее пространство и берут @load.");
+                return false;
+            }
+            const SmpToken *n = advance(p);
+            SmpAstNum      *v = &b->vals[b->n++];
+            v->is_float = (n->kind == SMP_TK_FLOAT);
+            if (v->is_float) {
+                v->fval = neg ? -n->num.f : n->num.f;
+                b->any_float = true;
+            } else {
+                v->ival = neg ? (uint64_t)(-(int64_t)n->num.u) : n->num.u;
+            }
+        }
+        count++;
+        if (!accept(p, SMP_TK_COMMA)) break;
+    }
+
+    if (!at(p, SMP_TK_RBRACKET)) {
+        perr(p, SMP_E0203, cur(p)->span,
+             fmt(p, "Литерал открыт '[' в %u:%u и не закрыт ']'; найдено: %s.",
+                 open->span.line, open->span.col, found_str(p)), NULL);
+        return false;
+    }
+    const SmpToken *close = advance(p);
+
+    if (!b->dim_set[depth]) {
+        b->dim_set[depth] = true;
+        b->dims[depth]    = count;
+    } else if (b->dims[depth] != count) {
+        perr(p, SMP_E0211, span_join(open->span, close->span),
+             fmt(p, "В этой строке %u элемент(ов), а в первой строке того же уровня %u.",
+                 count, b->dims[depth]), NULL);
+        return false;
+    }
+    return true;
+}
+
+static bool parse_list(SmpParser *p, SmpAstOperand *o)
+{
+    static ListB b;                   /* 16 КиБ — в .bss, а не на стеке */
+    memset(&b, 0, sizeof b);
+
+    const SmpToken *open = cur(p);
+    if (!list_level(p, &b, 0)) return false;
+
+    SmpAstList *l = (SmpAstList *)smp_arena_push_raw(p->arena, sizeof *l, 8);
+    SmpAstNum  *v = (SmpAstNum *)smp_arena_push_raw(p->arena, b.n * sizeof *v, 8);
+    if (!l || !v) {
+        perr(p, SMP_E0401, open->span, "Арена компилятора исчерпана на литерале.", NULL);
+        return false;
+    }
+    memcpy(v, b.vals, b.n * sizeof *v);
+    l->rank      = b.rank;
+    l->n         = b.n;
+    l->vals      = v;
+    l->any_float = b.any_float;
+    for (uint32_t i = 0; i < b.rank; i++) l->dims[i] = b.dims[i];
+
+    o->kind = SMP_OPD_LIST;
+    o->list = l;
+    const SmpToken *last = &p->toks[p->pos ? p->pos - 1u : 0u];
+    o->span = span_join(open->span, last->span);
+    return true;
+}
+
+/* ========================================================================== */
 /*  Операнды                                                                  */
 /* ========================================================================== */
 
@@ -302,6 +439,8 @@ static bool parse_operand(SmpParser *p, SmpAstOperand *o)
     memset(o, 0, sizeof *o);
     const SmpToken *t = cur(p);
     o->span = t->span;
+
+    if (at_list(p)) return parse_list(p, o);
 
     /* Отрицательный литерал: '-' приклеивается только к числу. */
     bool neg = false;
@@ -576,7 +715,7 @@ static bool parse_stmt(SmpParser *p, SmpAstStmt *s)
     while (group_kind(p, 0) == GRP_PREFIX)
         if (!parse_prefix_group(p, pfx, &npfx)) return false;
 
-    if (group_kind(p, 0) == GRP_UNKNOWN) {
+    if (group_kind(p, 0) == GRP_UNKNOWN && !at_list(p)) {
         perr(p, SMP_E0204, peek(p, 1)->span,
              fmt(p, "Группа '[' в %u:%u не опознана: следом идёт %s.",
                  cur(p)->span.line, cur(p)->span.col, found_str(p)), NULL);
@@ -616,7 +755,8 @@ static bool parse_stmt(SmpParser *p, SmpAstStmt *s)
     s->arrow_span = advance(p)->span;
 
     if (!parse_operand(p, &s->dest)) return false;
-    if (s->dest.kind == SMP_OPD_INT || s->dest.kind == SMP_OPD_FLOAT) {
+    if (s->dest.kind == SMP_OPD_INT || s->dest.kind == SMP_OPD_FLOAT ||
+        s->dest.kind == SMP_OPD_LIST) {
         perr(p, SMP_E0208, s->dest.span, NULL, NULL);
         return false;
     }

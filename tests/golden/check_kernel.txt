@@ -27,4 +27,4 @@ $ smpc3 check examples/kernel.smpc -v
 АРЕНЫ
   #0  12582912 байт (12.00 МиБ)
 
-arena#1 'compile' 105.2 KiB / 64.0 MiB (peak 105.2 KiB, 109 allocs)
+arena#1 'compile' 105.4 KiB / 64.0 MiB (peak 105.4 KiB, 109 allocs)

@@ -1,6 +1,7 @@
 /* SMPC3 :: vm.c -- прямая диспетчеризация байткода. */
 #include "smpc3/vm.h"
 #include "smpc3/cpu.h"
+#include "smpc3/fmath.h"
 #include "smpc3/kernels.h"
 #include "smpc3/plat.h"
 #include "smpc3/thread.h"
@@ -394,6 +395,94 @@ static bool strict_check(SmpVM *vm, uint8_t flags, double v, const char *what)
 }
 
 /* ========================================================================== */
+/*  Числа                                                                     */
+/* ========================================================================== */
+
+/* Число из регистра: скаляр как есть или единственный элемент тензора — так
+ * приходит *&v[2], вид на один элемент. false — диагностика уже выдана. */
+static bool reg_num(SmpVM *vm, const SmpReg *r, double *out)
+{
+    if (!r->is_tensor) { *out = r->s.f; return true; }
+    SmpBuf b;
+    if (r->t.nelem != 1u) {
+        vm_fatal(vm, SMP_E0604, "Число ждали в регистре, а там тензор.", NULL);
+        return false;
+    }
+    if (!make_buf(vm, &b, &r->t)) return false;
+    *out = smp_k_reduce_add(&b);
+    return true;
+}
+
+static uint8_t reg_dtype(const SmpReg *r)
+{
+    return r->is_tensor ? r->t.dtype : r->dtype;
+}
+
+/* Число, которым заполняет @fill и умножает @scale: константа из пула, а при
+ * aux == SMP_AUX_REG — регистр b. */
+static bool stage_num(SmpVM *vm, const SmpInstr *in, double *out)
+{
+    if (in->aux != SMP_AUX_REG) {
+        *out = smp_const_as_double(vm->mod->consts[in->k], in->aux);
+        return true;
+    }
+    return reg_num(vm, &vm->regs[in->b], out);
+}
+
+/* Арифметика над числами (aux == SMP_AUX_SCALAR). Скаляр в регистре —
+ * double с логическим типом; результат округляется в этот тип ровно так,
+ * как посчитало бы железо: для f32 двойное округление через double
+ * безвредно, у double на 53 бита запаса больше чем вдвое. Целые не
+ * насыщаются: переполнение — ошибка, а не молча другое число. Целого
+ * деления на железе здесь нет вовсе, поэтому и #DE в Ring 0 взяться неоткуда:
+ * деление на ноль ловится до него. */
+static bool scalar_op(SmpVM *vm, const SmpInstr *in)
+{
+    SmpReg *R = vm->regs;
+    double  x = 0.0, y = 0.0, r;
+    if (!reg_num(vm, &R[in->a], &x)) return false;
+    const bool two = in->op != SMP_BC_ABS && in->op != SMP_BC_SQRT;
+    if (two && !reg_num(vm, &R[in->b], &y)) return false;
+
+    const SmpDType dt     = (SmpDType)reg_dtype(&R[in->a]);
+    const bool     is_int = (dt == SMP_DT_I32 || dt == SMP_DT_U64);
+
+    switch (in->op) {
+        case SMP_BC_ADD:  r = x + y; break;
+        case SMP_BC_SUB:  r = x - y; break;
+        case SMP_BC_MUL:  r = x * y; break;
+        case SMP_BC_ABS:  r = x < 0.0 ? -x : x; break;
+        case SMP_BC_SQRT: r = smp_sqrt(x); break;
+        default:
+            if (is_int && y == 0.0) {
+                vm_fatal(vm, SMP_E0601,
+                         vfmt(vm, "%.17g делится на ноль в %s.", x, smp_dtype_name(dt)),
+                         NULL);
+                return false;
+            }
+            r = x / y;
+            /* Целое деление отбрасывает дробную часть, к нулю — как в C. */
+            if (is_int) r = r < 0.0 ? -(double)(uint64_t)(-r) : (double)(uint64_t)r;
+            break;
+    }
+
+    if (dt == SMP_DT_F32) r = (double)(float)r;
+    if ((dt == SMP_DT_I32 && (r < -2147483648.0 || r > 2147483647.0)) ||
+        (dt == SMP_DT_U64 && (r < 0.0 || r >= 18446744073709551616.0))) {
+        vm_fatal(vm, SMP_E0613,
+                 vfmt(vm, "Получилось %.17g, а это %s.", r, smp_dtype_name(dt)), NULL);
+        return false;
+    }
+    if (!strict_check(vm, in->flags, r, smp_opcode_def((SmpOpcode)in->op)->mnemonic))
+        return false;
+
+    R[in->d].is_tensor = false;
+    R[in->d].s.f       = r;
+    R[in->d].dtype     = (uint8_t)dt;
+    return true;
+}
+
+/* ========================================================================== */
 /*  Обмен с файлами                                                           */
 /* ========================================================================== */
 
@@ -697,7 +786,8 @@ static bool vm_fuse(SmpVM *vm, const SmpInstr **ipp, const SmpInstr *first)
         steps[i].op = (uint8_t)f;
 
         if (f == (int)SMP_FOP_SCALE) {
-            steps[i].k = smp_const_as_double(mod->consts[c->k], c->aux);
+            vm->pc = (uint32_t)(c - mod->code);
+            if (!stage_num(vm, c, &steps[i].k)) return true;
         } else if (f == (int)SMP_FOP_ADD || f == (int)SMP_FOP_MUL) {
             vm->pc = (uint32_t)(c - mod->code);
             if (!make_buf(vm, &steps[i].b, &R[c->b].t)) return true;
@@ -830,7 +920,8 @@ static bool vm_fuse_gemm(SmpVM *vm, const SmpInstr **ipp, const SmpInstr *first)
         steps[i].op = (uint8_t)f;
 
         if (f == (int)SMP_FOP_SCALE) {
-            steps[i].k = smp_const_as_double(mod->consts[c->k], c->aux);
+            vm->pc = (uint32_t)(c - mod->code);
+            if (!stage_num(vm, c, &steps[i].k)) return true;
         } else if (f == (int)SMP_FOP_ADD || f == (int)SMP_FOP_MUL) {
             vm->pc = (uint32_t)(c - mod->code);
             if (!make_buf(vm, &steps[i].b, &R[c->b].t)) return true;
@@ -951,6 +1042,8 @@ dispatch_switch:
         R[in->d].is_tensor = false;
         R[in->d].s.f       = smp_const_as_double(mod->consts[in->k], in->aux);
         R[in->d].dtype     = in->aux ? in->aux : (uint8_t)SMP_DT_F64;
+        /* Число f32 обязано быть числом f32: 0.1 в пуле — double. */
+        if (in->aux == SMP_DT_F32) R[in->d].s.f = (double)(float)R[in->d].s.f;
         VM_NEXT();
 
     VM_CASE(MOVE)
@@ -995,11 +1088,14 @@ dispatch_switch:
         R[in->d].t.off = R[in->a].t.off + (uint64_t)n * step;
 
         /* Срез мог сбить выравнивание, которое компилятор проверить не мог:
-         * индекс стал известен только сейчас. У q8_0 строка — целые блоки по
-         * 34 байта, выровненной она не бывает, и ядра читают её без
-         * требований к выравниванию. */
+         * индекс стал известен только сейчас. Требовать его можно лишь там,
+         * где ширину попросили явно (#simd), — без этого строка f32:3 по
+         * индексу-регистру падала на любой машине с AVX2. У q8_0 строка —
+         * целые блоки по 34 байта, выровненной она не бывает, и ядра читают
+         * её без требований к выравниванию. */
         const uint32_t bits = smp_vec_bits(in->flags & SMP_IF_VEC_MASK);
-        if (bits >= 256 && !smp_dtype_is_block((SmpDType)R[in->d].t.dtype) &&
+        if ((in->flags & SMP_IF_SIMD) && bits >= 256 &&
+            !smp_dtype_is_block((SmpDType)R[in->d].t.dtype) &&
             (R[in->d].t.off % (bits / 8u)) != 0) {
             vm_fatal(vm, SMP_E0402,
                      vfmt(vm, "Динамический индекс %lld дал смещение %llu байт, "
@@ -1018,11 +1114,14 @@ dispatch_switch:
         smp_k_zero(&bd);
         VM_NEXT();
 
-    VM_CASE(FILL)
+    VM_CASE(FILL) {
+        double v;
         apply_fp(vm, in->flags);
-        if (!make_dst(vm, &bd, &R[in->d].t)) return SMP_ERR_INTERNAL;
-        smp_k_fill(&bd, smp_const_as_double(mod->consts[in->k], in->aux));
+        if (!stage_num(vm, in, &v) || !make_dst(vm, &bd, &R[in->d].t))
+            return SMP_ERR_INTERNAL;
+        smp_k_fill(&bd, v);
         VM_NEXT();
+    }
 
     VM_CASE(FILLI)
         if (!make_dst(vm, &bd, &R[in->d].t)) return SMP_ERR_INTERNAL;
@@ -1085,6 +1184,10 @@ dispatch_switch:
         VM_NEXT();
 
     VM_CASE(SUB)
+        if (in->aux == SMP_AUX_SCALAR) {
+            if (!scalar_op(vm, in)) return SMP_ERR_INTERNAL;
+            VM_NEXT();
+        }
         apply_fp(vm, in->flags);
         if (!make_dst(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t) ||
@@ -1197,6 +1300,10 @@ dispatch_switch:
         VM_NEXT();
 
     VM_CASE(ABS)
+        if (in->aux == SMP_AUX_SCALAR) {
+            if (!scalar_op(vm, in)) return SMP_ERR_INTERNAL;
+            VM_NEXT();
+        }
         if (SMP_UNLIKELY(in->flags & SMP_IF_FUSE) && vm_fuse(vm, &ip, in))
             VM_NEXT();
         apply_fp(vm, in->flags);
@@ -1205,16 +1312,23 @@ dispatch_switch:
         smp_k_abs(&bd, &ba);
         VM_NEXT();
 
-    VM_CASE(SCALE)
+    VM_CASE(SCALE) {
         if (SMP_UNLIKELY(in->flags & SMP_IF_FUSE) && vm_fuse(vm, &ip, in))
             VM_NEXT();
+        double k;
         apply_fp(vm, in->flags);
-        if (!make_dst(vm, &bd, &R[in->d].t) ||
+        if (!stage_num(vm, in, &k) ||
+            !make_dst(vm, &bd, &R[in->d].t) ||
             !make_buf(vm, &ba, &R[in->a].t)) return SMP_ERR_INTERNAL;
-        smp_k_scale(&bd, &ba, smp_const_as_double(mod->consts[in->k], in->aux));
+        smp_k_scale(&bd, &ba, k);
         VM_NEXT();
+    }
 
     VM_CASE(ADD)
+        if (in->aux == SMP_AUX_SCALAR) {
+            if (!scalar_op(vm, in)) return SMP_ERR_INTERNAL;
+            VM_NEXT();
+        }
         if (SMP_UNLIKELY(in->flags & SMP_IF_FUSE) && vm_fuse(vm, &ip, in))
             VM_NEXT();
         apply_fp(vm, in->flags);
@@ -1225,6 +1339,10 @@ dispatch_switch:
         VM_NEXT();
 
     VM_CASE(MUL)
+        if (in->aux == SMP_AUX_SCALAR) {
+            if (!scalar_op(vm, in)) return SMP_ERR_INTERNAL;
+            VM_NEXT();
+        }
         if (SMP_UNLIKELY(in->flags & SMP_IF_FUSE) && vm_fuse(vm, &ip, in))
             VM_NEXT();
         apply_fp(vm, in->flags);
@@ -1233,6 +1351,43 @@ dispatch_switch:
             !make_buf(vm, &bb, &R[in->b].t)) return SMP_ERR_INTERNAL;
         smp_k_mul(&bd, &ba, &bb);
         VM_NEXT();
+
+    VM_CASE(DIV)
+        if (in->aux == SMP_AUX_SCALAR) {
+            if (!scalar_op(vm, in)) return SMP_ERR_INTERNAL;
+            VM_NEXT();
+        }
+        apply_fp(vm, in->flags);
+        if (!make_dst(vm, &bd, &R[in->d].t) ||
+            !make_buf(vm, &ba, &R[in->a].t) ||
+            !make_buf(vm, &bb, &R[in->b].t)) return SMP_ERR_INTERNAL;
+        smp_k_div(&bd, &ba, &bb);
+        VM_NEXT();
+
+    VM_CASE(SQRT)
+        if (in->aux == SMP_AUX_SCALAR) {
+            if (!scalar_op(vm, in)) return SMP_ERR_INTERNAL;
+            VM_NEXT();
+        }
+        apply_fp(vm, in->flags);
+        if (!make_dst(vm, &bd, &R[in->d].t) ||
+            !make_buf(vm, &ba, &R[in->a].t)) return SMP_ERR_INTERNAL;
+        smp_k_sqrt(&bd, &ba);
+        VM_NEXT();
+
+    VM_CASE(LIT) {
+        /* Числа литерала лежат в пуле подряд, с k; сколько их — знает
+         * дескриптор в rD. Кладутся по его шагам, так что годится и столбец. */
+        const SmpTensor *t = &R[in->d].t;
+        if (!R[in->d].is_tensor || (uint64_t)in->k + t->nelem > mod->n_consts) {
+            vm_fatal(vm, SMP_E0604, "Литерал выходит за пул констант.", NULL);
+            return SMP_ERR_INTERNAL;
+        }
+        if (!make_dst(vm, &bd, t)) return SMP_ERR_INTERNAL;
+        for (uint32_t i = 0; i < t->nelem; i++)
+            smp_k_set(&bd, i, smp_const_as_double(mod->consts[in->k + i], in->aux));
+        VM_NEXT();
+    }
 
     VM_CASE(REDADD) {
         apply_fp(vm, in->flags);
@@ -1375,9 +1530,11 @@ void smp_vm_dump_tensors(FILE *out, const SmpVM *vm, uint32_t max_elems)
     for (uint32_t i = 0; i < vm->n_regs && i < mod->n_reg_names; i++) {
         const SmpReg *r = &vm->regs[i];
         if (r->is_tensor || r->dtype == 0 || !mod->reg_names[i]) continue;
-        fprintf(out, "$%-12s <%s>  %.9g\n",
+        char num[40];
+        fprintf(out, "$%-12s <%s>  %s\n",
                 smp_module_str(mod, mod->reg_names[i]),
-                smp_dtype_name((SmpDType)r->dtype), r->s.f);
+                smp_dtype_name((SmpDType)r->dtype),
+                smp_num_fmt(r->s.f, (SmpDType)r->dtype, num, sizeof num));
     }
 
     for (uint32_t i = 0; i < mod->n_tens; i++) {
@@ -1411,7 +1568,9 @@ void smp_vm_dump_tensors(FILE *out, const SmpVM *vm, uint32_t max_elems)
                 case SMP_DT_Q8_0: v = smp_q8_0_get(base, e); break;
                 default: break;
             }
-            fprintf(out, "%s%.6g", e ? ", " : "", v);
+            char num[40];
+            fprintf(out, "%s%s", e ? ", " : "",
+                    smp_num_fmt(v, (SmpDType)t->dtype, num, sizeof num));
         }
         if (t->nelem > n) fprintf(out, ", ... (+%u)", t->nelem - n);
         fprintf(out, "]\n");

@@ -168,6 +168,11 @@ typedef struct Ctx {
     uint32_t           n_arg_syms;
 
     uint32_t           cur_stage;   /* индекс разбираемой стадии */
+
+    /* Источник-литерал, пока он не прошёл ни одной стадии. Своего типа у
+     * числа в тексте нет: 2 рядом с f32 — это 2.0f, а не i32, — и тип ему
+     * даёт то, с чем оно встречается. NULL — источник не литерал. */
+    const SmpAstOperand *lit;
 } Ctx;
 
 static const char *sfmt(Ctx *c, const char *f, ...) SMP_PRINTF(2, 3);
@@ -681,10 +686,110 @@ static bool read_operand(Ctx *c, const SmpAstOperand *o, SmpValue *out)
             out->dtype     = SMP_DT_F32;
             return true;
 
+        case SMP_OPD_LIST: {
+            /* Безымянный плотный тензор; тип — по числам, пока приёмник или
+             * соседний операнд не дадут другой. */
+            const SmpAstList *l = o->list;
+            out->dtype = l->any_float ? SMP_DT_F32 : SMP_DT_I32;
+            out->rank  = l->rank;
+            for (uint32_t i = 0; i < l->rank; i++) out->shape[i] = l->dims[i];
+            val_dense(out);
+            out->flags |= SMP_TF_ALIGN64 | SMP_TF_ALIGN32;
+            return true;
+        }
+
         default:
             serr(c, SMP_E0209, o->span, NULL, NULL);
             return false;
     }
+}
+
+/* ========================================================================== */
+/*  Литералы                                                                  */
+/* ========================================================================== */
+
+static bool is_lit(const SmpAstOperand *o)
+{
+    return o && (o->kind == SMP_OPD_INT || o->kind == SMP_OPD_FLOAT ||
+                 o->kind == SMP_OPD_LIST);
+}
+
+/* Число литерала как SmpAstNum — у одиночного и у элемента таблицы одно
+ * представление. */
+static SmpAstNum lit_num(const SmpAstOperand *o, uint32_t i)
+{
+    if (o->kind == SMP_OPD_LIST) return o->list->vals[i];
+    SmpAstNum n;
+    n.is_float = (o->kind == SMP_OPD_FLOAT);
+    n.ival     = o->ival;
+    n.fval     = o->fval;
+    return n;
+}
+
+/* Может ли литерал стать типом to. Дробное в целый тип не идёт — отбросить
+ * дробную часть молча значило бы посчитать не то, что написано; целое —
+ * только в пределах типа. */
+static bool lit_fits(Ctx *c, const SmpAstOperand *o, SmpDType to)
+{
+    if (to != SMP_DT_F32 && to != SMP_DT_F64 && to != SMP_DT_I32 && to != SMP_DT_U64) {
+        serr(c, SMP_E0303, o->span,
+             sfmt(c, "Число из текста программы не может быть %s.", smp_dtype_name(to)),
+             NULL);
+        return false;
+    }
+    const uint32_t n = o->kind == SMP_OPD_LIST ? o->list->n : 1u;
+    for (uint32_t i = 0; i < n; i++) {
+        const SmpAstNum v = lit_num(o, i);
+        const int64_t   s = (int64_t)v.ival;
+        if (v.is_float && (to == SMP_DT_I32 || to == SMP_DT_U64)) {
+            serr(c, SMP_E0303, o->span,
+                 sfmt(c, "Дробное число %g там, где нужен %s.", v.fval, smp_dtype_name(to)),
+                 "Убери дробную часть либо приведи другую сторону к f32: @cast.f32.");
+            return false;
+        }
+        if (!v.is_float && to == SMP_DT_I32 && (s < -2147483648LL || s > 2147483647LL)) {
+            serr(c, SMP_E0303, o->span,
+                 sfmt(c, "Число %lld не помещается в i32.", (long long)s),
+                 "Возьми f64: напиши число с точкой или приведи другую сторону @cast.f64.");
+            return false;
+        }
+        if (!v.is_float && to == SMP_DT_U64 && s < 0) {
+            serr(c, SMP_E0303, o->span,
+                 sfmt(c, "Отрицательное число %lld там, где нужен u64.", (long long)s), NULL);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Тип, который литерал берёт сам, когда взять его не у кого: дробный, если
+ * в нём есть точка, иначе целый. */
+static SmpDType lit_own(const SmpAstOperand *o)
+{
+    if (o->kind == SMP_OPD_LIST)  return o->list->any_float ? SMP_DT_F32 : SMP_DT_I32;
+    return o->kind == SMP_OPD_FLOAT ? SMP_DT_F32 : SMP_DT_I32;
+}
+
+/* Два числа одной операции: литерал без собственного типа принимает тип
+ * другой стороны, два литерала — общий: f32, если хоть в одном есть точка. */
+static bool unify_lits(Ctx *c, SmpValue *v, const SmpAstOperand *vo,
+                       SmpValue *a, const SmpAstOperand *ao)
+{
+    const bool vl = is_lit(vo), al = is_lit(ao);
+    if (vl && !al) {
+        if (!lit_fits(c, vo, a->dtype)) return false;
+        v->dtype = a->dtype;
+    } else if (al && !vl) {
+        if (!lit_fits(c, ao, v->dtype)) return false;
+        a->dtype = v->dtype;
+    } else if (vl && al) {
+        const SmpDType t = (lit_own(vo) == SMP_DT_F32 || lit_own(ao) == SMP_DT_F32)
+                         ? SMP_DT_F32 : SMP_DT_I32;
+        if (!lit_fits(c, vo, t) || !lit_fits(c, ao, t)) return false;
+        v->dtype = a->dtype = t;
+    }
+    if (vl) c->info->src_val.dtype = v->dtype;
+    return true;
 }
 
 /* ========================================================================== */
@@ -751,6 +856,14 @@ static bool apply_stage(Ctx *c, const SmpAstStage *st, SmpOpKind k, SmpValue *v)
     SmpValue a0;
     memset(&a0, 0, sizeof a0);
     a0.sym = SMP_SYM_NONE;
+
+    for (uint32_t i = 0; i < st->nargs; i++) {
+        if (st->args[i].kind != SMP_OPD_LIST) continue;
+        serr(c, SMP_E0309, st->args[i].span,
+             "Литерал тензора стоит только источником инструкции.",
+             "Положи его в тензор отдельной инструкцией: [1, 2] => *&b<f32:2>;");
+        return false;
+    }
 
     if (st->nargs >= 1) {
         if (!read_operand(c, &st->args[0], &a0)) return false;
@@ -970,10 +1083,27 @@ static bool apply_stage(Ctx *c, const SmpAstStage *st, SmpOpKind k, SmpValue *v)
 
         case SMP_OP_RELU:
         case SMP_OP_ABS:
-            if (!require_tensor(c, v, st->span, def->name)) return false;
+            /* Модуль числа нужен калькулятору не реже, чем модуль вектора. */
+            if (k == SMP_OP_RELU && !require_tensor(c, v, st->span, def->name)) return false;
             if (v->dtype == SMP_DT_RAW_PTR) {
                 serr(c, SMP_E0303, st->span,
                      sfmt(c, "@%s не определён для raw_ptr.", def->name), NULL);
+                return false;
+            }
+            if (v->is_scalar && c->lit) c->info->src_val.dtype = v->dtype = lit_own(c->lit);
+            return true;
+
+        case SMP_OP_SQRT:
+            /* Целое число из текста — ещё не i32: корню нужна дробь, её он и
+             * получит. Целый тензор или регистр — уже тип, и приводить его
+             * молча было бы неявным приведением. */
+            if (c->lit && lit_own(c->lit) == SMP_DT_I32)
+                c->info->src_val.dtype = v->dtype = SMP_DT_F32;
+            if (v->dtype != SMP_DT_F32 && v->dtype != SMP_DT_F64) {
+                serr(c, SMP_E0303, st->span,
+                     sfmt(c, "@sqrt считает над f32 или f64, а на входе %s.",
+                          smp_dtype_name(v->dtype)),
+                     "Приведи явно через @cast.f32.");
                 return false;
             }
             return true;
@@ -989,12 +1119,48 @@ static bool apply_stage(Ctx *c, const SmpAstStage *st, SmpOpKind k, SmpValue *v)
 
         case SMP_OP_ADD:
         case SMP_OP_MUL:
-        case SMP_OP_SUB: {
-            if (!require_tensor(c, v, st->span, def->name)) return false;
-            if (a0.is_scalar) {
-                serr(c, SMP_E0309, st->args[0].span,
-                     sfmt(c, "@%s поэлементный: оба операнда обязаны быть тензорами. "
-                             "Для скаляра есть @scale.", def->name), NULL);
+        case SMP_OP_SUB:
+        case SMP_OP_DIV: {
+            /* Два числа — арифметика калькулятора: 17 -> @mul(23) => $p. */
+            if (v->is_scalar && a0.is_scalar) {
+                if (!unify_lits(c, v, c->lit, &a0, &st->args[0])) return false;
+                if (c->cur_stage < SMP_MAX_STAGES) c->info->arg_val[c->cur_stage] = a0;
+                if (v->dtype != a0.dtype) {
+                    serr(c, SMP_E0303, st->args[0].span,
+                         sfmt(c, "Числа разных типов: %s и %s.",
+                              smp_dtype_name(v->dtype), smp_dtype_name(a0.dtype)),
+                         sfmt(c, "Приведи одно к другому: @cast.%s.",
+                              smp_dtype_name(v->dtype)));
+                    return false;
+                }
+                if (v->dtype == SMP_DT_RAW_PTR) {
+                    serr(c, SMP_E0303, st->span,
+                         sfmt(c, "@%s не определён для raw_ptr.", def->name), NULL);
+                    return false;
+                }
+                v->sym      = SMP_SYM_NONE;
+                v->byte_off = 0;
+                v->flags    = SMP_TF_CONTIG;
+                return true;
+            }
+            if (v->is_scalar != a0.is_scalar) {
+                serr(c, SMP_E0309, v->is_scalar ? st->span : st->args[0].span,
+                     sfmt(c, "@%s складывает тензор с тензором или число с числом, "
+                             "а здесь %s.", def->name,
+                          v->is_scalar ? "число и тензор" : "тензор и число"),
+                     "Тензор на число умножает @scale. Для остального заполни тензор "
+                     "числом: *&t<f32:4> -> @fill($x) => *&t;");
+                return false;
+            }
+            if (c->lit && v->dtype != a0.dtype) {
+                if (!lit_fits(c, c->lit, a0.dtype)) return false;
+                c->info->src_val.dtype = v->dtype = a0.dtype;
+            }
+            if (k == SMP_OP_DIV && v->dtype != SMP_DT_F32 && v->dtype != SMP_DT_F64) {
+                serr(c, SMP_E0303, st->span,
+                     sfmt(c, "@div над тензорами делит f32 или f64, а на входе %s.",
+                          smp_dtype_name(v->dtype)),
+                     "Приведи оба через @cast.f32.");
                 return false;
             }
             if (v->dtype != a0.dtype) {
@@ -1021,6 +1187,8 @@ static bool apply_stage(Ctx *c, const SmpAstStage *st, SmpOpKind k, SmpValue *v)
         case SMP_OP_ROPE:
             /* Строки — по последней оси; форма и тип не меняются. */
             if (!require_tensor(c, v, st->span, def->name)) return false;
+            if (c->lit && lit_own(c->lit) == SMP_DT_I32)       /* как у @sqrt */
+                c->info->src_val.dtype = v->dtype = SMP_DT_F32;
             if (v->dtype != SMP_DT_F32 && v->dtype != SMP_DT_F64) {
                 serr(c, SMP_E0303, st->span,
                      sfmt(c, "@%s считает над f32 или f64, а на входе %s.",
@@ -1258,6 +1426,7 @@ static void check_stmt(Ctx *c)
     if (!read_operand(c, &s->source, &v)) return;
     const uint32_t src_sym = v.sym;
     in->src_val = v;
+    c->lit = is_lit(&s->source) ? &s->source : NULL;
 
     check_align(c, &v, s->source.span, "Источник");
     if (c->bad) return;
@@ -1296,6 +1465,7 @@ static void check_stmt(Ctx *c)
 
         if (!apply_stage(c, st, k, &v)) return;
         in->stage_out[i] = v;
+        c->lit = NULL;           /* после стадии у значения свой тип */
     }
 
     /* Конвейер без стадий: значение уходит в приёмник как есть. */
@@ -1327,6 +1497,23 @@ static void check_stmt(Ctx *c)
         in->dest_val        = dv;
         in->dest_is_tensor  = true;
 
+        /* Литерал прямо в тензор: тип даёт приёмник — [1, 2] => *&v<f32:2>
+         * пишет 1.0 и 2.0, а 3 => *&v[0] кладёт 3.0. */
+        if (c->lit && dv.dtype != v.dtype && v.is_scalar == dv.is_scalar) {
+            if (!lit_fits(c, c->lit, (SmpDType)dv.dtype)) return;
+            in->src_val.dtype = v.dtype = dv.dtype;
+        }
+        if (c->lit && c->lit->kind == SMP_OPD_LIST &&
+            (dv.is_scalar || v.rank != dv.rank ||
+             memcmp(v.shape, dv.shape, sizeof v.shape[0] * v.rank) != 0)) {
+            char s1[80], s2[80];
+            serr(c, SMP_E0309, s->source.span,
+                 sfmt(c, "Литерал — %s, а приёмник — %s.",
+                      val_sig(&v, s1, sizeof s1), val_sig(&dv, s2, sizeof s2)),
+                 "Строк и чисел в строке у литерала столько же, сколько у приёмника.");
+            return;
+        }
+
         if (v.is_scalar != dv.is_scalar || v.dtype != dv.dtype ||
             v.rank != dv.rank ||
             (v.rank && memcmp(v.shape, dv.shape, sizeof v.shape[0] * v.rank) != 0)) {
@@ -1337,8 +1524,11 @@ static void check_stmt(Ctx *c)
             return;
         }
 
-        /* Писать плотный результат в разреженный вид нельзя без упаковки. */
-        if (!(dv.flags & SMP_TF_CONTIG) && dv.rank > 0) {
+        /* Писать плотный результат в разреженный вид нельзя без упаковки.
+         * Литерал — можно: его числа кладутся по одному, по шагам приёмника,
+         * так столбец матрицы и задаётся: [1, 2] => *&M[.., 0]. */
+        const bool lit_direct = s->source.kind == SMP_OPD_LIST && s->nstages == 0;
+        if (!(dv.flags & SMP_TF_CONTIG) && dv.rank > 0 && !lit_direct) {
             serr(c, SMP_E0421, s->dest.span,
                  sfmt(c, "Приёмник — срез с шагом %u элементов, а результат плотный.",
                       (unsigned)dv.stride[0]), NULL);

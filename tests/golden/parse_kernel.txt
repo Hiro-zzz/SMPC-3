@@ -35,4 +35,4 @@ $ smpc3 parse examples/kernel.smpc
 
 инструкций: 4
 
-arena#1 'compile' 7.8 KiB / 64.0 MiB (peak 7.8 KiB, 107 allocs)
+arena#1 'compile' 8.0 KiB / 64.0 MiB (peak 8.0 KiB, 107 allocs)

@@ -48,4 +48,4 @@ $ smpc3 check examples/forward.smpc -v
   #0  384 байт (0.00 МиБ)
   #1  224 байт (0.00 МиБ)
 
-arena#1 'compile' 148.7 KiB / 64.0 MiB (peak 148.7 KiB, 252 allocs)
+arena#1 'compile' 149.1 KiB / 64.0 MiB (peak 149.1 KiB, 252 allocs)

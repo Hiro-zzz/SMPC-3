@@ -130,6 +130,24 @@ static void pr_operand(const Pr *pr, const SmpAstOperand *o, const char *label, 
                     pc(pr, AC_RESET), pc(pr, AC_NUM), o->fval, pc(pr, AC_RESET));
             break;
 
+        case SMP_OPD_LIST: {
+            const SmpAstList *l = o->list;
+            pr_indent(pr, d);
+            fprintf(pr->o, "%s%s%s литерал %s", pc(pr, AC_KEY), label,
+                    pc(pr, AC_RESET), pc(pr, AC_NUM));
+            for (uint32_t i = 0; i < l->rank; i++)
+                fprintf(pr->o, "%s%u", i ? "x" : "", l->dims[i]);
+            fprintf(pr->o, " [");
+            for (uint32_t i = 0; i < l->n && i < 8u; i++) {
+                if (l->vals[i].is_float) fprintf(pr->o, "%s%g", i ? ", " : "", l->vals[i].fval);
+                else fprintf(pr->o, "%s%lld", i ? ", " : "", (long long)l->vals[i].ival);
+            }
+            fprintf(pr->o, "%s]%s %s@%u:%u%s\n", l->n > 8u ? ", ..." : "",
+                    pc(pr, AC_RESET), pc(pr, AC_DIM), o->span.line, o->span.col,
+                    pc(pr, AC_RESET));
+            break;
+        }
+
         default:
             pr_indent(pr, d);
             fprintf(pr->o, "%s%s%s <пусто>\n", pc(pr, AC_KEY), label, pc(pr, AC_RESET));

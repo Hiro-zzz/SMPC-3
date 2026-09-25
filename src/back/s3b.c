@@ -284,7 +284,10 @@ SmpStatus smp_s3b_read(SmpModule *m, const char *path, SmpArena *arena,
         const SmpOpFmt fmt = g_bc[in->op].fmt;
         const bool uses_tens = (fmt == SMP_FMT_D_T || fmt == SMP_FMT_T_A ||
                                 fmt == SMP_FMT_D_A_T);
-        const bool uses_const = (fmt == SMP_FMT_D_K || fmt == SMP_FMT_D_A_K ||
+        /* fill и scale с числом из регистра пул не читают. */
+        const bool reg_num = (in->op == SMP_BC_FILL || in->op == SMP_BC_SCALE) &&
+                             in->aux == SMP_AUX_REG;
+        const bool uses_const = !reg_num && (fmt == SMP_FMT_D_K || fmt == SMP_FMT_D_A_K ||
                                  fmt == SMP_FMT_D_A_B_K);
         if (uses_tens && in->k >= m->n_tens) {
             static char b[160];
@@ -412,12 +415,18 @@ void smp_disasm(FILE *out, const SmpModule *m, bool color)
                 break;
             case SMP_FMT_D_A:
                 fprintf(out, "%sr%u, r%u%s", dc(color, D_REG), in->d, in->a, dc(color, D_RESET));
+                if (in->aux == SMP_AUX_SCALAR && (in->op == SMP_BC_ABS || in->op == SMP_BC_SQRT))
+                    fprintf(out, "  %s(число)%s", dc(color, D_DIM), dc(color, D_RESET));
                 break;
             case SMP_FMT_D_A_B:
                 fprintf(out, "%sr%u, r%u, r%u%s", dc(color, D_REG), in->d, in->a, in->b,
                         dc(color, D_RESET));
                 if ((in->op == SMP_BC_MMUL || in->op == SMP_BC_MMULT) && in->aux == 1)
                     fprintf(out, ", длина %sr%u%s", dc(color, D_REG), in->k, dc(color, D_RESET));
+                else if (in->aux == SMP_AUX_SCALAR &&
+                         (in->op == SMP_BC_ADD || in->op == SMP_BC_SUB ||
+                          in->op == SMP_BC_MUL || in->op == SMP_BC_DIV))
+                    fprintf(out, "  %s(числа)%s", dc(color, D_DIM), dc(color, D_RESET));
                 break;
             case SMP_FMT_D_T:
                 fprintf(out, "%sr%u%s, ", dc(color, D_REG), in->d, dc(color, D_RESET));
@@ -436,6 +445,11 @@ void smp_disasm(FILE *out, const SmpModule *m, bool color)
                             dc(color, D_RESET));
                 break;
             case SMP_FMT_D_A_K:
+                if (in->aux == SMP_AUX_REG) {
+                    fprintf(out, "%sr%u, r%u, r%u%s", dc(color, D_REG), in->d, in->a,
+                            in->b, dc(color, D_RESET));
+                    break;
+                }
                 fprintf(out, "%sr%u, r%u%s, K%u", dc(color, D_REG), in->d, in->a,
                         dc(color, D_RESET), in->k);
                 if (in->k < m->n_consts)

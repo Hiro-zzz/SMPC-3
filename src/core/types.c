@@ -2,6 +2,40 @@
 #include "smpc3/types.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+
+char *smp_num_fmt(double v, SmpDType dt, char *buf, size_t cap)
+{
+    if (dt == SMP_DT_I32 || dt == SMP_DT_U64) {
+        snprintf(buf, cap, "%.0f", v);
+        return buf;
+    }
+    if (v != v || v - v != 0.0) {             /* NaN и бесконечности */
+        snprintf(buf, cap, "%g", v);
+        return buf;
+    }
+    /* Кратчайшая запись, которая читается обратно в то же число своего
+     * типа: 0.1 + 0.2 в f32 — это «0.3», а не «0.300000012», а 1234567 —
+     * «1234567», а не «1.23457e+06». У f32 хватает девяти цифр, у f64 —
+     * семнадцати. */
+    const bool f32 = (dt != SMP_DT_F64);
+    const int  max = f32 ? 9 : 17;
+
+    /* Цифр меньше, чем в целой части, не берём: иначе 40 записалось бы как
+     * «4e+01» — оно тоже читается обратно в 40. Для чисел длиннее max
+     * экспонента честнее: 1e+20 короче двадцати одной цифры. */
+    int    first = 1;
+    double a     = v < 0.0 ? -v : v;
+    while (a >= 10.0 && first <= max) { a /= 10.0; first++; }
+    if (first > max) first = 1;
+
+    for (int p = first; p <= max; p++) {
+        snprintf(buf, cap, "%.*g", p, v);
+        const double back = strtod(buf, NULL);
+        if (f32 ? (float)back == (float)v : back == v) break;
+    }
+    return buf;
+}
 
 typedef struct { const char *name; uint32_t size; bool is_float; } SmpDTypeInfo;
 
