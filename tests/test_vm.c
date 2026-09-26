@@ -1372,6 +1372,54 @@ static SmpDType regtype(const char *name)
     return SMP_DT_INVALID;
 }
 
+static void test_broadcast(void)
+{
+    SECTION("растяжение осей размера 1");
+
+    /* Таблица сложения, вычитание в обратную сторону, деление f32 на
+     * строку со слиянием следом (@relu), столбики как в bars.smpc: V - J. */
+    CHECK(run_str("[[1], [2], [3]] => *&a<i32:3,1>;\n"
+                  "[[10, 20, 30, 40]] => *&b<i32:1,4>;\n"
+                  "*&a -> @add(*&b) => *&T<i32:3,4>;\n"
+                  "*&b -> @sub(*&a) => *&U<i32:3,4>;\n"
+                  "*&a -> @mul(*&b) -> @reduce.add => $s;\n"
+                  "[[1.5, 2, 4], [3, 6, 8]] => *&M<f32:2,3>;\n"
+                  "[[2, 1, 4]] => *&r<f32:1,3>;\n"
+                  "*&M -> @div(*&r) -> @relu => *&D<f32:2,3>;\n"
+                  "[[3], [5]] => *&V<f32:2,1>;\n"
+                  "[[0, 1, 2, 3, 4]] => *&J<f32:1,5>;\n"
+                  "*&V -> @sub(*&J) -> @relu => *&R<f32:2,5>;\n"), "растяжение");
+    const int32_t *T = (const int32_t *)tensor_data("T", NULL);
+    const int32_t *U = (const int32_t *)tensor_data("U", NULL);
+    bool ok = T && U;
+    for (int i = 0; ok && i < 3; i++)
+        for (int j = 0; ok && j < 4; j++)
+            ok = T[i * 4 + j] == (i + 1) + 10 * (j + 1) && U[i * 4 + j] == 10 * (j + 1) - (i + 1);
+    CHECK(ok, "таблица сложения или вычитание в обратную сторону не те");
+    CHECK(regval("s", NULL) == 6.0 * 100.0, "сумма внешнего произведения = %g", regval("s", NULL));
+    const float d[6] = { 0.75f, 2, 1, 1.5f, 6, 2 };
+    ok = true;
+    for (uint32_t i = 0; i < 6; i++) ok = ok && felem("D", i) == d[i];
+    CHECK(ok, "M / r не то");
+    const float bars[10] = { 3, 2, 1, 0, 0, 5, 4, 3, 2, 1 };
+    ok = true;
+    for (uint32_t i = 0; i < 10; i++) ok = ok && felem("R", i) == bars[i];
+    CHECK(ok, "relu(V - J) не то");
+
+    /* Столбец матрицы, растянутый по строке; и вид с шагами — транспонированный
+     * столбец — растянутый по столбцу. */
+    CHECK(run_str("[[1, 2], [3, 4], [5, 6]] => *&A<f64:3,2>;\n"
+                  "[[100, 200, 300]] => *&w<f64:1,3>;\n"
+                  "*&A[.., 0] -> @pack -> @reshape(3, 1) -> @add(*&w) => *&S<f64:3,3>;\n"
+                  "*&S -> @reduce.add => $t;\n"
+                  "[[1], [2], [3]] => *&c<f64:3,1>;\n"
+                  "*&c -> @transpose -> @sub(*&c) => *&K<f64:3,3>;\n"
+                  "*&K[0, 2] -> @reduce.add => $k02;\n"), "срез и вид с растяжением");
+    CHECK(regval("t", NULL) == (1 + 3 + 5) * 3 + 600.0 * 3,
+          "сумма = %g", regval("t", NULL));
+    CHECK(regval("k02", NULL) == 3.0 - 1.0, "K[0,2] = c[2] - c[0] = %g", regval("k02", NULL));
+}
+
 static void test_calc(void)
 {
     SECTION("калькулятор: числа");
@@ -1529,6 +1577,7 @@ int main(void)
     test_arith();
     test_literals();
     test_calc();
+    test_broadcast();
     test_emit();
     test_views();
     test_traps();

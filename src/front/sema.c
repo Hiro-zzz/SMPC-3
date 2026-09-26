@@ -1146,7 +1146,7 @@ static bool apply_stage(Ctx *c, const SmpAstStage *st, SmpOpKind k, SmpValue *v)
             }
             if (v->is_scalar != a0.is_scalar) {
                 serr(c, SMP_E0309, v->is_scalar ? st->span : st->args[0].span,
-                     sfmt(c, "@%s складывает тензор с тензором или число с числом, "
+                     sfmt(c, "@%s берёт тензор с тензором или число с числом, "
                              "а здесь %s.", def->name,
                           v->is_scalar ? "число и тензор" : "тензор и число"),
                      "Тензор на число умножает @scale. Для остального заполни тензор "
@@ -1170,14 +1170,37 @@ static bool apply_stage(Ctx *c, const SmpAstStage *st, SmpOpKind k, SmpValue *v)
                           smp_dtype_name(v->dtype), smp_dtype_name(a0.dtype)), NULL);
                 return false;
             }
-            if (v->rank != a0.rank ||
-                memcmp(v->shape, a0.shape, sizeof v->shape[0] * v->rank) != 0) {
+            /* Оси совпадают или одна из них размера 1: такая растягивается
+             * на другую — столбец [n,1] и строка [1,m] дают таблицу [n,m].
+             * Только при равных рангах и только осями размера 1: форма
+             * результата видна из форм операндов, без правил выравнивания
+             * рангов. Растяжение — шаг 0 в VM, копии нет. */
+            uint32_t out_shape[SMP_MAX_RANK];
+            bool fits = v->rank == a0.rank;
+            for (uint32_t i = 0; fits && i < v->rank; i++) {
+                if (v->shape[i] == a0.shape[i] || a0.shape[i] == 1) out_shape[i] = v->shape[i];
+                else if (v->shape[i] == 1)                          out_shape[i] = a0.shape[i];
+                else                                                fits = false;
+            }
+            if (!fits) {
                 char s1[80], s2[80];
                 serr(c, SMP_E0309, st->args[0].span,
-                     sfmt(c, "Формы не совпадают: %s и %s.\n"
-                             "Broadcast в этом языке отсутствует намеренно.",
-                          val_sig(v, s1, sizeof s1), val_sig(&a0, s2, sizeof s2)), NULL);
+                     sfmt(c, "Формы не совпадают: %s и %s.",
+                          val_sig(v, s1, sizeof s1), val_sig(&a0, s2, sizeof s2)),
+                     "Растягиваются только оси размера 1 при равных рангах: [n,1] и "
+                     "[1,m] дают [n,m], [n,m] и [1,m] — [n,m]. Остальное приведи "
+                     "через @reshape или @transpose.");
                 return false;
+            }
+            if (memcmp(out_shape, v->shape, sizeof v->shape[0] * v->rank) != 0) {
+                SmpValue out;
+                memset(&out, 0, sizeof out);
+                out.dtype = v->dtype;
+                out.rank  = v->rank;
+                memcpy(out.shape, out_shape, sizeof out.shape[0] * v->rank);
+                out.sym   = SMP_SYM_NONE;
+                val_dense(&out);
+                *v = out;
             }
             return true;
         }

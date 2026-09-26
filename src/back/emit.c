@@ -421,6 +421,11 @@ static bool in_place_ok(SmpOpKind k)
     }
 }
 
+static bool same_shape(const SmpValue *a, const SmpValue *b)
+{
+    return a->rank == b->rank && memcmp(a->shape, b->shape, sizeof a->shape[0] * a->rank) == 0;
+}
+
 /* Стадии, которые умеет сливать рантайм: строго поэлементные, форма не
  * меняется, промежуточный результат нужен только следующей стадии. */
 static bool fusable_op(SmpOpKind k)
@@ -618,6 +623,16 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
                           (k == SMP_OP_ADD || k == SMP_OP_SUB || k == SMP_OP_MUL ||
                            k == SMP_OP_DIV || k == SMP_OP_ABS || k == SMP_OP_SQRT);
 
+        /* Растяжение осей размера 1. Результат больше входа — писать поверх
+         * входа нельзя; и ни с чем не сливается: слитый проход считает формы
+         * всех операндов одинаковыми. */
+        const SmpValue *in_v = i ? &in->stage_out[i - 1u] : &in->src_val;
+        const bool grows = !scal && !same_shape(in_v, &in->stage_out[i]);
+        const bool bcast = !scal &&
+                           (k == SMP_OP_ADD || k == SMP_OP_SUB || k == SMP_OP_MUL ||
+                            k == SMP_OP_DIV) &&
+                           (grows || !same_shape(&in->arg_val[i], &in->stage_out[i]));
+
         /* Аргумент стадии. */
         if (k == SMP_OP_RESHAPE) {
             /* Размеры едут не аргументами, а дескриптором новой формы: VM
@@ -682,7 +697,7 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
                 (in->dest_val.flags & SMP_TF_CONTIG)) {
                 /* Пишем прямо в приёмник — копия в конце не понадобится. */
                 t = tens_for_value(m, &in->dest_val, in->arena_id);
-            } else if (m->reg_scratch[a] && in_place_ok(k)) {
+            } else if (m->reg_scratch[a] && in_place_ok(k) && !(bcast && grows)) {
                 /* Вход уже наш временный буфер нужной формы — работаем на месте. */
                 t = 0xFFFFFFFEu;
             } else {
@@ -714,7 +729,7 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
          * незачем. Утверждать это может лишь компилятор — VM сама не знает,
          * что буфер больше никем не читается. */
         bool chain = (prev_instr != 0xFFFFFFFFu) && fusable_head(prev_kind) &&
-                     (fusable_op(k) || fusable_tail(k)) && !scal;
+                     (fusable_op(k) || fusable_tail(k)) && !scal && !bcast;
         if (chain) {
             const uint32_t ns = hoist_loads(m, chain_start, prev_instr + 1u);
             if (ns == 0xFFFFFFFFu) chain = false;
@@ -729,7 +744,7 @@ static bool emit_stmt_body(Em *m, const SmpAstStmt *s, const SmpStmtInfo *in)
         prev_instr = m->n_code ? m->n_code - 1u : 0xFFFFFFFFu;
         /* @mmul с живой длиной цепочку не начинает: слитый эпилог считает
          * весь тайл, а длину не знает. */
-        prev_kind  = ((k == SMP_OP_MMUL && kaux == 1) || scal) ? SMP_OP__COUNT : k;
+        prev_kind  = ((k == SMP_OP_MMUL && kaux == 1) || scal || bcast) ? SMP_OP__COUNT : k;
         if (!chain) chain_start = prev_instr;
         r = d;
     }

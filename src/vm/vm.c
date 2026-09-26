@@ -310,6 +310,26 @@ static bool make_dst(SmpVM *vm, SmpBuf *b, const SmpTensor *t)
     return make_buf(vm, b, t);
 }
 
+/* Операнд бинарной поэлементной операции в форме результата. Ось размера 1,
+ * которая у результата длиннее, растягивается шагом 0 — тот же элемент на
+ * всю ось, без копии; такой вид не плотный, и считает скалярный эталон.
+ * Совпадает ли что с чем, проверила сема; здесь только сборка вида. */
+static bool make_bcast(SmpVM *vm, SmpBuf *b, const SmpTensor *t, const SmpTensor *like,
+                       SmpTensor *tmp)
+{
+    if (t->nelem == like->nelem) return make_buf(vm, b, t);
+    *tmp = *t;
+    for (uint32_t i = 0; i < t->rank; i++) {
+        if (t->shape[i] == 1 && like->shape[i] != 1) {
+            tmp->shape[i]  = like->shape[i];
+            tmp->stride[i] = 0;
+        }
+    }
+    tmp->nelem  = like->nelem;
+    tmp->flags &= (uint16_t)~(SMP_TF_CONTIG | SMP_TF_ALIGN64 | SMP_TF_ALIGN32);
+    return make_buf(vm, b, tmp);
+}
+
 /* ========================================================================== */
 /*  Умножение по живой длине                                                  */
 /* ========================================================================== */
@@ -1013,6 +1033,7 @@ SmpStatus smp_vm_run(SmpVM *vm)
     const SmpInstr *in = NULL;
 
     SmpBuf bd, ba, bb;
+    SmpTensor ta, tb;                   /* виды растянутых операндов */
 
 #if SMP_HAS_COMPUTED_GOTO
     VM_NEXT();
@@ -1190,8 +1211,8 @@ dispatch_switch:
         }
         apply_fp(vm, in->flags);
         if (!make_dst(vm, &bd, &R[in->d].t) ||
-            !make_buf(vm, &ba, &R[in->a].t) ||
-            !make_buf(vm, &bb, &R[in->b].t)) return SMP_ERR_INTERNAL;
+            !make_bcast(vm, &ba, &R[in->a].t, &R[in->d].t, &ta) ||
+            !make_bcast(vm, &bb, &R[in->b].t, &R[in->d].t, &tb)) return SMP_ERR_INTERNAL;
         smp_k_sub(&bd, &ba, &bb);
         VM_NEXT();
 
@@ -1333,8 +1354,8 @@ dispatch_switch:
             VM_NEXT();
         apply_fp(vm, in->flags);
         if (!make_dst(vm, &bd, &R[in->d].t) ||
-            !make_buf(vm, &ba, &R[in->a].t) ||
-            !make_buf(vm, &bb, &R[in->b].t)) return SMP_ERR_INTERNAL;
+            !make_bcast(vm, &ba, &R[in->a].t, &R[in->d].t, &ta) ||
+            !make_bcast(vm, &bb, &R[in->b].t, &R[in->d].t, &tb)) return SMP_ERR_INTERNAL;
         smp_k_add(&bd, &ba, &bb);
         VM_NEXT();
 
@@ -1347,8 +1368,8 @@ dispatch_switch:
             VM_NEXT();
         apply_fp(vm, in->flags);
         if (!make_dst(vm, &bd, &R[in->d].t) ||
-            !make_buf(vm, &ba, &R[in->a].t) ||
-            !make_buf(vm, &bb, &R[in->b].t)) return SMP_ERR_INTERNAL;
+            !make_bcast(vm, &ba, &R[in->a].t, &R[in->d].t, &ta) ||
+            !make_bcast(vm, &bb, &R[in->b].t, &R[in->d].t, &tb)) return SMP_ERR_INTERNAL;
         smp_k_mul(&bd, &ba, &bb);
         VM_NEXT();
 
@@ -1359,8 +1380,8 @@ dispatch_switch:
         }
         apply_fp(vm, in->flags);
         if (!make_dst(vm, &bd, &R[in->d].t) ||
-            !make_buf(vm, &ba, &R[in->a].t) ||
-            !make_buf(vm, &bb, &R[in->b].t)) return SMP_ERR_INTERNAL;
+            !make_bcast(vm, &ba, &R[in->a].t, &R[in->d].t, &ta) ||
+            !make_bcast(vm, &bb, &R[in->b].t, &R[in->d].t, &tb)) return SMP_ERR_INTERNAL;
         smp_k_div(&bd, &ba, &bb);
         VM_NEXT();
 
