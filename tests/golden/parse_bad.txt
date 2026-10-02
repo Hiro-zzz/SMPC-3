@@ -84,4 +84,4 @@ $ smpc3 parse examples/bad_syntax.smpc
 
 инструкций: 4
 
-arena#1 'compile' 13.1 KiB / 64.0 MiB (peak 13.1 KiB, 177 allocs)
+arena#1 'compile' 13.4 KiB / 64.0 MiB (peak 13.4 KiB, 177 allocs)

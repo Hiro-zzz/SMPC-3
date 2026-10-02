@@ -384,6 +384,8 @@ void smp_lex_next(SmpLexer *lx, SmpToken *out)
         switch (c) {
             case '[': smp__punct(lx, out, SMP_TK_LBRACKET, 1); return;
             case ']': smp__punct(lx, out, SMP_TK_RBRACKET, 1); return;
+            case '{': smp__punct(lx, out, SMP_TK_LBRACE,   1); return;
+            case '}': smp__punct(lx, out, SMP_TK_RBRACE,   1); return;
             case '(': smp__punct(lx, out, SMP_TK_LPAREN,   1); return;
             case ')': smp__punct(lx, out, SMP_TK_RPAREN,   1); return;
             case '<': smp__punct(lx, out, SMP_TK_LANGLE,   1); return;

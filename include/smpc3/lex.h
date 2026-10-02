@@ -21,6 +21,8 @@
     X(ERROR,     "<ошибка>")                          \
     X(LBRACKET,  "[")                                 \
     X(RBRACKET,  "]")                                 \
+    X(LBRACE,    "{")                                 \
+    X(RBRACE,    "}")                                 \
     X(LPAREN,    "(")                                 \
     X(RPAREN,    ")")                                 \
     X(LANGLE,    "<")                                 \

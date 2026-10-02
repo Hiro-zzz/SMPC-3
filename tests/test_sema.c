@@ -537,6 +537,89 @@ static void test_repeat(void)
 }
 
 /* ========================================================================== */
+/*  Блоки [#repeat:N] { … }                                                   */
+/* ========================================================================== */
+
+#define BLK2 "[#repeat:3, #index:i] { *&M[$i, ..] -> @abs => *&M[$i, ..]; " \
+             "*&M[$i, ..] -> @relu => *&M[$i, ..]; }"
+
+static void test_blocks(void)
+{
+    SECTION("блоки [#repeat:N] { … }");
+
+    /* --- что обязано проходить --- */
+    expect_clean(PM BLK2, "две инструкции трижды");
+    expect_clean(PM "[#repeat:4, #index:i] { *&M[$i, ..] -> @fill($i) => *&M[$i, ..]; }",
+                 "индекс блока как значение");
+    expect_clean("*&N<i32:4,8> -> @alloc => $n;  [#repeat:4, #index:i] { "
+                 "[#repeat:8, #index:j] $i -> @mul(8) -> @add($j) => *&N[$i, $j]; }",
+                 "оба индекса в одной инструкции");
+    expect_clean(PM "[#repeat:2] { [#arena:0] *&M -> @abs => *&M; }",
+                 "свой префикс у инструкции в блоке");
+
+    /* --- копий ровно столько, сколько просили, и в том порядке --- */
+    CHECK(expanded(PM BLK2) == 7, "блок 3 x 2 дал %u инструкций вместо 7",
+          expanded(PM BLK2));
+    CHECK(expanded(PM "[#repeat:2, #index:i] { [#repeat:4, #index:j] "
+                      "*&M[$j, ..] -> @abs => *&M[$j, ..]; *&M -> @relu => *&M; }") == 11,
+          "блок 2 x (4 + 1) дал не 11 инструкций");
+    {
+        SmpSemaResult res;
+        sema_str(PM BLK2, &res, NULL);
+        /* abs, relu, abs, relu, ... — группа подряд, а не каждая строка N раз. */
+        CHECK(res.ninfo == 7 && res.info[1].ok && res.info[2].ok, "блок не прошёл");
+    }
+
+    /* --- ошибки блока --- */
+    expect_err(PM "[#repeat:0, #index:i] { *&M -> @abs => *&M; }",
+               SMP_E0310, "ноль повторов блока");
+    expect_err(PM "[#index:i] { *&M -> @abs => *&M; }",
+               SMP_E0310, "блок без #repeat");
+    expect_err(PM "[#repeat:2, #arena:0] { *&M -> @abs => *&M; }",
+               SMP_E0310, "#arena у блока");
+    expect_err(PM "[#repeat:2, ^raw] { *&M -> @abs => *&M; }",
+               SMP_E0310, "^raw у блока");
+    expect_err(PM "[#repeat:2, #index:i] { [#repeat:2, #index:i] *&M[$i, ..] -> @abs => *&M[$i, ..]; }",
+               SMP_E0310, "индекс инструкции совпал с индексом блока");
+    expect_err(PM "[#repeat:2] { *&M -> @abs => *&BAD<f32:4,8>; }",
+               SMP_E0310, "объявление внутри блока");
+    expect_err(PM "2 => $i;  [#repeat:2, #index:i] { *&M -> @abs => *&M; }",
+               SMP_E0310, "индекс блока занят обычным регистром");
+    {
+        /* 4096 повторов по 17 инструкций — больше, чем вмещает программа. */
+        static char big[4096];
+        size_t n = (size_t)snprintf(big, sizeof big, PM "[#repeat:4096] {");
+        for (int k = 0; k < 17; k++)
+            n += (size_t)snprintf(big + n, sizeof big - n, " *&M -> @abs => *&M;");
+        snprintf(big + n, sizeof big - n, " }");
+        expect_err(big, SMP_E0310, "блок больше программы");
+    }
+
+    /* --- одна претензия на написанную строку ---
+     * Копии двух строк блока идут вперемешку: abs₀ relu₀ abs₁ relu₁ ... За
+     * границу уходят повторы 4 и 5 обеих строк. Строк две — претензий две,
+     * а не четыре; латч, помнящий одну последнюю строку, дал бы четыре. */
+    {
+        SmpSemaResult res;
+        const uint32_t errs = sema_str(PM
+            "[#repeat:6, #index:i] { *&M[$i, ..] -> @abs => *&M[$i, ..]; "
+            "*&M[$i, ..] -> @relu => *&M[$i, ..]; }", &res, NULL);
+        CHECK(errs == 2, "за границу ушли две строки блока: ошибок %u, ждали 2", errs);
+        CHECK(saw(SMP_E0410), "нет E0410");
+        CHECK(strstr(g_out, "Это повтор #4 из 6: блок [#repeat] в 1:"),
+              "в сообщении не назван повтор блока:\n%s", g_out);
+    }
+    {
+        SmpSemaResult res;
+        sema_str(PM "[#repeat:2, #index:i] { [#repeat:6, #index:j] "
+                    "*&M[$j, ..] -> @abs => *&M[$j, ..]; }", &res, NULL);
+        CHECK(strstr(g_out, "Это повтор #4 из 6: развёртка [#repeat]") &&
+              strstr(g_out, "Внутри повтор #0 из 2: блок [#repeat]"),
+              "в сообщении не названы оба повтора:\n%s", g_out);
+    }
+}
+
+/* ========================================================================== */
 /*  @load и @store                                                            */
 /* ========================================================================== */
 
@@ -670,6 +753,7 @@ int main(void)
     test_warnings();
     test_registries();
     test_repeat();
+    test_blocks();
     test_q8();
     test_nn_ops();
     test_fileio_rules();

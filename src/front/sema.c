@@ -54,7 +54,7 @@ static const AttrDef g_directives[] = {
     { "arena",  VAL_INT,   "номер арены, 0..7" },
     { "simd",   VAL_IDENT, "ширина вектора: v128, v256, v512" },
     { "unroll", VAL_INT,   "коэффициент разворота цикла" },
-    { "repeat", VAL_INT,   "развернуть инструкцию N раз, 1..4096" },
+    { "repeat", VAL_INT,   "развернуть инструкцию или блок { } N раз, 1..4096" },
     { "index",  VAL_IDENT, "имя индекса повтора для #repeat" }
 };
 static const AttrDef g_modes[] = {
@@ -182,12 +182,34 @@ static const char *sfmt(Ctx *c, const char *f, ...) SMP_PRINTF(2, 3);
  * каком именно индексе всё разъехалось, нечем. */
 static const char *repeat_note(Ctx *c, const char *details)
 {
-    const SmpAstPrefix *r = smp_stmt_directive(c->stmt, "repeat");
-    return sfmt(c, "%s\nЭто повтор #%u из %u: развёртка [#repeat] в %u:%u.",
-                details ? details : "",
-                c->stmt->repeat_idx, c->stmt->repeat_n,
-                r ? r->span.line : c->stmt->span.line,
-                r ? r->span.col  : c->stmt->span.col);
+    const SmpAstStmt   *s  = c->stmt;
+    const SmpAstPrefix *r  = smp_stmt_directive(s, "repeat");
+    const SmpAstPrefix *br = s->block ? smp_block_directive(s->block, "repeat") : NULL;
+
+    const char *own = "";
+    if (s->repeat_n)
+        own = sfmt(c, "\nЭто повтор #%u из %u: развёртка [#repeat] в %u:%u.",
+                   s->repeat_idx, s->repeat_n,
+                   r ? r->span.line : s->span.line, r ? r->span.col : s->span.col);
+    const char *blk = "";
+    if (s->block_n)
+        blk = sfmt(c, "\n%s повтор #%u из %u: блок [#repeat] в %u:%u.",
+                   s->repeat_n ? "Внутри" : "Это", s->block_idx, s->block_n,
+                   br ? br->span.line : s->block->open.line,
+                   br ? br->span.col  : s->block->open.col);
+    return sfmt(c, "%s%s%s", details ? details : "", own, blk);
+}
+
+/* Высказана ли уже претензия этого вида к написанной инструкции, и если
+ * нет — запомнить, что сейчас будет. */
+static bool latched(Ctx *c, uint8_t bit)
+{
+    const SmpAstStmt *s = c->stmt;
+    if (!s->from_repeat || s->repeat_of >= c->sm->nlatch) return false;
+    uint8_t *l = &c->sm->latch[s->repeat_of];
+    if (*l & bit) return true;
+    *l |= bit;
+    return false;
 }
 
 static void serr(Ctx *c, SmpDiagCode code, SmpSpan sp,
@@ -200,10 +222,7 @@ static void serr(Ctx *c, SmpDiagCode code, SmpSpan sp,
      * ним одна. Латч стоит ДО счётчика намеренно: иначе опечатка внутри
      * [#repeat:1024] отчиталась бы тысячей ошибок об одной строке, и число в
      * итоговой сводке перестало бы что-либо значить. */
-    if (c->stmt->from_repeat) {
-        if (c->sm->repeat_told == c->stmt->repeat_of) return;
-        c->sm->repeat_told = c->stmt->repeat_of;
-    }
+    if (latched(c, SMP_LATCH_TOLD)) return;
 
     c->sm->n_errors++;
     if (!c->sm->diag) return;
@@ -218,10 +237,7 @@ static void serr(Ctx *c, SmpDiagCode code, SmpSpan sp,
 static void swarn(Ctx *c, SmpDiagCode code, SmpSpan sp,
                   const char *details, const char *fix)
 {
-    if (c->stmt->from_repeat) {
-        if (c->sm->repeat_warned == c->stmt->repeat_of) return;
-        c->sm->repeat_warned = c->stmt->repeat_of;
-    }
+    if (latched(c, SMP_LATCH_WARNED)) return;
 
     c->sm->n_warnings++;
     if (!c->sm->diag) return;
@@ -1605,8 +1621,6 @@ void smp_sema_init(SmpSema *sm, SmpArena *arena, SmpDiagCtx *diag,
     sm->diag          = diag;
     sm->src           = src;
     sm->host_vec_bits = smp_cpu()->max_vec_bits;
-    sm->repeat_told   = SMP_REPEAT_NONE;
-    sm->repeat_warned = SMP_REPEAT_NONE;
 
     /* SMPC3_VEC_BITS выдаёт компилятору другую ширину вектора, чем есть в
      * кремнии. Нужно в двух местах: снимки диагностики должны совпадать на
@@ -1708,6 +1722,13 @@ SmpStatus smp_sema_run(SmpSema *sm, const SmpAstProgram *prog, SmpSemaResult *re
         memset(res->info, 0, prog->nstmts * sizeof(SmpStmtInfo));
     }
     res->ninfo = prog->nstmts;
+
+    if (prog->nwritten) {
+        sm->latch = (uint8_t *)smp_arena_push_raw(sm->arena, prog->nwritten, 8);
+        if (!sm->latch) return SMP_ERR_OOM;
+        memset(sm->latch, 0, prog->nwritten);
+        sm->nlatch = prog->nwritten;
+    }
 
     for (uint32_t i = 0; i < prog->nstmts; i++) {
         Ctx c;

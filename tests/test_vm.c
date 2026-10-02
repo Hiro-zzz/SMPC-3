@@ -1558,6 +1558,42 @@ static void test_nn_chain(void)
     CHECK(regval("i", NULL) == 0.0, "argmax %g, ждали 0", regval("i", NULL));
 }
 
+/* Блок [#repeat:N] { … }: группа повторяется целиком, по порядку, и каждая
+ * копия видит то, что записала предыдущая инструкция того же повтора. */
+static void test_blocks(void)
+{
+    SECTION("блоки");
+
+    /* Оба индекса: N[i][j] = 8i + j, то есть N = 0, 1, ..., 31 подряд. */
+    CHECK(run_str("*&N<i32:4,8> -> @alloc => $n;\n"
+                  "[#repeat:4, #index:i] {\n"
+                  "    [#repeat:8, #index:j] $i -> @mul(8) -> @add($j) => *&N[$i, $j];\n"
+                  "}\n"), "блок с двумя индексами");
+    {
+        const int32_t *n = (const int32_t *)tensor_data("N", NULL);
+        bool ok = n != NULL;
+        for (uint32_t k = 0; ok && k < 32; k++) ok = n[k] == (int32_t)k;
+        CHECK(ok, "N = %d %d .. %d, ждали 0 1 .. 31",
+              n ? n[0] : -1, n ? n[1] : -1, n ? n[31] : -1);
+    }
+
+    /* Порядок: строка заполняется и тут же сворачивается — в том же
+     * повторе, до следующей строки. И строка, которую свернули, — та же,
+     * что заполнили: R = 0, 8, 16, 24. */
+    CHECK(run_str("*&M<f32:4,8> -> @alloc => $m;\n"
+                  "*&R<f32:4> -> @alloc => $r;\n"
+                  "[#repeat:4, #index:i] {\n"
+                  "    *&M[$i, ..] -> @fill($i) => *&M[$i, ..];\n"
+                  "    *&M[$i, ..] -> @reduce.add => *&R[$i];\n"
+                  "}\n"
+                  "*&R -> @reduce.add => $s;\n"), "блок: заполнить и свернуть");
+    CHECK(felem("R", 0) == 0.0f && felem("R", 1) == 8.0f &&
+          felem("R", 2) == 16.0f && felem("R", 3) == 24.0f,
+          "R = %g %g %g %g, ждали 0 8 16 24",
+          felem("R", 0), felem("R", 1), felem("R", 2), felem("R", 3));
+    CHECK(regval("s", NULL) == 48.0, "накоплено %g, ждали 48", regval("s", NULL));
+}
+
 int main(void)
 {
     smp_console_setup();
@@ -1593,6 +1629,7 @@ int main(void)
     test_nn_chain();
     test_attention();
     test_live_len();
+    test_blocks();
 
     smp_vm_release(&g_vm);
     fclose(g_sink);

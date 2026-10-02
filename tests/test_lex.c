@@ -77,6 +77,11 @@ static void test_punct(void)
         };
         expect_kinds("[]()<>,;:", w, 9);
     }
+    {
+        static const SmpTokKind w[] = { SMP_TK_LBRACKET, SMP_TK_DIRECTIVE, SMP_TK_RBRACKET,
+                                        SMP_TK_LBRACE, SMP_TK_RBRACE };
+        expect_kinds("[#repeat]{}", w, 5);
+    }
 
     /* Без пробелов лексер обязан разбирать так же. */
     {

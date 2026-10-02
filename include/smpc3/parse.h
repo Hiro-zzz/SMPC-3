@@ -27,6 +27,16 @@ typedef struct SmpParser {
 
     uint32_t         n_errors;
     bool             panic;    /* внутри уже испорченной инструкции */
+
+    /* Открытый блок [#repeat:N] { … }: инструкции до его '}' получают на
+     * него указатель. Вложенных блоков нет, поэтому хватает одного. */
+    SmpAstBlock     *block;
+    uint32_t         block_stmts;  /* инструкций в нём на сейчас           */
+    bool             opened;       /* последний parse_stmt открыл блок     */
+
+    /* '{', проглоченные восстановлением или отвергнутые: их '}' закрывают
+     * не блок, а то, что уже отвергнуто, и второй претензии не стоят. */
+    uint32_t         skip_braces;
 } SmpParser;
 
 void smp_parse_init(SmpParser *p, SmpArena *arena, SmpDiagCtx *diag,

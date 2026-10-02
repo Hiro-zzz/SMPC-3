@@ -407,6 +407,73 @@ static void test_ambiguity(void)
 }
 
 /* ========================================================================== */
+/*  Блоки [#repeat:N] { … }                                                   */
+/* ========================================================================== */
+
+static void test_blocks(void)
+{
+    SECTION("блоки");
+
+    SmpAstProgram prog;
+    CHECK(parse_str("[#repeat:2, #index:i] {\n"
+                    "    *&A[$i, ..] -> @abs => *&A[$i, ..];\n"
+                    "    [#arena:1] *&B -> @relu => *&B;\n"
+                    "}\n"
+                    "*&C -> @abs => *&C;\n", &prog) == 0, "блок не разобрался");
+    CHECK(prog.nstmts == 3, "инструкций %u, ждали 3: '{' и '}' — не инструкции",
+          prog.nstmts);
+    if (prog.nstmts == 3) {
+        const SmpAstBlock *b = prog.stmts[0].block;
+        CHECK(b && prog.stmts[1].block == b, "инструкции блока не указывают на один блок");
+        CHECK(!prog.stmts[2].block, "инструкция после '}' осталась в блоке");
+        CHECK(b && b->nprefix == 2 && smp_block_directive(b, "repeat") &&
+              smp_block_directive(b, "repeat")->ival == 2, "префикс блока потерян");
+        CHECK(b && b->open.line == 1, "'{' не на своей строке");
+        CHECK(prog.stmts[0].nprefix == 0, "префикс блока прилип к инструкции");
+        CHECK(prog.stmts[1].nprefix == 1, "свой префикс инструкции в блоке потерян");
+    }
+
+    expect_ok("[#repeat:2] { *&A -> @abs => *&A; }", 1, "блок в одну строку");
+    expect_ok("[#repeat:2] { *&A -> @abs => *&A; ; }", 1, "лишняя ';' в блоке");
+
+    /* --- скобки не сошлись --- */
+    expect_error("*&A -> @abs => *&A; }", SMP_E0203, "'}' без блока");
+    expect_error("[#repeat:2] { *&A -> @abs => *&A;", SMP_E0203, "блок не закрыт");
+
+    /* --- блок неправильной формы --- */
+    expect_error("[#repeat:2] { }", SMP_E0310, "пустой блок");
+    expect_error("{ *&A -> @abs => *&A; }", SMP_E0310, "блок без префикса");
+    expect_error("[#repeat:2] { [#repeat:2] { *&A -> @abs => *&A; } }",
+                 SMP_E0310, "блок в блоке");
+
+    /* Отвергнутый '{' не мешает разобрать то, что внутри: инструкции целы,
+     * и их '}' не вызывает второй претензии. */
+    CHECK(parse_str("{ *&A -> @abs => *&A; *&B -> @abs => *&B; } *&C -> @abs => *&C;",
+                    &prog) == 1, "блок без префикса: ждали одну претензию");
+    CHECK(prog.nstmts == 3 && !prog.stmts[0].block,
+          "инструкции отвергнутого блока: %u, ждали 3 вне блока", prog.nstmts);
+
+    /* --- восстановление не съедает '}' --- */
+    CHECK(parse_str("[#repeat:2] { *&A -> => *&A; *&B -> @abs => *&B; }\n"
+                    "*&C -> @abs => *&C;", &prog) == 1,
+          "испорченная инструкция в блоке: ждали одну претензию");
+    CHECK(prog.nstmts == 2 && prog.stmts[0].block && !prog.stmts[1].block,
+          "после испорченной инструкции блок закрылся не там");
+
+    /* Забытая ';' перед '}' — претензия к инструкции, а блок закрыт как надо. */
+    CHECK(parse_str("[#repeat:2] { *&A -> @abs => *&A }\n*&C -> @abs => *&C;", &prog) == 1,
+          "';' перед '}': ждали одну претензию");
+    CHECK(prog.nstmts == 2 && prog.stmts[0].block && !prog.stmts[1].block,
+          "';' перед '}': блок закрылся не там");
+
+    /* Испорченный префикс блока: '{' проглочен восстановлением, его '}' —
+     * тоже, без второй претензии. */
+    CHECK(parse_str("[#repeat:2, 5] { *&A -> @abs => *&A; *&B -> @abs => *&B; }\n"
+                    "*&C -> @abs => *&C;", &prog) == 1,
+          "испорченный префикс блока: ждали одну претензию");
+}
+
+/* ========================================================================== */
 
 int main(void)
 {
@@ -426,6 +493,7 @@ int main(void)
     test_recovery();
     test_ambiguity();
     test_lists();
+    test_blocks();
 
     fclose(g_sink);
     smp_arena_release(&g_arena);

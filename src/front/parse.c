@@ -101,11 +101,21 @@ static const char *found_str(SmpParser *p)
                                 : fmt(p, "%s '%s'", nm, buf);
 }
 
-/* Паническая синхронизация: до ближайшей ';' включительно. */
+/* Паническая синхронизация: до ближайшей ';' включительно. '}' открытого
+ * блока остаётся на месте — он закрывает блок, а не испорченную инструкцию.
+ * '{', проглоченный по дороге, идёт в счёт skip_braces, и его '}' тоже
+ * граница: за ней начинается следующая инструкция, а не продолжение этой. */
 static void sync_stmt(SmpParser *p)
 {
     while (!at_end(p)) {
         if (accept(p, SMP_TK_SEMI)) return;
+        if (at(p, SMP_TK_RBRACE)) {
+            if (!p->skip_braces) return;
+            p->skip_braces--;
+            advance(p);
+            return;
+        }
+        if (at(p, SMP_TK_LBRACE)) p->skip_braces++;
         advance(p);
     }
 }
@@ -667,6 +677,69 @@ static bool parse_suffix_group(SmpParser *p, SmpAstSuffix *out, uint32_t *count)
 }
 
 /* ========================================================================== */
+/*  Блок                                                                      */
+/* ========================================================================== */
+
+/* Префикс разобран, за ним '{'. Что в префиксе — дело развёртки: она судит
+ * блок по тем же правилам, что и одну инструкцию. Здесь — только то, чего
+ * развёртка не увидит: блок без префикса и блок в блоке. Оба раза '{'
+ * отвергается, а инструкции за ним разбираются как обычно — они-то ни в чём
+ * не виноваты, и молчать о них до следующей сборки незачем. */
+static bool open_block(SmpParser *p, const SmpAstPrefix *pfx, uint32_t npfx)
+{
+    const SmpToken *open = advance(p);        /* '{' */
+    p->opened = true;
+
+    if (p->block || !npfx) {
+        if (p->block)
+            perr(p, SMP_E0310, open->span,
+                 fmt(p, "Блок внутри блока: внешний открыт '{' в %u:%u.",
+                     p->block->open.line, p->block->open.col),
+                 "Блоки не вкладываются. Внутри блока повтори одну инструкцию "
+                 "её собственной [#repeat:N].");
+        else
+            perr(p, SMP_E0310, open->span,
+                 "Блок без префикса: сколько раз его повторять, не сказано.",
+                 "Запиши [#repeat:N] { … }.");
+        p->skip_braces++;
+        return true;
+    }
+
+    SmpAstBlock *b = (SmpAstBlock *)smp_arena_push_raw(p->arena, sizeof *b, 8);
+    SmpAstPrefix *bp = (SmpAstPrefix *)smp_arena_push_raw(p->arena, npfx * sizeof *bp, 8);
+    if (!b || !bp) {
+        perr(p, SMP_E0401, open->span, "Арена исчерпана на блоке.", NULL);
+        return false;
+    }
+    memcpy(bp, pfx, npfx * sizeof *bp);
+    b->open    = open->span;
+    b->nprefix = npfx;
+    b->prefix  = bp;
+
+    p->block       = b;
+    p->block_stmts = 0;
+    return true;
+}
+
+static void close_block(SmpParser *p)
+{
+    const SmpToken *close = advance(p);       /* '}' */
+
+    if (p->skip_braces) { p->skip_braces--; return; }
+
+    if (!p->block) {
+        perr(p, SMP_E0203, close->span, "'}' без открытого блока.",
+             "Убери '}' или открой блок: [#repeat:N] { … }.");
+        return;
+    }
+    if (!p->block_stmts)
+        perr(p, SMP_E0310, p->block->open,
+             "Блок пуст: повторять нечего.",
+             "Наполни блок инструкциями или убери его.");
+    p->block = NULL;
+}
+
+/* ========================================================================== */
 /*  Инструкция                                                                */
 /* ========================================================================== */
 
@@ -714,6 +787,9 @@ static bool parse_stmt(SmpParser *p, SmpAstStmt *s)
     uint32_t     npfx = 0;
     while (group_kind(p, 0) == GRP_PREFIX)
         if (!parse_prefix_group(p, pfx, &npfx)) return false;
+
+    /* --- или это не инструкция, а начало блока --- */
+    if (at(p, SMP_TK_LBRACE)) return open_block(p, pfx, npfx);
 
     if (group_kind(p, 0) == GRP_UNKNOWN && !at_list(p)) {
         perr(p, SMP_E0204, peek(p, 1)->span,
@@ -853,6 +929,8 @@ SmpStatus smp_parse(SmpParser *p, SmpAstProgram *prog)
         /* Лишние ';' — не ошибка, просто пустая инструкция. */
         if (accept(p, SMP_TK_SEMI)) continue;
 
+        if (at(p, SMP_TK_RBRACE)) { close_block(p); continue; }
+
         StmtLink *link = (StmtLink *)smp_arena_push_raw(p->arena, sizeof *link, 8);
         if (!link) {
             perr(p, SMP_E0401, cur(p)->span, "Арена исчерпана на списке инструкций.", NULL);
@@ -860,14 +938,28 @@ SmpStatus smp_parse(SmpParser *p, SmpAstProgram *prog)
         }
         link->next = NULL;
 
+        p->opened = false;
         if (!parse_stmt(p, &link->stmt)) {
             sync_stmt(p);
             continue;
         }
+        if (p->opened) continue;               /* это был '{', а не инструкция */
+
+        link->stmt.block = p->block;
+        if (p->block) p->block_stmts++;
 
         if (tail) tail->next = link; else head = link;
         tail = link;
         n++;
+    }
+
+    if (p->block) {
+        p->panic = false;
+        perr(p, SMP_E0203, p->block->open,
+             fmt(p, "Блок открыт '{' в %u:%u и не закрыт '}'.",
+                 p->block->open.line, p->block->open.col),
+             "Закрой блок '}' после последней его инструкции.");
+        p->block = NULL;
     }
 
     if (n) {
